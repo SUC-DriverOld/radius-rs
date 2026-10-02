@@ -390,7 +390,18 @@ impl VocoderState {
             mask_table_8f8: vec![0.0; nb],
             sync_weight_buf: vec![0.0; nb],
             peak_count: 0,
-            sync_sens_3496: 0.0,
+            // Stereo phase-synchronisation sensitivity. This was a `0.0` placeholder,
+            // which is not a neutral value: the sync weight is
+            // `sqrt(1 - clamp(inv * v9 / 0.7))` with `inv = 1/(sens + 1e-6)`, so
+            // `sens = 0` drives `v11` to 1 and the weight to exactly 0, making
+            // `SynchronizeStereoPhases` a no-op. That is why vocoder output used to
+            // lose the inter-channel phase relationship entirely (L/R coherence fell
+            // from 0.2-0.7 on the input to 0.02-0.11), while Audition keeps it.
+            //
+            // 0.75 is the value this crate's own golden test for the operator passes
+            // (`noise.rs`, SYNC_SENS_BITS = 0x3F400000), i.e. the value the ported
+            // operator was validated against.
+            sync_sens_3496: f32::from_bits(0x3F40_0000),
             pitch_freq_169: 0.0,
             pitch_metric_168: 0.0,
             win1: vec![0.0; cfg.n_fft],

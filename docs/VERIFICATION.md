@@ -21,16 +21,31 @@ The references are produced by the development tool `tools/gen_refs.py`, which r
 
 ## Stereo, and why the vocoder used to collapse it
 
-The reference's `rx_vc_feed` splits **only channel 0** into bands, by calling `rx_crossover_process1_f(..., 0, src[i * nch], ...)`, and scatters them into the single band ring that every channel's analysis later reads. The synthesis side *is* per channel, since `ev_assembly` loops `for r in 0..nch`, so the output is not literally one mono channel: it is the left channel's spectrum synthesised twice, with identical magnitudes and synchronised phases. That measures exactly like it sounds:
+The reference handles stereo incorrectly in two independent ways, and this crate reproduced both until they were fixed.
+
+**1. The band split saw only one channel.** `rx_vc_feed` calls `rx_crossover_process1_f(..., 0, src[i * nch], ...)` — channel 0, always — and scatters those bands into the single ring every channel's analysis then reads. The synthesis side *is* per channel, since `ev_assembly` loops `for r in 0..nch`, so the output is not literally one mono channel: it is the left channel's spectrum synthesised twice.
 
 | input | before (C engine semantics) | after |
 |---|---|---|
 | stereo pair with R = −L | corr(L,R) **+1.0000**, an inverted pair collapses | corr(L,R) **−1.0000** |
 | L 440 Hz, R 1200 Hz at −8 dB | R/L **+0.00 dB**, the right channel is discarded | R/L **−8.46 dB** |
 
-Both this crate (`VocoderState::feed`) and the Python reference (`VocoderState.feed` in `pyradius.vocoder_core`) now run one `Crossover` **per channel**, and each channel's granule is built from its own band ring. The two remain bit-exact with each other: on the corpus at +3 semitones, `max|d| = 3.6e-07` and `corr = 1.0000000000` on both channels.
+**2. The stereo phase synchroniser was disabled by a placeholder.** `sync_sens_3496` was initialised to `0.0` and never set. That is not a neutral value: the sync weight is `sqrt(1 - clamp(inv * v9 / 0.7))` with `inv = 1/(sens + 1e-6)`, so `sens = 0` drives the weight to exactly 0 and `SynchronizeStereoPhases`, the stage that re-imposes the inter-channel phase relationship, did nothing at all. It is now `0.75`, the sensitivity the operator's own golden test passes.
 
-The consequence to know about is that **on stereo input the vocoder no longer matches the C engine**, which still has the defect. The C engine was not changed. On dual-mono input the three agree, which is the third assertion of `vocoder_preserves_stereo_separation`.
+Losing that relationship is not cosmetic. Magnitude-squared coherence between L and R on the acceptance corpus at +3 semitones:
+
+| band (Hz) | 20 | 80 | 160 | 315 | 630 | 1250 | 2500 | 5000 | 10000 |
+|---|---|---|---|---|---|---|---|---|---|
+| input | 0.688 | 0.744 | 0.194 | 0.316 | 0.444 | 0.235 | 0.275 | 0.274 | 0.403 |
+| Audition | 0.645 | 0.878 | 0.252 | 0.220 | 0.392 | 0.280 | 0.196 | 0.207 | 0.352 |
+| before fix | 0.033 | 0.110 | 0.022 | 0.052 | 0.083 | 0.068 | 0.046 | 0.030 | 0.047 |
+| after fix | 0.656 | 0.882 | 0.271 | 0.221 | 0.412 | 0.293 | 0.206 | 0.217 | 0.371 |
+
+`corr(L,R)` goes 0.0192 → 0.7046 and `side/mid` −0.17 dB → −7.61 dB, landing next to Audition's own render (0.7020 / −7.57 dB) against 0.6930 / −7.41 dB on the input. The level error had the same cause: −2.53 dB → −0.30 dB, against −0.50 dB for Audition, because two channels whose phases have drifted apart sum to less energy than two that have not.
+
+Both this crate (`VocoderState::feed`) and the Python reference (`VocoderState.feed` in `pyradius.vocoder_core`) now run one `Crossover` **per channel**, and each channel's granule is built from its own band ring, with the sync sensitivity set to 0.75. The two remain bit-exact with each other: on the corpus at +3 semitones, `max|d| = 5e-07` and `corr = 1.0000000000` on both channels.
+
+The consequence to know about is that **on stereo input the vocoder no longer matches the C engine**, which still has both defects. The C engine was not changed. On dual-mono input the three agree, which is the third assertion of `vocoder_preserves_stereo_separation`.
 
 ## Reference renders from Adobe Audition (perceptual)
 

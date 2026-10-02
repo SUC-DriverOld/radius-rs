@@ -37,7 +37,7 @@ That discipline is what buys the `max|d| = 3.6e-07` agreement reported in [VERIF
 
 Two places where this crate knowingly does not reproduce the reference, both because the reference is wrong:
 
-* **Stereo in the vocoder.** The reference splits only channel 0 into bands, which collapses the stereo image. See the stereo section of [VERIFICATION.md](VERIFICATION.md). The Python reference was fixed at the same time, so the two still agree with each other, and both now differ from the C engine on stereo material.
+* **Stereo in the vocoder.** The reference handles stereo incorrectly in two independent ways: the band split reads only channel 0, and `sync_sens_3496` sits at a `0.0` placeholder that reduces the stereo phase synchroniser's weight to exactly zero, so it never runs. Both are fixed here. See the stereo section of [VERIFICATION.md](VERIFICATION.md). The Python reference carries the same two fixes, so the two remain bit-exact with each other, and both now differ from the C engine on stereo material.
 * **32-bit integer WAV output.** Rejected with an error rather than silently downgraded, because ffmpeg has no 32-bit integer PCM encoder. See [CLI.md](CLI.md).
 
 `--fft rustfft` is a third case, but it is opt-in rather than a change of default: see [FFT.md](FFT.md).
