@@ -46,22 +46,17 @@ radius in.wav out.wav -m vc -s 3 --fft rustfft
 
 # engine, CLI and C ABI tests; needs no external audio
 cargo test --release
-
-# vocoder benchmark: crossover and full render, per FFT backend
-cargo run --release --example bench_vc
 ```
 
 ## Profiling and benchmarks
 
-`RADIUS_PROFILE=1` prints a per-stage breakdown of the vocoder, which is the first thing to reach for before optimising anything:
+`RADIUS_PROFILE=1` prints a per-stage breakdown of the vocoder, which is the first thing to reach for before optimising anything. Add `RADIUS_THREADS=1` alongside it — the stage timers are thread-local, so worker time would otherwise be missing from the report:
 
 ```bash
-RADIUS_PROFILE=1 radius in.wav out.wav -m vc -s 3
+RADIUS_PROFILE=1 RADIUS_THREADS=1 radius in.wav out.wav -m vc -s 3
 ```
 
-Note that the stages cover the per-granule chain only. The CLI's `render:` time minus their sum is what was spent outside it — the crossover, the ring writes and the output — and that gap is where the vocoder's single largest cost used to hide. [docs/VERIFICATION.md](docs/VERIFICATION.md) has the details and current numbers.
-
-`cargo run --release --example bench_vc` measures the crossover alone versus a full render, under each FFT backend, so a change can be attributed to the right part of the pipeline.
+Note that the stages cover the per-granule chain only, and the crossover is reported separately for exactly that reason: it runs in `feed`, between granules, and that placement once hid the largest cost in the engine. The report includes an `unaccounted` figure so the next such blind spot shows up instead of being absorbed silently. [docs/VERIFICATION.md](docs/VERIFICATION.md) has the details and current numbers.
 
 ## Learn more
 

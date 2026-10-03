@@ -113,28 +113,45 @@ RADIUS_AUDITION_REF_DIR=/path/to/audition_renders \
 
 ## Performance
 
-Release build, one machine, single-threaded, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured, so process start-up and the ffmpeg I/O around it are excluded.
+Release build, one machine, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured, so process start-up and the ffmpeg I/O around it are excluded.
 
 | engine | `--fft` | time | throughput |
 |---|---|---|---|
-| TD, `+3` | `radix2` | 1.30 s | ~22x realtime |
-| TD, `+3` | `rustfft` | 0.58 s | ~50x realtime |
-| vocoder, `+3` | `radix2` | 31.8 s | ~0.91x realtime |
-| vocoder, `+3` | `rustfft` | 22.5 s | ~1.29x realtime |
+| TD, `+3` | `radix2` | 1.26 s | ~23x realtime |
+| TD, `+3` | `rustfft` | 0.55 s | ~53x realtime |
+| vocoder, `+3` | `radix2` | 28.0 s | ~1.04x realtime |
+| vocoder, `+3` | `rustfft` | 18.5 s | ~1.57x realtime |
 
-For reference, the same measurements before the build gained hardware FMA (see below) were 1.83 s / 0.75 s / 68.5 s / 57.1 s, so the vocoder is about **2x** faster than it was and now runs at roughly real time on the default backend.
+The vocoder numbers are with the band split running on two threads (see below); `RADIUS_THREADS=0` makes it single-threaded and about 13% slower. The TD engine has no per-channel parallelism to exploit and is unaffected.
 
-That change is worth understanding, because it was invisible to stage profiling for a long time. The crate keeps `a*b + c` as one correctly-rounded operation to match the reference's `-ffp-contract=off`, which on a baseline `x86-64` target means every `f32::mul_add` call is a call to a *software* `fmaf`. The crossover filter is 4 bands by 2048 taps of that per input sample, making it **53% of the vocoder's whole runtime** — a cost that lives in `feed`, outside the per-granule timers, which is why profiling by granule stage kept ranking it last. [`.cargo/config.toml`](../.cargo/config.toml) now enables the hardware instruction; [DESIGN.md](DESIGN.md) records why that is free for accuracy.
+Earlier revisions of this document recorded 1.83 s / 0.75 s / 68.5 s / 57.1 s, so the vocoder is now about **2.4x** faster than it was and runs faster than real time on either backend. Two independent changes got it there:
+
+* **Hardware FMA** (see below) — 2x.
+* **Parallel band split plus removing per-granule allocation** — a further ~17%: the crossover runs one channel per thread, and `ev_apc`/`ev_pull_to_peak` no longer clone spectrum-sized buffers on every granule (they take reusable scratch out of the state instead of allocating; that alone cut `apc` from 36.5 ms to 11.1 ms per 3 s).
+
+The first of those was invisible to stage profiling for a long time. The crate keeps `a*b + c` as one correctly-rounded operation to match the reference's `-ffp-contract=off`, which on a baseline `x86-64` target means every `f32::mul_add` call is a call to a *software* `fmaf`. The crossover filter is 4 bands by 2048 taps of that per input sample, making it **53% of the vocoder's whole runtime** — a cost that lives in `feed`, outside the per-granule timers, which is why profiling by granule stage kept ranking it last. [`.cargo/config.toml`](../.cargo/config.toml) now enables the hardware instruction; [DESIGN.md](DESIGN.md) records why that is free for accuracy.
+
+### Parallelism
+
+The vocoder splits work across threads only where the reference's own semantics make it exact, which is the per-channel work: each channel's band split is independent, reads nothing the other writes, and writes to its own ring plane. Two threads therefore produce **byte-identical output** to one — `RADIUS_THREADS=1` and the default render the same file, verified by hash on the acceptance corpus.
+
+The thread count defaults to `min(available_cores, 2)` and `RADIUS_THREADS` overrides it. The cap is 2 because the parallel regions are per *channel* and stereo is the supported case; a third thread has nothing to take. Measured on the corpus, `RADIUS_THREADS` at 1 / 2 / 8 gives 31.9 s / 27.3 s / 28.7 s, so oversubscribing is a small loss.
+
+What is *not* parallel, and why, is worth recording because it is the obvious next step — and because each item was attempted:
+
+* **A persistent worker pool to replace the per-region `spawn`.** The band split runs once per 448/1024-sample block, so a `spawn`+`join` pair happens ~5 700 times per render. Measured at **100 µs** against ~190 µs of useful worker time, which caps the crossover gain at about 1.35x. A pool was written and abandoned: jobs borrow the caller's data for a non-`'static` lifetime, and a parked `'static` worker cannot hold such a closure. Doing this properly needs an inverted control flow (workers pull borrowed jobs through a scoped submission), which is a rewrite of the module rather than a patch.
+* **`ev_assembly` (34%) and `ev_acs` (26%)** are per channel in structure — `ev_assembly` already loops `for r in 0..nch` — but they share `cart`, `acc`, `frame`, `win1`, `win2` and one `FormantState`. `mask_table_8f8` and `b_710` turned out to be granule-local scratch and a read-only input, so they are not the obstacle; `FormantState` is. It carries persistent cross-granule state (`env`, `gain_env`, `db`) that is currently *shared by both channels*, so giving each channel its own copy is not provably equivalent without an audit of that state's channel dependence. The FFT plans themselves are already thread-local (`fft::with_plan`), so the transforms need no locking.
+* **Radix-2 butterfly SIMD.** The butterflies at different `base` chunks are independent, but the twiddle factor differs per `j` (needs a gather) and for small stages `ln < 8` makes neighbouring lanes overlap, so a wider vector cannot be written. Crossing either limit means a multi-pass multi-base FFT — a rewrite of the kernel. The estimated ceiling is ~12% overall, against a real risk to the bit-exactness that the whole acceptance story rests on. What *was* done here is structural and is kept: the per-butterfly `sign *` multiply is gone (signed twiddle tables per direction), and the loop uses `split_at_mut` so the compiler sees non-overlapping addresses.
 
 The vocoder is still inherently expensive, since it does 16384-point FFTs and several full-spectrum passes per granule; the TD engine runs far faster than real time. [FFT.md](FFT.md) explains what the faster backend costs in accuracy.
 
 ### Profiling
 
-`RADIUS_PROFILE=1` prints a breakdown of a vocoder render, which is the tool to use before optimising anything:
+`RADIUS_PROFILE=1` prints a breakdown of a vocoder render, which is the tool to use before optimising anything. Pair it with `RADIUS_THREADS=0`: the stage timers are thread-local, so a worker's time would not reach the report, and the single-threaded figures are the ones comparable to the reference measurements.
 
 ```text
-vc profile: granules=2661 wall=3986.1 ms | chain=2734.5 (69%) crossover=1095.3 (27%) ring=3.4 drain=91.6 out_copy=0.6 | unaccounted=60.7 (2%)
-vc profile:   chain detail: fill=135.4 acs=1050.2 unwrap=49.3 apc=36.5 pull=33.3 sync=65.4 assembly=1364.4 (formant=641.0 phase_cart=782.0 inv_fft=472.6 fold_ola=70.2)
+vc profile: granules=2661 wall=3362.6 ms | chain=2240.5 (67%) crossover=1007.7 (30%) ring=2.3 drain=63.3 out_copy=0.5 | unaccounted=48.2 (1%)
+vc profile:   chain detail: fill=113.6 acs=830.7 unwrap=35.1 apc=12.6 pull=28.3 sync=62.9 assembly=1157.4 (formant=563.7 phase_cart=687.0 inv_fft=386.1 fold_ola=61.7)
 ```
 
 The line is deliberately split into **the per-granule chain** and **everything outside it**, and both are reported as a share of measured `wall` time:

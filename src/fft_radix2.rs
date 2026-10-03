@@ -21,8 +21,14 @@ pub struct Fft {
     rev: Vec<u32>,
     /// Cosine twiddles `W[k].re` for `k < n/2`.
     wr: Vec<f32>,
-    /// Sine twiddles `W[k].im` for `k < n/2`.
+    /// Sine twiddles with the **forward** sign already applied. The inverse
+    /// transform uses the separate negated table below, so the butterfly loop
+    /// carries no `sign *` multiply: `x*c - y*s` and `x*s + y*c` must stay
+    /// separate operations, and a sign multiply was the only extra work per
+    /// butterfly.
     wi: Vec<f32>,
+    /// Sine twiddles with the inverse sign applied (`-W[k].im`).
+    wi_inv: Vec<f32>,
     /// Per-stage twiddle strides: `(ln, half, step)`.
     stages: Vec<(usize, usize, usize)>,
     /// Scratch for the out-of-place bit-reversal gather.
@@ -41,6 +47,7 @@ impl Fft {
             wr[k] = ang.cos() as f32;
             wi[k] = ang.sin() as f32;
         }
+        let wi_inv: Vec<f32> = wi.iter().map(|v| -v).collect();
         let bits = n.trailing_zeros();
         let mut rev = vec![0u32; n];
         for (i, slot) in rev.iter_mut().enumerate() {
@@ -57,6 +64,7 @@ impl Fft {
             rev,
             wr,
             wi,
+            wi_inv,
             stages,
             bre: vec![0.0; n],
             bim: vec![0.0; n],
@@ -99,26 +107,30 @@ impl Fft {
         re.copy_from_slice(&self.bre);
         im.copy_from_slice(&self.bim);
 
-        let sign = if inverse { -1.0f32 } else { 1.0f32 };
+        // The sine table already carries this direction's sign, so the inner loop
+        // is the same two fused-and-separate expressions for both directions.
+        let wi = if inverse { &self.wi_inv } else { &self.wi };
         for si in 0..self.stages.len() {
             let (ln, half, step) = self.stages[si];
             let mut base = 0usize;
             while base < n {
+                let (lo, hi) = re.split_at_mut(base + half);
+                let (lo_im, hi_im) = im.split_at_mut(base + half);
                 for j in 0..half {
                     let t = j * step;
                     let c = self.wr[t];
-                    let s = sign * self.wi[t];
-                    let xr = re[base + j + half];
-                    let xi = im[base + j + half];
+                    let s = wi[t];
+                    let xr = hi[j];
+                    let xi = hi_im[j];
                     // tr = xr*c - xi*s ; ti = xr*s + xi*c (separate ops)
                     let tr = xr * c - xi * s;
                     let ti = xr * s + xi * c;
-                    let vl = re[base + j];
-                    let ul = im[base + j];
-                    re[base + j] = vl + tr;
-                    re[base + j + half] = vl - tr;
-                    im[base + j] = ul + ti;
-                    im[base + j + half] = ul - ti;
+                    let vl = lo[base + j];
+                    let ul = lo_im[base + j];
+                    lo[base + j] = vl + tr;
+                    hi[j] = vl - tr;
+                    lo_im[base + j] = ul + ti;
+                    hi_im[j] = ul - ti;
                 }
                 base += ln;
             }

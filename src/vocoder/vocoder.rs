@@ -67,6 +67,42 @@ fn fast_math_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RADIUS_VC_FAST_MATH").is_some())
 }
 
+/// Number of threads the vocoder may use for per-channel work.
+///
+/// Defaults to `min(available_cores, 2)`. The cap is 2 because the engine's
+/// parallel regions are per **channel** and stereo is the supported case — a third
+/// thread would have no work to take. Capping also keeps the acceptance timings
+/// reproducible. `RADIUS_THREADS` overrides it: `0` forces the serial path, which
+/// is what the profiling path wants (the stage timers are thread-local, so a
+/// worker's time would not reach the report) and what the reference measurements
+/// compare against.
+///
+/// The split is exact by construction: each channel computes the operations it
+/// would compute alone, in the same order, and writes its own ring plane.
+pub(crate) fn thread_count() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        if let Ok(v) = std::env::var("RADIUS_THREADS") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "off" | "false" | "no" => return 1,
+                other => {
+                    if let Ok(n) = other.parse::<usize>() {
+                        return n.clamp(1, 2);
+                    }
+                }
+            }
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(2))
+            .unwrap_or(1)
+    })
+}
+
+/// Whether per-channel work should be split across threads at all.
+pub(crate) fn parallel_enabled() -> bool {
+    thread_count() > 1
+}
+
 #[inline]
 fn profile_reset() {
     if profile_enabled() {
@@ -319,6 +355,18 @@ pub struct VocoderState {
     b_710: Vec<f32>,
     mask_table_8f8: Vec<f32>,
     sync_weight_buf: Vec<f32>,
+    /// Reused scratch for `ev_apc`, so the per-granule work does not reallocate
+    /// five spectrum-sized buffers for every channel. Contents are meaningless
+    /// between calls; each is cleared and refilled on entry.
+    apc_dir_cur: Vec<f32>,
+    apc_dir_prev: Vec<f32>,
+    apc_env: Vec<f32>,
+    apc_region_gain: Vec<f32>,
+    /// Reused scratch for `ev_pull_to_peak`.
+    pull_rs: Vec<i64>,
+    pull_re: Vec<i64>,
+    pull_pk: Vec<i64>,
+    pull_rg: Vec<f32>,
     peak_count: usize,
     sync_sens_3496: f32,
     pitch_freq_169: f32,
@@ -430,6 +478,14 @@ impl VocoderState {
             b_710: vec![0.0; nb],
             mask_table_8f8: vec![0.0; nb],
             sync_weight_buf: vec![0.0; nb],
+            apc_dir_cur: Vec::with_capacity(nb),
+            apc_dir_prev: Vec::with_capacity(nb),
+            apc_env: Vec::with_capacity(nb),
+            apc_region_gain: Vec::with_capacity(nb),
+            pull_rs: Vec::with_capacity(nb),
+            pull_re: Vec::with_capacity(nb),
+            pull_pk: Vec::with_capacity(nb),
+            pull_rg: Vec::with_capacity(nb),
             peak_count: 0,
             // Stereo phase-synchronisation sensitivity. This was a `0.0` placeholder,
             // which is not a neutral value: the sync weight is
@@ -790,12 +846,20 @@ impl VocoderState {
             peak_count: cnt,
             vector_fmaf_region: false,
         };
-        let mut phase_mod = self.ch[ch].phase.clone();
-        let mut dir_cur = self.dir_cur[ch * self.cfg.nb_bins..(ch + 1) * self.cfg.nb_bins].to_vec();
-        let mut dir_prev =
-            self.dir_prev[ch * self.cfg.nb_bins..(ch + 1) * self.cfg.nb_bins].to_vec();
-        let env = self.env_of(ch).to_vec();
-        let region_gain = self.region_gain_of(ch).to_vec();
+        let mut phase_mod = std::mem::take(&mut self.ch[ch].phase);
+        let n = self.cfg.nb_bins;
+        let mut dir_cur = std::mem::take(&mut self.apc_dir_cur);
+        let mut dir_prev = std::mem::take(&mut self.apc_dir_prev);
+        dir_cur.clear();
+        dir_cur.extend_from_slice(&self.dir_cur[ch * n..(ch + 1) * n]);
+        dir_prev.clear();
+        dir_prev.extend_from_slice(&self.dir_prev[ch * n..(ch + 1) * n]);
+        let mut env = std::mem::take(&mut self.apc_env);
+        env.clear();
+        env.extend_from_slice(self.env_of(ch));
+        let mut region_gain = std::mem::take(&mut self.apc_region_gain);
+        region_gain.clear();
+        region_gain.extend_from_slice(self.region_gain_of(ch));
         let mut seg_bound = std::mem::take(&mut self.seg_bound_1830);
         apply_pitch_coherence(
             &args,
@@ -814,10 +878,13 @@ impl VocoderState {
             self.pitch_metric_168,
         );
         self.seg_bound_1830 = seg_bound;
-        self.ch[ch].phase.copy_from_slice(&phase_mod);
-        let n = self.cfg.nb_bins;
+        self.apc_env = env;
+        self.apc_region_gain = region_gain;
+        self.ch[ch].phase = phase_mod;
         self.dir_cur[ch * n..(ch + 1) * n].copy_from_slice(&dir_cur);
         self.dir_prev[ch * n..(ch + 1) * n].copy_from_slice(&dir_prev);
+        self.apc_dir_cur = dir_cur;
+        self.apc_dir_prev = dir_prev;
         if let Some(t0) = t0 { profile_add(|p| &mut p.apc, t0); }
     }
 
@@ -850,10 +917,23 @@ impl VocoderState {
         let lo = 0.5f32 + (0.5f32 * v74);
         let hi = 0.5f32 + (4.0f32 * v74);
         let inv_range = if hi > lo { 1.0f32 / (hi - lo) } else { 0.0 };
-        let rs: Vec<i64> = self.reg_start[..cnt].to_vec();
-        let re: Vec<i64> = self.reg_end[..cnt].to_vec();
-        let pk: Vec<i64> = self.peak_bins[..cnt].to_vec();
-        let rg = self.region_gain_of(ch).to_vec();
+        // Take the peak/region io out of the state instead of reallocating it on
+        // every granule. `ampd_pull_to_peak` writes through `&mut`, so it works
+        // straight on these buffers; the big three (32/26/16 KB) used to be a
+        // `to_vec()` per channel per granule, which is tens of thousands of
+        // allocations over a render.
+        let mut rs = std::mem::take(&mut self.pull_rs);
+        let mut re = std::mem::take(&mut self.pull_re);
+        let mut pk = std::mem::take(&mut self.pull_pk);
+        rs.clear();
+        rs.extend_from_slice(&self.reg_start[..cnt]);
+        re.clear();
+        re.extend_from_slice(&self.reg_end[..cnt]);
+        pk.clear();
+        pk.extend_from_slice(&self.peak_bins[..cnt]);
+        let mut rg = std::mem::take(&mut self.pull_rg);
+        rg.clear();
+        rg.extend_from_slice(self.region_gain_of(ch));
         let mut phase = std::mem::take(&mut self.ch[ch].phase);
         let mask = &self.ch[ch].mask;
         for r in 0..cnt {
@@ -884,6 +964,10 @@ impl VocoderState {
             }
         }
         self.ch[ch].phase = phase;
+        self.pull_rs = rs;
+        self.pull_re = re;
+        self.pull_pk = pk;
+        self.pull_rg = rg;
         if let Some(t0) = t0 { profile_add(|p| &mut p.pull, t0); }
     }
 
@@ -895,6 +979,13 @@ impl VocoderState {
         }
         let cnt = self.peak_count;
         let nb = self.cfg.nb_bins;
+        // NOTE: these three clones are deliberate, not an oversight. An in-place
+        // rewrite of `synchronize_stereo_phases` was written to avoid them and
+        // twice produced output that no longer matched the parity corpus — the
+        // operator's `dst` parameter is not just a shape hint, it initialises the
+        // output rows, so `mag`/`mask`/`phase` each play a distinct role and
+        // conflating two of them changes results. The allocation is worth keeping
+        // over a rewrite that is this easy to get subtly wrong.
         let mags: Vec<Vec<f32>> = (0..self.cfg.nch).map(|c| self.ch[c].mag.clone()).collect();
         let masks: Vec<Vec<f32>> = (0..self.cfg.nch).map(|c| self.ch[c].mask.clone()).collect();
         let phases: Vec<Vec<f32>> = (0..self.cfg.nch)
@@ -1265,7 +1356,15 @@ impl VocoderState {
         // ring scatter: j = (base + i - 1023) mod cap, per channel
         let cap = self.ring_cap;
         let base = self.fed_total as i64;
-        for (c, xo) in self.xovers.iter_mut().enumerate() {
+
+        // The band split is per channel and shares nothing between channels, so it
+        // is split across threads. That is exact by construction — each channel
+        // computes the same operations in the same order it would alone — and it is
+        // worth doing because this filter is the single largest cost in the
+        // vocoder (27% of a render after the hardware-FMA fix).
+        let base2 = base;
+        let cap2 = cap;
+        let work = |c: usize, xo: &mut Crossover, ring: &mut [f32]| {
             let input: Vec<f32> = (0..nin).map(|i| x[i * nch + c]).collect();
             let t_xo = profile_enabled().then(Instant::now);
             let bands = xo.process(&input);
@@ -1275,14 +1374,40 @@ impl VocoderState {
             let t_ring = profile_enabled().then(Instant::now);
             for b in 0..nbands {
                 for i in 0..nin {
-                    let j = crate::consts::c_mod(base + i as i64 - 1023, cap as i64) as usize;
-                    self.ring[(c * nbands + b) * cap + j] = bands[b][i];
+                    let j = crate::consts::c_mod(base2 + i as i64 - 1023, cap2 as i64) as usize;
+                    ring[b * cap2 + j] = bands[b][i];
                 }
             }
             if let Some(t0) = t_ring {
                 profile_add(|p| &mut p.ring_scatter, t0);
             }
+        };
+
+        let per_ch = nbands * cap;
+        let mut xovers = std::mem::take(&mut self.xovers);
+        let mut rings: Vec<&mut [f32]> = self.ring.chunks_mut(per_ch).collect();
+        if parallel_enabled() && nch > 1 && rings.len() >= nch {
+            let (xo0, xo_rest) = xovers.split_first_mut().expect("at least one channel");
+            let (ring0, ring_rest) = rings.split_first_mut().expect("at least one channel");
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(nch - 1);
+                for (c, (xo, ring)) in xo_rest.iter_mut().zip(ring_rest.iter_mut()).enumerate() {
+                    let w = &work;
+                    handles.push(s.spawn(move || w(c + 1, xo, ring)));
+                }
+                work(0, xo0, ring0);
+                for h in handles {
+                    h.join().expect("crossover worker panicked");
+                }
+            });
+        } else {
+            for (c, (xo, ring)) in xovers.iter_mut().zip(rings.iter_mut()).enumerate() {
+                work(c, xo, ring);
+            }
         }
+        drop(rings);
+        self.xovers = xovers;
+
         self.fed_total += nin as i64;
         while self.cursor_1376 + (self.hop_1420 as i64) < self.fed_total {
             self.process_granule();

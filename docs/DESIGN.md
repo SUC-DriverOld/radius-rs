@@ -55,6 +55,14 @@ Two places where this crate knowingly does not reproduce the reference, both bec
 
 `--fft rustfft` is a third case, but it is opt-in rather than a change of default: see [FFT.md](FFT.md).
 
+## Threading
+
+The vocoder runs its per-channel band split on one thread per channel, up to 2. This is not a numerical shortcut: the split is independent per channel and each writes its own ring plane, so the parallel path is *byte-identical* to the serial one. `RADIUS_THREADS=1` is provided to check that (the test suite compares the two on the acceptance corpus), and `RADIUS_THREADS=0` is what the profiling path wants, because the stage timers are thread-local and a worker's time would otherwise be missing from the report.
+
+The default is `min(cores, 2)`. The cap is not timidity: the parallel regions are per channel and the engine has two, so a third thread has no work to take, and oversubscribing measured slightly worse.
+
+Threads are only used where the reference's own semantics allow it. The per-granule chain (`acs`, `sync`, `assembly`) is still sequential because it shares five scratch buffers and one `FormantState`. What blocks each of those, and what was already tried against them, is written up in [VERIFICATION.md](VERIFICATION.md).
+
 ## Environment variables
 
 | variable | effect |
@@ -62,6 +70,7 @@ Two places where this crate knowingly does not reproduce the reference, both bec
 | `RADIUS_FFMPEG` | path to the ffmpeg binary; otherwise `ffmpeg` on `PATH` |
 | `RADIUS_FFT` | default FFT backend, `radix2` or `rustfft`, equivalent to `--fft` |
 | `RADIUS_PROGRESS` | force the progress bar on even when stderr is not a terminal |
+| `RADIUS_THREADS` | thread count for the vocoder's per-channel work, clamped to 2; `0`/`1`/`off` forces the serial path. See [VERIFICATION.md](VERIFICATION.md) |
 | `RADIUS_TEST_AUDIO` | acceptance corpus for the tests |
 | `RADIUS_AUDITION_REF_DIR` | directory holding the Audition reference renders |
 | `RADIUS_VC_FAST_MATH` | opt-in approximation in the vocoder's phase-to-cartesian step, faster but not reference-compatible |
