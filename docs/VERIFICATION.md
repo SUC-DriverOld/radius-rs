@@ -113,13 +113,29 @@ RADIUS_AUDITION_REF_DIR=/path/to/audition_renders \
 
 ## Performance
 
-Release build, one machine, single-threaded, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured.
+Release build, one machine, single-threaded, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured, so process start-up and the ffmpeg I/O around it are excluded.
 
 | engine | `--fft` | time | throughput |
 |---|---|---|---|
-| TD, `+3` | `radix2` | 1.83 s | ~15.9x realtime |
-| TD, `+3` | `rustfft` | 0.75 s | ~38.7x realtime |
-| vocoder, `+3` | `radix2` | 68.5 s | ~0.42x realtime |
-| vocoder, `+3` | `rustfft` | 57.1 s | ~0.51x realtime |
+| TD, `+3` | `radix2` | 1.30 s | ~22x realtime |
+| TD, `+3` | `rustfft` | 0.58 s | ~50x realtime |
+| vocoder, `+3` | `radix2` | 31.8 s | ~0.91x realtime |
+| vocoder, `+3` | `rustfft` | 22.5 s | ~1.29x realtime |
 
-The vocoder is inherently expensive, since it does 16384-point FFTs per granule; the TD engine runs far faster than real time. [FFT.md](FFT.md) explains what the faster backend costs in accuracy.
+For reference, the same measurements before the build gained hardware FMA (see below) were 1.83 s / 0.75 s / 68.5 s / 57.1 s, so the vocoder is about **2x** faster than it was and now runs at roughly real time on the default backend.
+
+That change is worth understanding, because it was invisible to stage profiling for a long time. The crate keeps `a*b + c` as one correctly-rounded operation to match the reference's `-ffp-contract=off`, which on a baseline `x86-64` target means every `f32::mul_add` call is a call to a *software* `fmaf`. The crossover filter is 4 bands by 2048 taps of that per input sample, making it **53% of the vocoder's whole runtime** — a cost that lives in `feed`, outside the per-granule timers, which is why profiling by granule stage kept ranking it last. [`.cargo/config.toml`](../.cargo/config.toml) now enables the hardware instruction; [DESIGN.md](DESIGN.md) records why that is free for accuracy.
+
+The vocoder is still inherently expensive, since it does 16384-point FFTs and several full-spectrum passes per granule; the TD engine runs far faster than real time. [FFT.md](FFT.md) explains what the faster backend costs in accuracy.
+
+### Profiling
+
+`RADIUS_PROFILE=1` prints a per-stage breakdown of the vocoder, which is the tool to use before optimising anything:
+
+```text
+vc profile: granules=4397 total=3756.3 ms fill=190.9 acs=1396.9 unwrap=59.2 apc=39.7
+            pull=47.0 sync=89.3 assembly=1933.5 formant=947.0 phase_cart=1155.2
+            inv_fft=634.0 fold_ola=105.7
+```
+
+Note what the stages cover: the per-granule chain only. `total` is the sum of them, so the CLI's `render:` time less `total` is the part spent outside the granule loop — the crossover, the ring writes, the resampler drain and the output. That gap used to be more than half the render, and reading the stage table alone gave the wrong answer about where the time went.

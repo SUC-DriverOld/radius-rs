@@ -387,7 +387,51 @@ impl Crossover {
     /// One channel: returns the band signals, `n_bands` vectors of `seq.len()`
     /// `f32` (`pyradius.vocoder_ops.Crossover.process` returns the same numbers
     /// widened to `f64`, "the C yields band values as double").
+    ///
+    /// # Why this dispatches
+    ///
+    /// The filter is 4 bands x 2048 taps of `fma` per input sample, which made it
+    /// **53% of a vocoder render** (measured: 3.40 s of 6.38 s for 3 s of 48 kHz
+    /// stereo). The crate's default target is baseline `x86-64`, whose feature set
+    /// has no `fma`, so `f32::mul_add` cannot be a hardware instruction there and
+    /// every tap becomes a call to a software correctly-rounded `fmaf`. Enabling
+    /// FMA takes the same work from 3.40 s to 1.11 s.
+    ///
+    /// That is a *pure* speedup: hardware FMA is a single correctly-rounded
+    /// operation, so it produces the same bits as the software path. It is not an
+    /// approximation, and `crossover_matches_reference_bits` plus the full parity
+    /// suite verify that under `-C target-cpu=native`.
+    ///
+    /// So the FMA build is selected at run time rather than by requiring a
+    /// non-default `target-cpu`, which would make the binary refuse to start on
+    /// older CPUs.
     pub fn process(&mut self, seq: &[f32]) -> Vec<Vec<f32>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("fma") {
+                // SAFETY: guarded by the runtime detection above.
+                return unsafe { self.process_fma(seq) };
+            }
+        }
+        self.process_impl(seq)
+    }
+
+    /// [`Crossover::process`] compiled with hardware FMA available.
+    ///
+    /// # Safety
+    /// The caller must have verified `fma` support (see `Crossover::process`).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "fma")]
+    unsafe fn process_fma(&mut self, seq: &[f32]) -> Vec<Vec<f32>> {
+        self.process_impl(seq)
+    }
+
+    /// The implementation, compiled for whatever features the caller's context
+    /// has. `#[inline(always)]` so the FMA-enabled caller really does get an FMA
+    /// inner loop — a `#[target_feature]` function cannot be inlined into a
+    /// non-FMA caller, so the split has to be at this boundary.
+    #[inline(always)]
+    fn process_impl(&mut self, seq: &[f32]) -> Vec<Vec<f32>> {
         let n = seq.len();
         let big_n = self.n;
         let mut out = vec![vec![0.0f32; n]; self.n_bands];
@@ -414,32 +458,44 @@ impl Crossover {
         }
 
         let z = &self.z;
+        // The sixteen lane accumulators are separate scalars, not `s[j]` indexed
+        // by a runtime `j`: an indexed array makes the compiler keep them in
+        // memory and reload/store all sixteen on every tap (measured ~7% slower).
+        // Processing several output samples per tap load ("time blocking") was
+        // also tried and did *not* help, because the loop is bound by the FMA
+        // issue rate rather than by load latency or the accumulator chains — see
+        // the note on `Crossover::process` about the software `fma`.
+        assert!(
+            self.n % 16 == 0,
+            "crossover FIR length must be a multiple of 16"
+        );
         for b in 0..self.n_bands {
             let tr = &self.taps_rev[b * big_n..(b + 1) * big_n];
+            let outb = &mut out[b];
             for t in 0..n {
                 let mut s = [0.0f32; 16];
                 let mut k = 0usize;
                 while k < big_n {
-                    // `s[j] = fma(hp[t, k+j], taps_rev[k+j], s[j])`
                     for j in 0..16 {
                         s[j] = fma(z[t + k + j], tr[k + j], s[j]);
                     }
                     k += 16;
                 }
-                // NEON tree `vaddvq(vaddq(vaddq(s0,s1), vaddq(s2,s3)))`:
-                // lane `l` is `((s[l] + s[4+l]) + (s[8+l] + s[12+l]))` — the
-                // Python's `(sj[0] + sj[1]) + (sj[2] + sj[3])` with
-                // `sj[i][l] = s[4i + l]` — and the horizontal add reduces the
-                // four lanes as `(v0 + v1) + (v2 + v3)`.
-                let mut v = [0.0f32; 4];
-                for l in 0..4 {
-                    v[l] = (s[l] + s[4 + l]) + (s[8 + l] + s[12 + l]);
-                }
-                out[b][t] = (v[0] + v[1]) + (v[2] + v[3]);
+                outb[t] = reduce16(s);
             }
         }
         out
     }
+}
+
+/// Collapse the sixteen lane accumulators the way the NEON horizontal add does.
+#[inline(always)]
+fn reduce16(s: [f32; 16]) -> f32 {
+    let v0 = (s[0] + s[4]) + (s[8] + s[12]);
+    let v1 = (s[1] + s[5]) + (s[9] + s[13]);
+    let v2 = (s[2] + s[6]) + (s[10] + s[14]);
+    let v3 = (s[3] + s[7]) + (s[11] + s[15]);
+    (v0 + v1) + (v2 + v3)
 }
 
 /// One-channel fresh-instance run (as in the C op harness).

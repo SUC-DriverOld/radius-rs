@@ -17,6 +17,7 @@ Radius supports two pitch-shifting engines, selectable at run time:
 
 * **Rust** 1.75 or newer, edition 2021.
 * **ffmpeg** at run time, for any audio I/O. The library itself has no audio codec in it: reading and writing go through ffmpeg, so every format it supports works in both directions.
+* A CPU with **AVX and FMA** on x86-64, i.e. Intel Haswell (2013) or AMD Excavator (2015) and newer. [`.cargo/config.toml`](.cargo/config.toml) turns the feature on because the engine mirrors the reference's `a*b + c` as one correctly-rounded operation, and without it every fused multiply-add becomes a software call — worth about 2x on the vocoder. It changes no output bits. See [docs/DESIGN.md](docs/DESIGN.md); build with `RUSTFLAGS=-C target-feature=-fma` to drop the requirement.
 
 ffmpeg is looked up as `ffmpeg` on `PATH`, or wherever `RADIUS_FFMPEG` points:
 
@@ -40,9 +41,27 @@ radius in.flac out.flac -m vc -s -3 -b 24
 # format conversion only (the default is no pitch change)
 radius in.wav out.mp3 --mp3-bitrate 320
 
+# faster FFT backend (not bit-exact; see docs/FFT.md)
+radius in.wav out.wav -m vc -s 3 --fft rustfft
+
 # engine, CLI and C ABI tests; needs no external audio
 cargo test --release
+
+# vocoder benchmark: crossover and full render, per FFT backend
+cargo run --release --example bench_vc
 ```
+
+## Profiling and benchmarks
+
+`RADIUS_PROFILE=1` prints a per-stage breakdown of the vocoder, which is the first thing to reach for before optimising anything:
+
+```bash
+RADIUS_PROFILE=1 radius in.wav out.wav -m vc -s 3
+```
+
+Note that the stages cover the per-granule chain only. The CLI's `render:` time minus their sum is what was spent outside it — the crossover, the ring writes and the output — and that gap is where the vocoder's single largest cost used to hide. [docs/VERIFICATION.md](docs/VERIFICATION.md) has the details and current numbers.
+
+`cargo run --release --example bench_vc` measures the crossover alone versus a full render, under each FFT backend, so a change can be attributed to the right part of the pipeline.
 
 ## Learn more
 

@@ -1,0 +1,31 @@
+# Project build flags.
+#
+# `+fma` is a large, and numerically free, win for the vocoder.
+#
+# The crate is written to mirror the reference engine's arithmetic exactly, which
+# means `a*b + c` must stay a single correctly-rounded operation (`-ffp-contract=off`
+# in the C, `f32::mul_add` here). On the default `x86-64` target the feature set has
+# no `fma`, so `mul_add` *cannot* be a hardware instruction: every one of the ~73
+# call sites becomes a call to a software correctly-rounded `fmaf`. The vocoder's
+# crossover alone is 4 bands x 2048 taps of it per sample, which measured **53% of a
+# whole render** (3.40 s of 6.38 s for 3 s of 48 kHz stereo).
+#
+# Enabling the feature fixes that without changing a single bit of output: hardware
+# FMA is one correctly-rounded operation, identical to the software path. Measured on
+# that same benchmark:
+#
+#   crossover   3.40 s -> 1.11 s   (3.1x)
+#   full render 6.38 s -> 3.83 s   (1.67x, radix-2 FFT)
+#
+# `crossover_matches_reference_bits` and the full parity suite pass either way.
+#
+# What this costs: the binary then requires AVX + FMA, i.e. Intel Haswell (2013) or
+# AMD Excavator (2015) and newer. Nothing else in the crate needs it. Build with
+# `RUSTFLAGS=-C target-feature=-fma` (or edit this file) for a baseline-CPU binary
+# that is portable to older hardware and ~1.7x slower on the vocoder.
+#
+# For the fastest build on a known machine, override with
+# `RUSTFLAGS=-C target-cpu=native`; that measured a further ~12%, and on an AArch64
+# host is what enables the NEON FMA the reference engine actually uses.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+fma"]

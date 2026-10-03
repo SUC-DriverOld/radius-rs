@@ -9,9 +9,9 @@ The engines need a real FFT at 8192 points (the TD pitch front-end), 4096/2048
 | `rustfft` | the [`rustfft`](https://crates.io/crates/rustfft) crate — mixed-radix | `--fft rustfft` |
 
 ```bash
-cargo build --release                      # radix2 only
-cargo build --release                    # both, selected at run time
-
+cargo build --release          # both kernels are always compiled in
+                                                                
+# pick one at run time (--fft), per process or per call
 radius in.wav out.wav -m td -s 3 --fft rustfft
 ```
 
@@ -21,6 +21,11 @@ the `1/N` inverse scaling, and picks the kernel. Selection is per thread
 (`fft::set_backend`) or process-wide via `RADIUS_FFT`, and the plan cache is
 keyed by `(size, backend)` so a mid-process switch cannot hand out the wrong
 plan.
+
+There is no Cargo feature for this: both kernels are always linked, and the choice
+is a run-time one. The build flags that matter are in
+[`.cargo/config.toml`](../.cargo/config.toml), and they apply to both kernels — see
+the note there about hardware FMA, which is worth roughly 2x on the vocoder.
 
 ## Shipped default: radix-2
 
@@ -48,29 +53,25 @@ substitute for the vocoder.
 
 ## Speed
 
-Measured on the same 29.03 s file with one binary, one process at a time, selecting
-the backend with `--fft` (the `RADIUS_FFT` environment variable remains available
-for library callers):
+Measured on the same 29.03 s file with one binary, one process at a time, reading the
+engine's own `render:` timing (so process start-up and the ffmpeg I/O are excluded),
+selecting the backend with `--fft` (the `RADIUS_FFT` environment variable remains
+available for library callers):
 
 | path | radix-2 | rustfft | speedup |
 |---|---|---|---|
-| TD (`-m td`) | 1.26 s | 0.54 s | **2.3x** |
-| vocoder (`-m vc`) | 45.1 s | 35.9 s | **1.26x** |
+| TD (`-m td`) | 1.30 s | 0.58 s | **2.2x** |
+| vocoder (`-m vc`) | 31.8 s | 22.5 s | **1.41x** |
 
-Bare transform cost on the same machine (400 iterations of a real `N`-point
-forward plus the cart packing each backend needs):
+Both columns are faster than earlier revisions of this document recorded, because the
+project now builds with hardware FMA (see [`.cargo/config.toml`](../.cargo/config.toml)).
+The vocoder's gain from `rustfft` is *larger* than it used to be (1.41x against 1.26x):
+with the crossover no longer dominating the render, the transforms are a bigger share
+of what is left, so the same per-transform advantage buys more.
 
-| size | radix-2 | rustfft | speedup |
-|---|---|---|---|
-| 2048 | 23 µs | 3 µs | 7.5x |
-| 4096 | 52 µs | 7 µs | 7.8x |
-| 8192 | 149 µs | 54 µs | 2.8x |
-| 16384 | 346 µs | 74 µs | 4.7x |
-
-The TD engine's whole-render gain (2.3x) tracks the 8192-point figure because
-its pitch front-end is dominated by those transforms. The vocoder gains much
-less overall (1.26x) because at 16384 points its per-granule cost is spread
-across dozens of operator loops, not just the transform.
+The TD engine's whole-render gain (2.2x) tracks its pitch front-end, which is dominated
+by 8192-point transforms. The vocoder gains less because at 16384 points its cost is
+spread across dozens of operator loops, not just the transform.
 
 ## Why not just use `rustfft` everywhere?
 
@@ -88,7 +89,9 @@ different properties:
 An earlier revision of this crate went further and made `rustfft` a *compile
 time* default for the whole engine. That was reverted: it silently cost the
 vocoder its acceptance margin, and a build flag is exactly the kind of thing
-that gets forgotten between a benchmark and a release.
+that gets forgotten between a benchmark and a release. The same argument is why
+the backend is a run-time switch rather than a Cargo feature — a feature is a
+property of the build, and the build is the thing nobody re-reads.
 
 ## Correctness tests
 

@@ -30,9 +30,8 @@
  *      -lpthread -ldl -lm -o example                          # Linux / macOS
  *
  * The extra Windows libraries are what the Rust standard library itself references.
- * The static archive also bundles the Ogg/Vorbis and LAME C objects when built with
- * `--features vorbis,mp3`, which can produce harmless `LNK4098`/`LNK4217` warnings
- * about the CRT (add `-NODEFAULTLIB:libucrt` to silence them).
+ * There is no Cargo feature to worry about: audio I/O goes through the external
+ * ffmpeg binary, so nothing third-party is compiled into the archive.
  */
 
 #include <math.h>

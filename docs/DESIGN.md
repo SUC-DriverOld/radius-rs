@@ -33,6 +33,19 @@ The reference engine is compiled with `-ffp-contract=off` and keeps almost every
 
 That discipline is what buys the `max|d| = 3.6e-07` agreement reported in [VERIFICATION.md](VERIFICATION.md).
 
+### Hardware FMA: required for speed, and free for accuracy
+
+Keeping `a*b + c` a single correctly-rounded operation has a consequence that is easy to miss: on the default `x86-64` target, whose feature set has no `fma`, `f32::mul_add` **cannot** be a hardware instruction. Every one of the crate's ~73 `mul_add` call sites then calls a software correctly-rounded `fmaf` instead. The vocoder's crossover is 4 bands by 2048 taps of it per input sample, and that alone measured **53% of a whole render**.
+
+[`.cargo/config.toml`](../.cargo/config.toml) therefore builds with `-C target-feature=+fma`. This changes **no output bits**: hardware FMA is one correctly-rounded operation, exactly what the software path computes, so the reference agreement above is untouched and the bit-exact tests pass under either setting. What it does cost is a higher CPU floor (AVX + FMA, i.e. Intel Haswell 2013 / AMD Excavator 2015 and newer). Measured on 3 s of 48 kHz stereo:
+
+| | software `fma` | hardware `fma` |
+|---|---|---|
+| crossover | 3.40 s | 1.11 s |
+| full vocoder render | 6.38 s | 3.83 s |
+
+`Crossover::process` additionally dispatches on `is_x86_feature_detected!("fma")` so the hardware path is still taken if the flags are overridden, and the crate still behaves correctly on a CPU without FMA. Build with `RUSTFLAGS=-C target-feature=-fma` for a baseline-CPU binary; use `RUSTFLAGS=-C target-cpu=native` for about 12% more on a known machine.
+
 ## Deliberate behaviour differences
 
 Two places where this crate knowingly does not reproduce the reference, both because the reference is wrong:
