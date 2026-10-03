@@ -111,6 +111,14 @@ impl Container {
         }
     }
 
+    /// The file extension this container is written with, without the dot.
+    ///
+    /// Used when the CLI has to invent an output name, so that the name it invents
+    /// implies the container it is about to write.
+    pub fn extension(self) -> &'static str {
+        self.muxer()
+    }
+
     /// The codec and its quality options.
     fn encoder_args(self, opts: &WriteOptions) -> Result<Vec<String>, String> {
         let v = |s: &str| s.to_string();

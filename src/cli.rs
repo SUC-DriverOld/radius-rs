@@ -4,6 +4,7 @@
 //! codecs (symphonia for decoding, hound/flacenc/vorbis/lame for encoding) so
 //! no external `ffmpeg` is required.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::io::{BitDepth, Container, WriteOptions};
@@ -42,8 +43,8 @@ pub enum Mode {
     about = "Pitch-shift audio with the Radius TD or phase-vocoder engine.",
     long_about = "Pitch-shift audio with the Radius TD or phase-vocoder engine.\n\nUse --help for the compact option list; see the README for detailed engine and format notes.",
     after_help = "EXAMPLES:\n  \
-        radius in.wav out.wav -m td -s 3\n  \
-        radius in.flac out.mp3 -m vc -s -3 --mp3-bitrate 320\n  \
+        radius in.wav -m td -s 3\n  \
+        radius in.wav out.mp3 -m vc -s -3 --mp3-bitrate 320\n  \
         radius in.wav out.flac --bit-depth 24\n  \
         radius in.wav out.wav -m td -s 3 --truth reference.wav"
 )]
@@ -52,9 +53,9 @@ pub struct Cli {
     #[arg(value_name = "INPUT")]
     pub input: String,
 
-    /// Output audio file; extension selects the container.
+    /// Output audio file. mit it to derive a name from the input.
     #[arg(value_name = "OUTPUT")]
-    pub output: String,
+    pub output: Option<String>,
 
     /// Engine: td (default) or vc.
     #[arg(short, long, value_enum, default_value_t = Mode::Td, value_name = "td|vc")]
@@ -75,7 +76,7 @@ pub struct Cli {
     pub semitones: f64,
 
     /// Time stretch percentage (100 = unchanged).
-    #[arg(long, default_value_t = 100.0, value_name = "PERCENT")]
+    #[arg(short, long, default_value_t = 100.0, value_name = "PERCENT")]
     pub tempo: f64,
 
     /// TD quality, 1 (fast) .. 100 (fine).
@@ -376,16 +377,156 @@ pub fn write_options(cli: &Cli) -> WriteOptions {
 }
 
 /// The container this run will actually produce.
+///
+/// Resolution order, highest priority first:
+///
+/// 1. `--format`, the explicit override;
+/// 2. the output path's extension;
+/// 3. the **input's** extension, when no output path was given and that format can
+///    be written at all;
+/// 4. WAV.
+///
+/// Step 3 is why a bare `radius in.flac` produces FLAC rather than WAV: the output
+/// format follows the input unless told otherwise, and 4 is the fallback for an
+/// input this crate can read but not write (compressed-only containers such as
+/// AAC/M4A, which ffmpeg can encode but which the size/quality knobs here do not
+/// cover).
 pub fn effective_container(cli: &Cli) -> Option<Container> {
-    cli.format
-        .or_else(|| Container::from_path(&cli.output).ok())
+    if let Some(c) = cli.format {
+        return Some(c);
+    }
+    if let Some(out) = &cli.output {
+        if let Ok(c) = Container::from_path(out) {
+            return Some(c);
+        }
+    }
+    if let Ok(c) = Container::from_path(&cli.input) {
+        return Some(c);
+    }
+    Some(Container::Wav)
+}
+
+/// The output path, deriving one from the input when the caller did not give it.
+///
+/// The derived suffix records only the engine and the two shifts that change the
+/// signal, in that order, e.g. `_vc_st-3_tp200`:
+///
+/// | piece | shown when | example |
+/// |---|---|---|
+/// | mode | always | `vc`, `td` |
+/// | `st<semitones>` | semitones != 0 | `st3`, `st-3`, `st2.5` |
+/// | `tp<tempo>` | tempo != 100 | `tp200`, `tp87.5` |
+///
+/// So `-m vc -s 0 --tempo 100` yields `name_vc.flac`, and `-m vc -s -3 --tempo 200`
+/// yields `name_vc_st-3_tp200.flac`. Anything else about the run (quality, precision,
+/// bit depth, FFT backend) is deliberately not in the name. The extension comes from
+/// the resolved container, not from the input, so the name always describes the file
+/// that will actually be written.
+///
+/// # Where the file lands
+///
+/// Next to the **input**, not in the working directory: `radius /music/a.flac -m vc`
+/// writes `/music/a_vc.flac`. That is what `flac`, `pngquant` and friends do when
+/// they derive an output name, and it is the only choice that survives a batch run —
+/// `find . -name '*.flac' -exec radius {} -m vc -s 3 \;` would otherwise pile every
+/// result into one directory, colliding on the stems and losing which output came
+/// from which input. The ` (1)`/` (2)` collision rule below is borrowed from Finder's
+/// "Keep Both", which also works beside the original file.
+///
+/// A path the user gave explicitly is used exactly as written, relative to the
+/// working directory like any other command line path.
+pub fn output_path(cli: &Cli, container: Container) -> PathBuf {
+    if let Some(p) = &cli.output {
+        return PathBuf::from(p);
+    }
+    let input = Path::new(&cli.input);
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let name = format!("{stem}{}.{}", shift_suffix(cli), container.extension());
+    match input.parent() {
+        // `parent()` of a bare filename is `Some("")`, which `join` would turn into
+        // a CWD-relative path anyway; treating it as "no directory" keeps the
+        // common `radius in.wav` case producing a plain relative name.
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// The `_vc_st-3_tp200` piece of a derived output name. See [`output_path`].
+fn shift_suffix(cli: &Cli) -> String {
+    let mode = match cli.mode {
+        Mode::Td => "td",
+        Mode::Vc => "vc",
+    };
+    let mut s = format!("_{mode}");
+    if cli.semitones != 0.0 {
+        s.push_str(&format!("_st{}", trim_num(cli.semitones)));
+    }
+    if cli.tempo != 100.0 {
+        s.push_str(&format!("_tp{}", trim_num(cli.tempo)));
+    }
+    s
+}
+
+/// `3.0` -> `3`, `-3.0` -> `-3`, `2.5` -> `2.5`, `87.50` -> `87.5`.
+///
+/// A whole number loses its fraction entirely so the common case reads `st3` rather
+/// than `st3.0`, which also keeps the name stable regardless of how the value was
+/// written on the command line (`-s 3` and `-s 3.0` must not produce different
+/// files).
+fn trim_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// Return `desired`, or `desired` with ` (1)`, ` (2)`, ... inserted before the
+/// extension until it names a file that does not exist.
+///
+/// The point is that a run never overwrites anything: an existing file of the same
+/// name is treated as a previous run's output and stepped over, the way a browser
+/// download does. The caller passes an already-unique path through unchanged.
+pub fn unique_path(desired: impl AsRef<Path>) -> PathBuf {
+    let desired = desired.as_ref();
+    if !desired.exists() {
+        return desired.to_path_buf();
+    }
+    let dir = desired.parent();
+    let stem = desired
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let ext = desired.extension().and_then(|s| s.to_str());
+    for n in 1u32.. {
+        let mut name = format!("{stem} ({n})");
+        if let Some(ext) = ext {
+            name.push('.');
+            name.push_str(ext);
+        }
+        let candidate = match dir {
+            Some(d) if !d.as_os_str().is_empty() => d.join(&name),
+            _ => PathBuf::from(&name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("the counter is unbounded")
 }
 
 /// Human-readable description of what the writer will produce.
-pub fn describe_output(cli: &Cli) -> String {
-    match effective_container(cli) {
-        Some(Container::Wav) => format!("wav {}", depth_name(cli.bit_depth)),
-        Some(Container::Flac) => format!(
+///
+/// Takes the container rather than the `Cli` because the container may have been
+/// inferred from the input (see [`effective_container`]) or from a derived output
+/// name, so it is not always recoverable from the options alone.
+pub fn describe_container(container: Container, cli: &Cli) -> String {
+    match container {
+        Container::Wav => format!("wav {}", depth_name(cli.bit_depth)),
+        Container::Flac => format!(
             "flac {}",
             if cli.bit_depth == BitDepth::I16 {
                 "16-bit"
@@ -393,9 +534,8 @@ pub fn describe_output(cli: &Cli) -> String {
                 "24-bit"
             }
         ),
-        Some(Container::Ogg) => format!("ogg/vorbis q={:.2}", cli.ogg_quality),
-        Some(Container::Mp3) => format!("mp3 {} kbps", cli.mp3_bitrate),
-        None => "unknown format".to_string(),
+        Container::Ogg => format!("ogg/vorbis q={:.2}", cli.ogg_quality),
+        Container::Mp3 => format!("mp3 {} kbps", cli.mp3_bitrate),
     }
 }
 

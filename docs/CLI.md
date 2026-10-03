@@ -1,7 +1,7 @@
 # Command line reference
 
 ```
-radius <INPUT> <OUTPUT> [OPTIONS]
+radius <INPUT> [OUTPUT] [OPTIONS]
 ```
 
 Every option is listed below with its default and the reason for it, together with the equivalent control in Adobe Audition's 效果 → 伸缩与变调 (Stretch and Pitch) dialog, which drives the same Radius algorithm family.
@@ -11,7 +11,30 @@ Every option is listed below with its default and the reason for it, together wi
 | argument | meaning |
 |---|---|
 | `INPUT` | Input audio file. Any container or codec ffmpeg can read: wav, flac, ogg/vorbis, mp3, aac/adts, m4a/alac, mkv/webm, aiff, caf, … Its **sample rate and channel count are used as-is** and written unchanged to the output. There is deliberately no rate option, so input and output always agree. |
-| `OUTPUT` | Output audio file. The extension selects the container unless `--format` overrides it. An unknown extension without `--format` is an error rather than a guess. |
+| `OUTPUT` | **Optional.** Output audio file; the extension selects the container unless `--format` overrides it. An unknown extension without `--format` is an error rather than a guess. Omit it entirely and a name is derived from the input, in the input's own format where that format can be written. |
+
+## Omitting the output name
+
+`radius in.flac -m vc -s -3 --tempo 200` writes `in_vc_st-3_tp200.flac` **next to the input**, so `radius /music/a.flac -m vc` writes `/music/a_vc.flac`. The suffix records only what changed about the signal:
+
+| piece | shown when | examples |
+|---|---|---|
+| mode | always | `vc`, `td` |
+| `st<semitones>` | semitones ≠ 0 | `st3`, `st-3`, `st2.5` |
+| `tp<tempo>` | tempo ≠ 100 | `tp200`, `tp87.5` |
+
+A whole number loses its fraction, so `-s 3` and `-s 3.0` produce the same name. Everything else about the run — quality, precision, bit depth, FFT backend — is deliberately left out, so the name describes the *shift* rather than every knob.
+
+Beside the input rather than in the working directory is deliberate, and matches what `flac`, `pngquant` and similar tools do when they derive a name. It is the only placement that survives a batch run: `find . -name '*.flac' -exec radius {} -m vc -s 3 \;` would otherwise collect every result into one directory, colliding on the stems and losing track of which output came from which input. It is also what Finder's "Keep Both" does, and the ` (1)` rule below is borrowed from there.
+
+Two further rules make this safe to use from a shell loop:
+
+* **The output format follows the input.** With no `--format` and no output extension, the container comes from the input file, so `in.flac` produces FLAC and `in.wav` produces WAV. An input this crate can read but not write — AAC/M4A, for instance, which ffmpeg decodes but for which there is no encoder here — falls back to **WAV**. `--format` outranks both of those, and an explicit output extension outranks the input as well.
+* **Nothing is ever overwritten.** If the chosen name already exists, ` (1)`, ` (2)`, … is inserted before the extension until it does not, the way a browser names a second download. This applies to a name you typed as well as to a derived one, so a mistyped output path cannot silently destroy an earlier render.
+
+Quality is never traded for convenience: the bit depth and the lossy-quality defaults are untouched by either rule, so a derived `_vc_st3.flac` is the same 24-bit lossless file you would have got by naming it yourself.
+
+An explicit `OUTPUT` is used exactly as written, relative to the working directory like any other command line path — only the derived case is placed relative to the input.
 
 ## Defaults
 

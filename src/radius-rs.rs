@@ -83,8 +83,13 @@ fn run(cli: &Cli) -> Result<()> {
 
     // What a non-float target would have to do with this signal.
     let clip = analyse_clipping(&out);
-    let container = effective_container(cli);
-    if let Some(w) = clip_warning(&clip, cli.bit_depth, container) {
+    // The output format follows the input unless `--format` or the output
+    // extension says otherwise, and the name is derived from the input when the
+    // caller did not give one. Both are resolved here rather than in the writer so
+    // the clipping warning below describes the file actually being produced.
+    let container = effective_container(cli).unwrap_or(radius_rs::io::Container::Wav);
+    let output_path = cli::unique_path(cli::output_path(cli, container));
+    if let Some(w) = clip_warning(&clip, cli.bit_depth, Some(container)) {
         eprintln!("{w}");
     } else if clip.over > 0 {
         println!(
@@ -98,13 +103,14 @@ fn run(cli: &Cli) -> Result<()> {
         sample_rate: sr,
         channels: nch,
     };
-    audio::write(&cli.output, &audio_out, cli::write_options(cli)).map_err(anyhow::Error::msg)?;
+    audio::write(&output_path, &audio_out, cli::write_options(cli))
+        .map_err(anyhow::Error::msg)?;
     println!(
         "wrote {} ({} frames, {:.3}s, {}, peak {:.4})",
-        cli.output,
+        output_path.display(),
         audio_out.frames(),
         audio_out.duration(),
-        cli::describe_output(cli),
+        cli::describe_container(container, cli),
         clip.peak
     );
 

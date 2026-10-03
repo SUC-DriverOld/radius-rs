@@ -189,13 +189,24 @@ pub fn read_audio(path: &Path) -> Wav {
 
 /// Write 32-bit float WAV through ffmpeg.
 pub fn write_wav(path: &Path, samples: &[f32], rate: u32, channels: usize) {
+    write_wav_with(path, samples, rate, channels, Default::default())
+}
+
+/// Write 32-bit float WAV with extra options, e.g. a forced container so the path's
+/// extension does not have to name one.
+pub fn write_wav_with(
+    path: &Path,
+    samples: &[f32],
+    rate: u32,
+    channels: usize,
+    opts: radius_rs::io::WriteOptions,
+) {
     let a = radius_rs::io::Audio {
         samples: samples.to_vec(),
         sample_rate: rate,
         channels,
     };
-    radius_rs::io::write(path, &a, radius_rs::io::WriteOptions::default())
-        .unwrap_or_else(|e| panic!("{e}"));
+    radius_rs::io::write(path, &a, opts).unwrap_or_else(|e| panic!("{e}"));
 }
 
 /// What ffmpeg says is in a file: codec name, sample rate, channel count.
@@ -286,8 +297,27 @@ pub fn synthetic_stereo(rate: u32, frames: usize) -> Wav {
 pub fn synthetic_file(tag: &str, rate: u32, frames: usize) -> PathBuf {
     let path = tmp_dir().join(format!("synth_{tag}_{rate}_{frames}.wav"));
     if !path.is_file() {
+        // Write to a private name and rename into place. Cargo runs tests in
+        // parallel, and several of them ask for the same cached fixture at the same
+        // moment; writing straight to `path` lets one test observe another's
+        // half-written file. That surfaced as "ffmpeg produced an empty file" coming
+        // out of a *reader*, in a test that does no writing at all. `rename` is
+        // atomic and replaces on both Windows and Unix, so a concurrent reader sees
+        // either no file or a complete one.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let scratch = PathBuf::from(format!(
+            "{}.{}.{}.part",
+            path.display(),
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let w = synthetic_stereo(rate, frames);
-        write_wav(&path, &w.samples, rate, 2);
+        let opts = radius_rs::io::WriteOptions {
+            container: Some(radius_rs::io::Container::Wav),
+            ..Default::default()
+        };
+        write_wav_with(&scratch, &w.samples, rate, 2, opts);
+        std::fs::rename(&scratch, &path).unwrap_or_else(|e| panic!("{e}"));
     }
     path
 }

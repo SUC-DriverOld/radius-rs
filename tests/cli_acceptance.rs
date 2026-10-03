@@ -703,3 +703,165 @@ fn cli_quality_options_are_honoured() {
         "stderr: {err}"
     );
 }
+
+/// Run the binary with `dir` as its working directory, so tests of the derived
+/// output name (which lands in the CWD) do not litter the source tree.
+fn run_in(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(bin())
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("failed to spawn radius");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Work dir for the derived-name tests, unique per call.
+fn cwd(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "radius_rs_cwd_{tag}_{}",
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// The output argument is optional. With no output path the CLI derives one from the
+/// input name plus a suffix describing the run, places it beside the input, and keeps
+/// running when a file of that name already exists instead of clobbering it.
+#[test]
+fn cli_derives_the_output_name_when_none_is_given() {
+    let dir = cwd("derived");
+    // Copy the synthetic input in so the derived name is predictable.
+    let src = input_wav();
+    let local = dir.join("song.wav");
+    std::fs::copy(&src, &local).unwrap();
+
+    // mode only: semitones 0 and tempo 100 contribute nothing to the name
+    let (ok, stdout, err) = run_in(&dir, &["song.wav", "-m", "td"]);
+    assert!(ok, "derived-output run failed: {err}");
+    assert!(stdout.contains("song_td.wav"), "stdout: {stdout}");
+    assert!(dir.join("song_td.wav").is_file());
+
+    // semitones and tempo appear, mode first, in that order
+    let (ok, stdout, err) = run_in(&dir, &["song.wav", "-m", "vc", "-s", "-3", "--tempo", "200"]);
+    assert!(ok, "run failed: {err}");
+    assert!(stdout.contains("song_vc_st-3_tp200.wav"), "stdout: {stdout}");
+    assert!(dir.join("song_vc_st-3_tp200.wav").is_file());
+
+    // a whole-number shift reads `st3`, not `st3.0`
+    let (ok, _, err) = run_in(&dir, &["song.wav", "-m", "vc", "-s", "3"]);
+    assert!(ok, "run failed: {err}");
+    assert!(dir.join("song_vc_st3.wav").is_file());
+
+    // never overwrite: the same command again must step over the existing file
+    let (ok, stdout, err) = run_in(&dir, &["song.wav", "-m", "td"]);
+    assert!(ok, "second run failed: {err}");
+    assert!(stdout.contains("song_td (1).wav"), "stdout: {stdout}");
+    let (ok, stdout, _) = run_in(&dir, &["song.wav", "-m", "td"]);
+    assert!(ok);
+    assert!(stdout.contains("song_td (2).wav"), "stdout: {stdout}");
+    // ...and all three still exist
+    for n in ["song_td.wav", "song_td (1).wav", "song_td (2).wav"] {
+        assert!(dir.join(n).is_file(), "{n} went missing");
+    }
+
+    // A derived name goes beside the *input*, not into the working directory: run
+    // from `elsewhere` against `sub/song.wav` and the result must join the input.
+    let sub = dir.join("sub");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::copy(&src, sub.join("song.wav")).unwrap();
+    let (ok, stdout, err) = run_in(&elsewhere, &["../sub/song.wav", "-m", "td", "-s", "4"]);
+    assert!(ok, "run from another directory failed: {err}");
+    assert!(stdout.contains("song_td_st4.wav"), "stdout: {stdout}");
+    assert!(
+        sub.join("song_td_st4.wav").is_file(),
+        "the output should sit beside the input, not in the working directory"
+    );
+    assert!(
+        !elsewhere.join("song_td_st4.wav").exists(),
+        "the output must not be created in the working directory"
+    );
+
+    // An explicit path is still taken relative to the working directory.
+    let (ok, _, err) = run_in(&elsewhere, &["../sub/song.wav", "picked.wav", "-m", "td"]);
+    assert!(ok, "explicit-output run failed: {err}");
+    assert!(elsewhere.join("picked.wav").is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With no `--format` and no output extension, the output format follows the *input*
+/// when the input's format is one this crate can write, and falls back to WAV when it
+/// is not. `--format` still wins over both.
+#[test]
+fn cli_output_format_follows_the_input() {
+    if !codec_available("the input-format-following cases") {
+        return;
+    }
+    let dir = cwd("follows");
+    let src = input_wav();
+    // A lossless FLAC input: the output should be FLAC, not WAV.
+    let flac = dir.join("song.flac");
+    let a = read_audio(&src);
+    radius_rs::io::write(
+        &flac,
+        &radius_rs::io::Audio {
+            samples: a.samples.clone(),
+            sample_rate: a.rate,
+            channels: a.channels,
+        },
+        radius_rs::io::WriteOptions {
+            container: Some(radius_rs::io::Container::Flac),
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+
+    let (ok, stdout, err) = run_in(&dir, &["song.flac", "-m", "td"]);
+    assert!(ok, "flac-input run failed: {err}");
+    assert!(stdout.contains("song_td.flac"), "stdout: {stdout}");
+    let out = dir.join("song_td.flac");
+    assert!(out.is_file(), "no .flac output was written");
+    assert_eq!(
+        ffmpeg_info(&out).codec,
+        "flac",
+        "the output should have followed the input's format"
+    );
+
+    // A format this crate cannot write falls back to WAV. `m4a`/AAC is exactly such
+    // an input: ffmpeg decodes it, but the CLI has no encoder for it, so the fixture
+    // has to be built with ffmpeg directly rather than through the CLI.
+    let m4a = dir.join("song.m4a");
+    let st = Command::new(radius_rs::io::ffmpeg_program())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&flac)
+        .args(["-c:a", "aac"])
+        .arg(&m4a)
+        .status()
+        .expect("failed to spawn ffmpeg");
+    assert!(st.success(), "could not build the m4a fixture");
+    let (ok, stdout, err) = run_in(&dir, &["song.m4a", "-m", "td"]);
+    assert!(ok, "unsupported-format-input run failed: {err}");
+    assert!(
+        stdout.contains("song_td.wav"),
+        "an unwritable input format must fall back to wav: {stdout}"
+    );
+    assert_eq!(ffmpeg_info(&dir.join("song_td.wav")).codec, "pcm_f32le");
+
+    // --format outranks the input's format.
+    let (ok, stdout, err) = run_in(&dir, &["song.flac", "-m", "td", "-s", "2", "--format", "mp3"]);
+    assert!(ok, "override run failed: {err}");
+    assert!(stdout.contains("song_td_st2.mp3"), "stdout: {stdout}");
+    assert_eq!(ffmpeg_info(&dir.join("song_td_st2.mp3")).codec, "mp3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

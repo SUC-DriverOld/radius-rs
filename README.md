@@ -35,6 +35,10 @@ cargo build --release
 # +3 semitones with the time-domain engine
 radius in.wav out.wav -m td -s 3
 
+# the output name is optional: this writes in_vc_st-3_tp200.flac next to the
+# input, following the input's format, and refuses to overwrite anything
+radius in.flac -m vc -s -3 --tempo 200
+
 # -3 semitones with the phase vocoder, written as 24-bit FLAC
 radius in.flac out.flac -m vc -s -3 -b 24
 
