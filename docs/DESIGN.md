@@ -44,7 +44,7 @@ Keeping `a*b + c` a single correctly-rounded operation has a consequence that is
 | crossover | 3.40 s | 1.11 s |
 | full vocoder render | 6.38 s | 3.83 s |
 
-`Crossover::process` additionally dispatches on `is_x86_feature_detected!("fma")` so the hardware path is still taken if the flags are overridden, and the crate still behaves correctly on a CPU without FMA. Build with `RUSTFLAGS=-C target-feature=-fma` for a baseline-CPU binary; use `RUSTFLAGS=-C target-cpu=native` for about 12% more on a known machine.
+`Crossover::process` additionally dispatches on `is_x86_feature_detected!("fma")` so the hardware path is still taken if the flags are overridden, and the crate still behaves correctly on a CPU without FMA. Build with `RUSTFLAGS=-C target-feature=-fma` for a baseline-CPU binary; use `RUSTFLAGS=-C target-cpu=native` for about 12% more on a known machine. Explicit AVX2 intrinsics for the crossover were written, measured and **rejected**: the eight-window construction needs 2 loads plus a permute plus a blend per tap pair against the scalar path's 4 instructions, so the upside is ~1.1x, and `-C target-feature=+fma,+avx2` was measured *slower* on this workload (6.27 s vs 5.73 s for a 5 s render).
 
 ## Deliberate behaviour differences
 

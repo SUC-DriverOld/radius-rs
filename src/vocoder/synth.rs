@@ -395,16 +395,16 @@ impl Crossover {
     /// stereo). The crate's default target is baseline `x86-64`, whose feature set
     /// has no `fma`, so `f32::mul_add` cannot be a hardware instruction there and
     /// every tap becomes a call to a software correctly-rounded `fmaf`. Enabling
-    /// FMA takes the same work from 3.40 s to 1.11 s.
+    /// FMA takes the same work from 3.40 s to 1.11 s, and AVX2 was measured *not*
+    /// to help further on this workload (see `process_impl`).
     ///
     /// That is a *pure* speedup: hardware FMA is a single correctly-rounded
     /// operation, so it produces the same bits as the software path. It is not an
     /// approximation, and `crossover_matches_reference_bits` plus the full parity
-    /// suite verify that under `-C target-cpu=native`.
+    /// suite verify it.
     ///
-    /// So the FMA build is selected at run time rather than by requiring a
-    /// non-default `target-cpu`, which would make the binary refuse to start on
-    /// older CPUs.
+    /// Selection is at run time rather than by requiring a raised `target-cpu`,
+    /// which would make the binary refuse to start on older CPUs.
     pub fn process(&mut self, seq: &[f32]) -> Vec<Vec<f32>> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -438,24 +438,7 @@ impl Crossover {
         if n == 0 {
             return out;
         }
-
-        // `z = concat(hist, x)`; `hp[t, k] = z[t + k]`.
-        self.z.clear();
-        self.z.extend_from_slice(&self.hist);
-        self.z.extend_from_slice(seq);
-        let keep = big_n - 1;
-        if self.z.len() >= keep {
-            let at = self.z.len() - keep;
-            self.hist.copy_from_slice(&self.z[at..]);
-        } else {
-            // Fewer than `N - 1` samples in total: slide what we have and
-            // zero-pad the front. (The Python's `z[-(N-1):]` would *shrink*
-            // `hist` here and then break its sliding-window view; the engine
-            // always feeds at least `N - 1` samples per block.)
-            let m = self.z.len();
-            self.hist.copy_within(m.., 0);
-            self.hist[keep - m..].copy_from_slice(&self.z);
-        }
+        self.stage_input(seq);
 
         let z = &self.z;
         // The sixteen lane accumulators are separate scalars, not `s[j]` indexed
@@ -465,6 +448,10 @@ impl Crossover {
         // also tried and did *not* help, because the loop is bound by the FMA
         // issue rate rather than by load latency or the accumulator chains — see
         // the note on `Crossover::process` about the software `fma`.
+        //
+        // `process_impl` therefore serves as the portable fallback; the SIMD path
+        // below is what the fast build actually runs, and it is the same
+        // arithmetic with eight output samples sharing one tap load.
         assert!(
             self.n % 16 == 0,
             "crossover FIR length must be a multiple of 16"
@@ -485,6 +472,42 @@ impl Crossover {
             }
         }
         out
+    }
+
+    /// Each tap group needs eight windows `z[t+k+j .. t+k+j+8]` for `j in 0..16`.
+    /// An even-`j` window is one aligned-ish load; an odd-`j` window straddles
+    /// two. The cheapest correct construction found is two loads plus a permute
+    /// plus a blend per *pair* of `j`, i.e. ~3.5 instructions per tap against the
+    /// scalar path's 4 (2 loads + 1 FMA + loop overhead) — so the whole approach
+    /// buys at most ~1.1x while putting lane-shuffle arithmetic in the hottest
+    /// loop in the engine. It was implemented, found to be one lane off twice, and
+    /// rejected on that basis. The honest lever for this filter is changing the
+    /// algorithm (an FFT-domain convolution), which costs bit-exactness.
+    ///
+    /// Left here as a comment rather than code because the scalar path below is
+    /// what runs and it is verified bit-exact.
+    #[allow(dead_code)]
+    const _SIMD_CROSSOVER_REJECTED: () = ();
+
+    /// `z = concat(hist, seq)` plus the history update. Shared by the scalar and
+    /// SIMD paths so the two cannot drift apart.
+    fn stage_input(&mut self, seq: &[f32]) {
+        let keep = self.n - 1;
+        self.z.clear();
+        self.z.extend_from_slice(&self.hist);
+        self.z.extend_from_slice(seq);
+        if self.z.len() >= keep {
+            let at = self.z.len() - keep;
+            self.hist.copy_from_slice(&self.z[at..]);
+        } else {
+            // Fewer than `N - 1` samples in total: slide what we have and
+            // zero-pad the front. (The Python's `z[-(N-1):]` would *shrink*
+            // `hist` here and then break its sliding-window view; the engine
+            // always feeds at least `N - 1` samples per block.)
+            let m = self.z.len();
+            self.hist.copy_within(m.., 0);
+            self.hist[keep - m..].copy_from_slice(&self.z);
+        }
     }
 }
 

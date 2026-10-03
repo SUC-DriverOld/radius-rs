@@ -34,7 +34,19 @@ struct VcProfile {
     phase_cart: Duration,
     inverse_fft: Duration,
     fold_ola: Duration,
+    /// Outside the per-granule chain, and therefore invisible to every stage
+    /// above: the band split in [`VocoderState::feed`].
+    crossover: Duration,
+    /// The band samples going into the per-channel rings, also in `feed`.
+    ring_scatter: Duration,
+    /// `take_output` plus the resampler drain in [`VocoderState::render`].
+    drain: Duration,
+    /// Copying the drained frames into the caller's interleaved buffer.
+    out_copy: Duration,
     granules: u64,
+    /// Wall time from the start of `render` to the profile report. Everything
+    /// above is compared against this, so "unaccounted" cannot hide again.
+    wall: Duration,
 }
 
 thread_local! {
@@ -68,11 +80,40 @@ fn profile_report() {
     }
     VC_PROFILE.with(|p| {
         let p = *p.borrow();
-        let total = p.fill + p.acs + p.unwrap + p.apc + p.pull + p.sync + p.assembly;
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        // The per-granule chain, then the parts of `render` that are outside it.
+        // Reporting both, against measured wall time, is the whole point: the
+        // crossover used to be 53% of this engine and was invisible here because
+        // it runs in `feed`, between granules.
+        let chain = p.fill + p.acs + p.unwrap + p.apc + p.pull + p.sync + p.assembly;
+        let outside = p.crossover + p.ring_scatter + p.drain + p.out_copy;
+        let accounted = chain + outside;
+        let unaccounted = p.wall.saturating_sub(accounted);
+        let pct = |d: Duration| {
+            if p.wall.is_zero() {
+                0.0
+            } else {
+                100.0 * d.as_secs_f64() / p.wall.as_secs_f64()
+            }
+        };
         eprintln!(
-            "vc profile: granules={} total={:.1} ms fill={:.1} acs={:.1} unwrap={:.1} apc={:.1} pull={:.1} sync={:.1} assembly={:.1} formant={:.1} phase_cart={:.1} inv_fft={:.1} fold_ola={:.1}",
-            p.granules, ms(total), ms(p.fill), ms(p.acs), ms(p.unwrap), ms(p.apc), ms(p.pull), ms(p.sync), ms(p.assembly), ms(p.formant), ms(p.phase_cart), ms(p.inverse_fft), ms(p.fold_ola)
+            "vc profile: granules={} wall={:.1} ms | chain={:.1} ({:.0}%) crossover={:.1} ({:.0}%) ring={:.1} drain={:.1} out_copy={:.1} | unaccounted={:.1} ({:.0}%)",
+            p.granules,
+            ms(p.wall),
+            ms(chain),
+            pct(chain),
+            ms(p.crossover),
+            pct(p.crossover),
+            ms(p.ring_scatter),
+            ms(p.drain),
+            ms(p.out_copy),
+            ms(unaccounted),
+            pct(unaccounted),
+        );
+        eprintln!(
+            "vc profile:   chain detail: fill={:.1} acs={:.1} unwrap={:.1} apc={:.1} pull={:.1} sync={:.1} assembly={:.1} (formant={:.1} phase_cart={:.1} inv_fft={:.1} fold_ola={:.1})",
+            ms(p.fill), ms(p.acs), ms(p.unwrap), ms(p.apc), ms(p.pull), ms(p.sync),
+            ms(p.assembly), ms(p.formant), ms(p.phase_cart), ms(p.inverse_fft), ms(p.fold_ola),
         );
     });
 }
@@ -1226,12 +1267,20 @@ impl VocoderState {
         let base = self.fed_total as i64;
         for (c, xo) in self.xovers.iter_mut().enumerate() {
             let input: Vec<f32> = (0..nin).map(|i| x[i * nch + c]).collect();
+            let t_xo = profile_enabled().then(Instant::now);
             let bands = xo.process(&input);
+            if let Some(t0) = t_xo {
+                profile_add(|p| &mut p.crossover, t0);
+            }
+            let t_ring = profile_enabled().then(Instant::now);
             for b in 0..nbands {
                 for i in 0..nin {
                     let j = crate::consts::c_mod(base + i as i64 - 1023, cap as i64) as usize;
                     self.ring[(c * nbands + b) * cap + j] = bands[b][i];
                 }
+            }
+            if let Some(t0) = t_ring {
+                profile_add(|p| &mut p.ring_scatter, t0);
             }
         }
         self.fed_total += nin as i64;
@@ -1269,6 +1318,7 @@ impl VocoderState {
     /// `vc_render` — the C driver's feed rhythm and resampler drain loop.
     pub fn render(&mut self, x: &[f32]) -> Vec<f32> {
         profile_reset();
+        let t_render = profile_enabled().then(Instant::now);
         self.start_streaming();
         let nch = self.cfg.nch;
         let nframes = x.len() / nch;
@@ -1318,6 +1368,7 @@ impl VocoderState {
                     break;
                 }
                 let chunk_n = chunk_n as usize;
+                let t_drain = profile_enabled().then(Instant::now);
                 let mut ph = drain_phase % ring_len as f64;
                 if ph < 0.0 {
                     ph += ring_len as f64;
@@ -1330,10 +1381,17 @@ impl VocoderState {
                     .collect();
                 let plane =
                     interp_nsamples(&tbl, &planes, ring_len, ph, chunk_n, ratio, ratio as f32);
+                if let Some(t0) = t_drain {
+                    profile_add(|p| &mut p.drain, t0);
+                }
+                let t_copy = profile_enabled().then(Instant::now);
                 for i in 0..chunk_n {
                     for c in 0..nch {
                         out[(out_n + i) * nch + c] = plane[c][i];
                     }
+                }
+                if let Some(t0) = t_copy {
+                    profile_add(|p| &mut p.out_copy, t0);
                 }
                 out_n += chunk_n;
                 drain_phase += chunk_n as f64 * ratio;
@@ -1341,6 +1399,9 @@ impl VocoderState {
                     break;
                 }
             }
+        }
+        if let Some(t0) = t_render {
+            profile_add(|p| &mut p.wall, t0);
         }
         profile_report();
         out

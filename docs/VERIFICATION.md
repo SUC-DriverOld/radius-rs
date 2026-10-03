@@ -130,12 +130,16 @@ The vocoder is still inherently expensive, since it does 16384-point FFTs and se
 
 ### Profiling
 
-`RADIUS_PROFILE=1` prints a per-stage breakdown of the vocoder, which is the tool to use before optimising anything:
+`RADIUS_PROFILE=1` prints a breakdown of a vocoder render, which is the tool to use before optimising anything:
 
 ```text
-vc profile: granules=4397 total=3756.3 ms fill=190.9 acs=1396.9 unwrap=59.2 apc=39.7
-            pull=47.0 sync=89.3 assembly=1933.5 formant=947.0 phase_cart=1155.2
-            inv_fft=634.0 fold_ola=105.7
+vc profile: granules=2661 wall=3986.1 ms | chain=2734.5 (69%) crossover=1095.3 (27%) ring=3.4 drain=91.6 out_copy=0.6 | unaccounted=60.7 (2%)
+vc profile:   chain detail: fill=135.4 acs=1050.2 unwrap=49.3 apc=36.5 pull=33.3 sync=65.4 assembly=1364.4 (formant=641.0 phase_cart=782.0 inv_fft=472.6 fold_ola=70.2)
 ```
 
-Note what the stages cover: the per-granule chain only. `total` is the sum of them, so the CLI's `render:` time less `total` is the part spent outside the granule loop — the crossover, the ring writes, the resampler drain and the output. That gap used to be more than half the render, and reading the stage table alone gave the wrong answer about where the time went.
+The line is deliberately split into **the per-granule chain** and **everything outside it**, and both are reported as a share of measured `wall` time:
+
+* `chain` is the granule event sequence — `acs` (the forward transforms and peak search), `assembly` (the inverse transform, formant correction, fold and overlap-add), and the phase stages. Its own breakdown is on the second line.
+* `crossover` is the 4-band FIR in `feed`. It is not a granule stage at all, which is exactly why it went unnoticed for so long: an earlier version of this profiler summed only the chain and printed that as `total`, so the largest single cost in the engine did not appear anywhere in the output. Someone reading that table concluded the crossover was negligible when it was **53%** of the render.
+* `ring`, `drain` and `out_copy` cover the band samples going into the per-channel rings, the resampler drain, and the interleaving into the caller's buffer.
+* `unaccounted` is `wall` minus everything above. It should stay near zero; if it grows, the profiler has a new blind spot, which is the signal to instrument whatever was just added rather than to trust the table.
