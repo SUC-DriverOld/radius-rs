@@ -17,7 +17,7 @@ fn render_wav(path: &std::path::Path, semis: f64) -> (Wav, Vec<f32>, TdState) {
     let input = read_wav(path);
     let mut st = TdState::new(input.rate, 37, 0, input.channels);
     st.set_ratio(semis, 100.0);
-    let out = st.render(&input.samples, input.frames());
+    let out = st.render(&input.samples, input.frames(), input.frames());
     (input, out, st)
 }
 
@@ -173,7 +173,7 @@ fn td_pitch_ratio_is_measured_correctly() {
     for semis in [3.0f64, -3.0] {
         let mut st = TdState::new(SR, 37, 0, 2);
         st.set_ratio(semis, 100.0);
-        let out = st.render(&x, frames);
+        let out = st.render(&x, frames, frames);
         assert!(out.iter().all(|v| v.is_finite()), "semis {semis}");
         // analyse a steady middle section, free of the startup transient
         let m = mono(&out, 2);

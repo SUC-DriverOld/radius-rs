@@ -39,8 +39,11 @@ Swap in the vocoder for polyphonic material. It takes the whole buffer and no fr
 ```rust
 use radius_rs::VocoderState;
 
-let mut engine = VocoderState::new(48_000, 2, 2); // rate, channels, precision
-engine.set_ratio(-3.0, 100.0);
+let mut engine = VocoderState::new(48_000, 2); // sample rate, channels
+engine.set_ratio(-3.0, 100.0);                 // semitones, tempo percent
+engine.set_gain(0.0);                          // output gain in dB (0 = bit-exact)
+engine.set_formant_shift(0.0);                 // spectral envelope shift, semitones
+engine.set_preserve_voice(true);               // formant preservation (the default)
 let output = engine.render(&input);
 ```
 

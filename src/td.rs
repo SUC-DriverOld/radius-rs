@@ -78,6 +78,8 @@ pub struct TdState {
     ti: Option<TiState>,
 
     pub stretch: f64,
+    /// Output gain in dB, applied to the finished samples. 0.0 is a no-op.
+    pub gain_db: f64,
     pub total_ratio: f64,
     pub pitch_ratio: f64,
 
@@ -163,6 +165,7 @@ impl TdState {
             pitch_buf: vec![0.0; geom.l1 + geom.n],
             ti: None,
             stretch: 1.0,
+            gain_db: 0.0,
             total_ratio: 1.0,
             pitch_ratio: 1.0,
             cursor: 0,
@@ -249,6 +252,16 @@ impl TdState {
         self.stretch = tempo / 100.0;
         self.pitch_ratio = 2.0f64.powf(semis / 12.0);
         self.total_ratio = self.pitch_ratio * self.stretch;
+    }
+
+    /// Multiply the output by `db` decibels, as a plain linear scale.
+    ///
+    /// Applied to the finished samples, after the engine, so it cannot interact with
+    /// the reference arithmetic: `set_gain(0.0)` is a no-op and leaves the output
+    /// bit-exact.
+    pub fn set_gain(&mut self, db: f64) -> &mut Self {
+        self.gain_db = db;
+        self
     }
 
     pub fn geometry(&self) -> &PitchGeom {
@@ -651,7 +664,18 @@ impl TdState {
 
     /// `rx_td_render` — render `nframes` interleaved frames into an interleaved
     /// output buffer, returning the number of output frames.
-    pub fn render(&mut self, x: &[f32], nframes: usize) -> Vec<f32> {
+    /// Render the first `nframes` input frames, producing `target_out` output frames.
+    ///
+    /// `nframes` is how much **input** is real; everything past it reads as silence.
+    /// `target_out` is how many **output** frames to make, which is what `--tempo`
+    /// moves: the stretch scales the output timeline while the pitch ratio moves the
+    /// read cursor, so `target_out = round(nframes * tempo / 100)` is longer than the
+    /// input when the tempo is above 100 and shorter when it is below.
+    ///
+    /// The reference driver produces exactly `nframes`, so
+    /// `render(x, nframes, nframes)` is the reference-faithful path and the one the
+    /// parity corpus is measured on.
+    pub fn render(&mut self, x: &[f32], nframes: usize, target_out: usize) -> Vec<f32> {
         let hop = self.hop as i64;
         let win_max = self.win_max;
         let nch = self.nch;
@@ -703,10 +727,14 @@ impl TdState {
         self.dedup.clear();
 
         let gate = hop + ((hop >> 1) << (if self.state_330 != 0 { 3 } else { 0 })) + 100;
-        let nstop = as_u32(nframes as i64) as i64;
-        let total_ext = as_u32(nframes as i64 + 4 * gate + 65536) as i64;
+        // The granule pump runs until the *output* is finished, so its bounds are
+        // driven by `target_out`, not by the input length. When the tempo stretches
+        // the timeline the pump has to keep going past the end of the input (reading
+        // the zero tail), and when it compresses the pump stops early.
+        let nstop = as_u32(target_out as i64) as i64;
+        let total_ext = as_u32(target_out as i64 + 4 * gate + 65536) as i64;
         let mut cursor_append: i64 = 0;
-        let loop_bound = as_u32(nframes as i64 + gate + 8 * hop) as i64;
+        let loop_bound = as_u32(target_out as i64 + gate + 8 * hop) as i64;
         let mut feed_n = 0usize;
         let mut fed_visible: i64;
         let mix_len = self.mix.len();
@@ -1084,7 +1112,7 @@ impl TdState {
                 }
             }
 
-            if cursor_append >= as_u32(nframes as i64 + gate + 8 * hop) as i64 {
+            if cursor_append >= as_u32(target_out as i64 + gate + 8 * hop) as i64 {
                 break;
             }
             if fed_pos >= nstop && cursor_append >= nframes as i64 {
@@ -1100,6 +1128,12 @@ impl TdState {
         for c in out_chunks {
             out[off..off + c.len()].copy_from_slice(&c);
             off += c.len();
+        }
+        if self.gain_db != 0.0 {
+            let m = 10.0f64.powf(self.gain_db / 20.0) as f32;
+            for v in out.iter_mut() {
+                *v *= m;
+            }
         }
         out
     }

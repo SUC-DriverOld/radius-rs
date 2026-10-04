@@ -230,7 +230,24 @@ pub struct VocoderConfig {
 }
 
 impl VocoderConfig {
-    pub fn for_rate(sr: u32, nch: usize, precision: i32) -> Self {
+    /// The reference driver's `precision` value, fixed.
+    ///
+    /// This used to be a public knob, but it is not a precision and not a quality
+    /// setting: it indexes the overlap-add write-gain table
+    /// (`edge_gain[p.clamp(0, 3)]`), so it changed the output *level* and nothing
+    /// else, and `3..=9` were byte-identical. It is pinned to the reference default
+    /// so the parity corpus keeps matching; use the CLI's `--gain` to change level.
+    pub const REFERENCE_PRECISION: i32 = 2;
+
+    pub fn for_rate(sr: u32, nch: usize) -> Self {
+        Self::for_rate_with_precision(sr, nch, Self::REFERENCE_PRECISION)
+    }
+
+    /// As [`VocoderConfig::for_rate`], with an explicit reference `precision`.
+    ///
+    /// Exposed for the C ABI, which keeps `rx_vc_init`'s third argument so that
+    /// existing callers do not break. Prefer [`VocoderConfig::for_rate`].
+    pub fn for_rate_with_precision(sr: u32, nch: usize, precision: i32) -> Self {
         let (n_fft, nb_bins, m_fft, mb_bins, n_write, hop) = if sr == 44100 {
             (
                 8192usize, 4097usize, 2048usize, 1025usize, 6599usize, 3299i32,
@@ -383,18 +400,156 @@ pub struct VocoderState {
     /// phase-inverted pair comes back in phase, and a hard-panned right channel comes
     /// back at the left channel's level). See [`VocoderState::feed`].
     xovers: Vec<Crossover>,
-    formant: FormantState,
+    /// The formant operator. Its `cfg` carries the live ratio, which is the pitch
+    /// ratio offset by [`VocoderState::set_formant_shift`].
+    pub formant: FormantState,
     // ---- ratio ----
     pub ratio: f64,
     pub stretch: f64,
+    /// Output gain in dB, applied to the finished samples. 0.0 is a no-op.
+    pub gain_db: f64,
+    /// Formant (spectral envelope) shift in semitones; `0.0` preserves the formants
+    /// as the pitch moves, which is the reference behaviour.
+    pub formant_semitones: f64,
     pub pitch_ratio: f64,
     pub total_ratio: f64,
     trace: bool,
 }
 
 impl VocoderState {
-    pub fn new(sr: u32, nch: usize, precision: i32) -> Self {
-        Self::with_config(VocoderConfig::for_rate(sr, nch, precision))
+    /// A vocoder for `sr` (44100 or 48000) with `nch` channels.
+    pub fn new(sr: u32, nch: usize) -> Self {
+        Self::with_config(VocoderConfig::for_rate(sr, nch))
+    }
+
+    /// As [`VocoderState::new`], with an explicit reference `precision`.
+    ///
+    /// Only the C ABI needs this; see [`VocoderConfig::REFERENCE_PRECISION`].
+    pub fn with_precision(sr: u32, nch: usize, precision: i32) -> Self {
+        Self::with_config(VocoderConfig::for_rate_with_precision(sr, nch, precision))
+    }
+
+    /// Multiply the output by `db` decibels, as a plain linear scale.
+    ///
+    /// Applied to the finished samples, after the engines, so it cannot interact
+    /// with the reference arithmetic: `set_gain(0.0)` is a no-op and leaves the
+    /// output bit-exact. Returns `self` for chaining.
+    pub fn set_gain(&mut self, db: f64) -> &mut Self {
+        self.gain_db = db;
+        self
+    }
+
+    /// The configured output gain in dB.
+    pub fn gain_db(&self) -> f64 {
+        self.gain_db
+    }
+
+    /// How the formants adapt to the pitch shift, in semitones.
+    ///
+    /// Audition calls this 共振变换 and describes it as determining "how the formant peaks
+    /// adapt to the pitch shift": `0` moves the formants and the pitch together, keeping
+    /// the timbre and the naturalness; a value above `0` gives a brighter result by
+    /// moving the formants up (a male voice sounding female is the usual example), and
+    /// below `0` the opposite.
+    ///
+    /// It works by *offsetting the formant operator's ratio* away from the pitch ratio.
+    /// The operator applies a gain curve of `db[round(R * v)] - db[v]`, whose passband
+    /// sits a factor `R` above the analysed envelope's; since the vocoder has already
+    /// transposed that envelope by the pitch ratio, the envelope the listener finally
+    /// hears sits at `f0 * pitch_ratio / R`. Setting
+    ///
+    /// ```text
+    ///   R = pitch_ratio * 2^(-semitones / 12)
+    /// ```
+    ///
+    /// therefore puts it at `f0 * 2^(semitones / 12)`, i.e. exactly `semitones` away
+    /// from where it started and independent of the pitch — which is what makes this an
+    /// absolute control rather than a second pitch knob. Measured on a 100 Hz harmonic
+    /// series with a formant near 4 kHz, `+6` lands 6.0 .. 7.2 semitones up across pitch
+    /// `+1/+6/+12` (a spread of 1.2) and `0` stays within 0.8.
+    ///
+    /// While the two ratios are equal — the `0` default — the envelope rides along with
+    /// the pitch exactly and the formants are preserved, which is the reference
+    /// behaviour and bit-exact.
+    ///
+    /// Has no effect where the formant operator is off: `--mode td`, a vocoder run with
+    /// no pitch shift, or [`VocoderState::set_preserve_voice`] set to `false`.
+    pub fn set_formant_shift(&mut self, semitones: f64) -> &mut Self {
+        self.formant_semitones = semitones;
+        self.sync_formant_ratio();
+        self
+    }
+
+    /// The formant shift in semitones.
+    pub fn formant_shift(&self) -> f64 {
+        self.formant_semitones
+    }
+
+    /// Push the formant operator's ratio, which is the pitch ratio offset by the
+    /// requested formant shift. Called from `set_ratio` and
+    /// [`VocoderState::set_formant_shift`] so the two can never disagree, and so that
+    /// either call order gives the same result.
+    fn sync_formant_ratio(&mut self) {
+        let f = 2.0f64.powf(-self.formant_semitones / 12.0);
+        self.formant.cfg.ratio = (self.ratio * f) as f32;
+    }
+
+    /// Audition's 音调一致 (pitch coherence), `0.0 .. 4.0`, default `1.0`.
+    ///
+    /// This is the reference's `trans_sens`: it scales the threshold that decides
+    /// whether `ApplyPitchCoherence` rewrites a region's phase (`v133 =
+    /// 1.4 * trans_sens * (v13 + 1)`). `0.0` disables the operator entirely — the
+    /// reference documents that as the "no pitch coherence" setting.
+    ///
+    /// **Not exposed on the CLI.** Every signal tried so far renders byte-identically
+    /// at every value in range: the stage runs, but no region crosses its threshold.
+    /// It is kept here because the reference has the parameter and the wiring is real,
+    /// so a future input or a corrected threshold could still use it — but it is not
+    /// offered as a knob that appears to do nothing.
+    pub fn set_pitch_coherence(&mut self, v: f32) -> &mut Self {
+        self.cfg.trans_sens = v;
+        self
+    }
+
+    /// The configured pitch coherence (the reference's `trans_sens`).
+    pub fn pitch_coherence(&self) -> f32 {
+        self.cfg.trans_sens
+    }
+
+    /// Audition's 保持语音特性 (preserve voice characteristics), default `true`.
+    ///
+    /// This is the formant operator's `active` flag. With it on — the default, and the
+    /// reference's hardcoded value — the spectral envelope stays where it is while the
+    /// pitch moves, so a shifted voice still sounds like the same voice. Turning it
+    /// off makes the envelope follow the pitch instead, which is what an unpreserved
+    /// shift sounds like.
+    ///
+    /// Measured on a 200 Hz harmonic series with a formant at 2 kHz, shifted +3
+    /// semitones: preserved leaves the formant at 1647 Hz (roughly held), unpreserved
+    /// moves it to 2172 Hz (following the pitch).
+    ///
+    /// With this off, [`VocoderState::set_formant_shift`] has nothing to offset and
+    /// does nothing. Also has no effect where the operator is already inert: the
+    /// time-domain engine, or a vocoder run with no pitch shift.
+    pub fn set_preserve_voice(&mut self, on: bool) -> &mut Self {
+        self.formant.cfg.active = i32::from(on);
+        self
+    }
+
+    /// Whether formant preservation is on.
+    pub fn preserve_voice(&self) -> bool {
+        self.formant.cfg.active == 1
+    }
+
+    /// Apply [`VocoderState::gain_db`] in place. Called by the render entry points.
+    fn apply_gain(&self, buf: &mut [f32]) {
+        if self.gain_db == 0.0 {
+            return;
+        }
+        let m = 10.0f64.powf(self.gain_db / 20.0) as f32;
+        for v in buf.iter_mut() {
+            *v *= m;
+        }
     }
 
     pub fn with_config(cfg: VocoderConfig) -> Self {
@@ -510,6 +665,8 @@ impl VocoderState {
             formant,
             ratio: 1.0,
             stretch: 1.0,
+            gain_db: 0.0,
+            formant_semitones: 0.0,
             pitch_ratio: 1.0,
             total_ratio: 1.0,
             trace: false,
@@ -541,16 +698,37 @@ impl VocoderState {
     }
 
     /// `set_ratio` — `pitch_chain(semis)` + the driver's `exp2` chain.
+    /// Set the pitch shift (semitones) and the time stretch (percent).
+    ///
+    /// # Why the stretch does *not* go into `ratio`
+    ///
+    /// `ratio` is the analysis/synthesis rate, and it is **the pitch control**: the
+    /// granule cursor advances by it, so doubling it doubles the pitch. Feeding the
+    /// tempo into it — which is what this port used to do — made `--tempo 200` raise
+    /// the pitch by an octave and `--tempo 50` drop it by an octave (measured on a
+    /// 440 Hz tone at +3 semitones: 523 Hz / 1047 Hz / 262 Hz).
+    ///
+    /// The stretch belongs on the *output* side instead, where it only changes how
+    /// fast the finished ring is read: `ratio` stays the pitch, the resampler runs at
+    /// `ratio * stretch`, and the frame target is `input * stretch`. That reproduces
+    /// what the reference TD engine does and what the Audition references show —
+    /// `--tempo` changes the duration and leaves the pitch alone.
+    ///
+    /// The reference's own `vc_render` has no tempo parameter at all (its second
+    /// argument is `quality`), so there is no reference behaviour to preserve here;
+    /// the stretch is this crate's addition and has to be wired up explicitly.
     pub fn set_ratio(&mut self, semis: f64, tempo: f64) {
         self.stretch = tempo / 100.0;
         let pr = 2.0f64.powf(semis / 12.0);
         let s = 12.0f32 * (pr as f32).log2();
-        self.ratio = 2.0f64.powf(s as f64 / 12.0) * self.stretch;
+        self.ratio = 2.0f64.powf(s as f64 / 12.0);
         self.pitch_ratio = self.ratio;
         self.total_ratio = self.ratio;
         self.cfg.total_ratio = self.ratio;
         self.comp_1432 = self.ratio * self.hop_1420 as f64;
-        self.formant.cfg.ratio = self.ratio as f32;
+        // Keep the formant operator in step: its ratio is the pitch ratio offset by
+        // the formant shift, and it must follow the pitch as well.
+        self.sync_formant_ratio();
     }
 
     #[inline]
@@ -1441,32 +1619,76 @@ impl VocoderState {
     }
 
     /// `vc_render` — the C driver's feed rhythm and resampler drain loop.
+    /// `vc_render` — the C driver's feed rhythm and resampler drain loop.
+    ///
+    /// Produces exactly as many frames as the input has, which is what the reference
+    /// driver does and what the parity corpus is measured against.
     pub fn render(&mut self, x: &[f32]) -> Vec<f32> {
+        let n = x.len() / self.cfg.nch.max(1);
+        self.render_to(x, n)
+    }
+
+    /// As [`VocoderState::render`], but producing `target_frames` output frames.
+    ///
+    /// `target_frames` is how many frames to make, of which the first
+    /// `x.len() / nch` come from the real signal; any remainder is reached by feeding
+    /// zeros past the end, the same end-of-stream flush the reference performs. The
+    /// caller derives it from the requested time stretch
+    /// (`round(input_frames * tempo / 100)`), because the reference's own
+    /// `vc_render` hardcodes the output to the input length — which is exactly why a
+    /// tempo change had no effect on duration before this existed.
+    ///
+    /// A `target_frames` equal to the input length reproduces [`VocoderState::render`]
+    /// bit for bit.
+    pub fn render_to(&mut self, x: &[f32], target_frames: usize) -> Vec<f32> {
         profile_reset();
         let t_render = profile_enabled().then(Instant::now);
         self.start_streaming();
         let nch = self.cfg.nch;
-        let nframes = x.len() / nch;
+        // Real input frames available; everything past this reads as silence.
+        let in_frames = x.len() / nch;
+        let target = target_frames;
         let ring_len = self.cfg.ring_out_len as i64;
+        // The drain resampler's `rate` **is** the pitch: reading a ring that already
+        // holds the shifted signal at rate `r` scales its frequency by `r` (verified
+        // directly — a 440 Hz ring read at 1.1892 gives 524 Hz). So the rate must be
+        // the pitch ratio alone. Putting the stretch here too is what made `--tempo`
+        // an octave shift.
+        //
+        // The stretch therefore acts through *how much is fed*: the synthetic timeline
+        // is `stretch` times as long, so the feed continues (past the input, as
+        // silence) until `target * pitch_ratio` frames have been pushed in. That is
+        // the same amount the reference feeds for an unstretched run, times `stretch`.
         let ratio = self.ratio;
-        // Progress is reported as output frames made against input frames: the
-        // engine is duration preserving, so the two converge.
-        self.progress_total = nframes.max(1) as i64;
+        // Progress is reported against the frames we are actually going to make.
+        self.progress_total = target.max(1) as i64;
         self.progress.store(0, std::sync::atomic::Ordering::Relaxed);
-        let mut out = vec![0.0f32; nframes * nch];
+        let mut out = vec![0.0f32; target * nch];
         let tbl = InterpTable::new(8192, 6, 16.0);
         let mut drain_phase = 0.0f64;
         let mut out_n = 0usize;
         let mut pos = 0usize;
         const CH: usize = 1024;
         let mut chunk = vec![0.0f32; CH * nch];
-        while out_n < nframes {
+        // Feed the whole input, then keep feeding silence while the drain still has
+        // signal to take — the reference's own loop, which runs until it has
+        // `target` output frames.
+        //
+        // There used to be a `feed_limit = target * ratio` here. That was wrong at low
+        // ratios: the resampler reads the output ring slowly, so a downward shift needs
+        // *more* ring frames than it emits output frames, and the limit starved it. At
+        // -28 semitones it cut the feed to 9 525 frames, `pos_1384` never passed the hop
+        // (`writepos` stayed 0, so `head` was -100 and the drain took nothing), and the
+        // whole render came out silent. The reference renders -36 semitones fine, and
+        // now so does this. Termination is the `out_n >= target` check plus the drain's
+        // own `head <= drain_phase`, exactly as in the reference.
+        while out_n < target {
             let n = if pos == 0 { 448 } else { 1024 };
             for v in chunk[..n * nch].iter_mut() {
                 *v = 0.0;
             }
-            if pos < nframes {
-                let avail = (nframes - pos).min(n);
+            if pos < in_frames {
+                let avail = (in_frames - pos).min(n);
                 chunk[..avail * nch].copy_from_slice(&x[pos * nch..(pos + avail) * nch]);
             }
             pos += n;
@@ -1486,8 +1708,8 @@ impl VocoderState {
                 if chunk_n > 4096 {
                     chunk_n = 4096;
                 }
-                if out_n as i64 + chunk_n > nframes as i64 {
-                    chunk_n = nframes as i64 - out_n as i64;
+                if out_n as i64 + chunk_n > target as i64 {
+                    chunk_n = target as i64 - out_n as i64;
                 }
                 if chunk_n <= 0 {
                     break;
@@ -1520,7 +1742,7 @@ impl VocoderState {
                 }
                 out_n += chunk_n;
                 drain_phase += chunk_n as f64 * ratio;
-                if out_n >= nframes {
+                if out_n >= target {
                     break;
                 }
             }
@@ -1529,6 +1751,7 @@ impl VocoderState {
             profile_add(|p| &mut p.wall, t0);
         }
         profile_report();
+        self.apply_gain(&mut out);
         out
     }
 

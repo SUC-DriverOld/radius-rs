@@ -286,6 +286,10 @@ fn cli_missing_args_fails() {
 /// defaults: time-domain engine, **no pitch change** (`-s 0` — a bare invocation is
 /// a format conversion, a shift has to be asked for), no time stretch, the reference
 /// drivers' quality values, and **32-bit float WAV** out.
+///
+/// The banner lists every setting that can change the signal, so a run is reproducible
+/// from its own output. Only the ones in force appear: `--quality`/`--solo` for the
+/// time-domain engine, `--formant-shift`/`--no-preserve-voice` for the vocoder.
 #[test]
 fn cli_bare_invocation_uses_the_documented_defaults() {
     let out = tmp("bare_defaults.wav");
@@ -293,8 +297,18 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
     let (ok, stdout, err) = run(&[input_wav().to_str().unwrap(), out.to_str().unwrap()]);
     assert!(ok, "bare invocation failed: {err}");
     assert!(
-        stdout.contains("mode=Td semitones=+0.00 tempo=100.0% quality=37 solo=0"),
+        stdout.contains(
+            "mode=Vc semitones=+0.00 tempo=100.0% fft=Radix2 formant_shift=+0.00 \
+             preserve_voice=true gain=+0.00dB \
+             format=Wav bit_depth=F32 ogg_quality=0.90 mp3_bitrate=320"
+        ),
         "unexpected defaults banner: {stdout}"
+    );
+    assert!(
+        // Anchored with the leading space so it cannot match `ogg_quality=`, which is a
+        // different setting and does appear in this banner.
+        !stdout.contains(" quality=") && !stdout.contains(" solo="),
+        "the td-only knobs must not appear in a vc banner: {stdout}"
     );
     assert!(
         stdout.contains("pass-through"),
@@ -797,6 +811,223 @@ fn cli_derives_the_output_name_when_none_is_given() {
     assert!(elsewhere.join("picked.wav").is_file());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--tempo` is a speed control: it changes the duration and **must not** touch the
+/// pitch. This is a regression test — the vocoder used to fold the stretch into the
+/// analysis ratio, so `--tempo 200` at +3 semitones produced +15 semitones and
+/// `--tempo 50` produced -9 (measured on a 440 Hz tone: 523 Hz became 1047 Hz and
+/// 262 Hz).
+#[test]
+fn cli_tempo_changes_duration_not_pitch() {
+    let dir = cwd("tempo");
+    // A pure 440 Hz tone makes an octave error impossible to miss: 12*log2(2) is a
+    // 2x frequency ratio, far outside anything interpolation noise could explain.
+    // 8 s rather than 1 s so the time-domain engine's tail trim — it drops a partial
+    // granule, and the granule is `hop * ratio` long, so the loss is relatively larger
+    // at low tempos — stays a small fraction of the length.
+    let sr = 48_000u32;
+    let frames = sr as usize * 8;
+    let mut tone = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let t = i as f64 / sr as f64;
+        let v = (0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as f32;
+        tone.push(v);
+        tone.push(v);
+    }
+    let input = dir.join("tone.wav");
+    write_wav(&input, &tone, sr, 2);
+
+    // +3 semitones is a ratio of 2^(3/12) = 1.1892, so the shifted tone must sit at
+    // 440 * 1.1892 = 523.25 Hz no matter what the tempo is.
+    let expected = 440.0 * 2f64.powf(3.0 / 12.0);
+    for mode in ["td", "vc"] {
+        let mut lengths: Vec<(f64, usize)> = Vec::new();
+        for tempo in ["100", "200", "50"] {
+            let out = dir.join(format!("{mode}_{tempo}.wav"));
+            let (ok, stdout, err) = run(&[
+                input.to_str().unwrap(),
+                out.to_str().unwrap(),
+                "-m",
+                mode,
+                "-s",
+                "3",
+                "--tempo",
+                tempo,
+            ]);
+            assert!(ok, "{mode} tempo {tempo} failed: {err}");
+
+            let got = read_audio(&out);
+            lengths.push((tempo.parse::<f64>().unwrap(), got.frames()));
+
+            // The pitch must not move. Energy at the requested shift has to dominate
+            // energy an octave either side of it.
+            let peak = spectral_peak_near(&got.samples, sr, expected);
+            let octave_down = spectral_peak_near(&got.samples, sr, expected / 2.0);
+            let octave_up = spectral_peak_near(&got.samples, sr, expected * 2.0);
+            let off = octave_down.max(octave_up);
+            assert!(
+                peak > 8.0 * off,
+                "{mode} tempo {tempo}: the tone landed an octave off (expected \
+                 {expected:.1} Hz to dominate). peak={peak:.3e} other={off:.3e} \
+                 down={octave_down:.3e} up={octave_up:.3e}. stdout: {stdout}"
+            );
+        }
+
+        // The duration scales with the tempo. Compare the ratios between tempos
+        // rather than absolute lengths, so the engine's constant-ish tail trim cancels.
+        let at100 = lengths[0].1 as f64;
+        for (tempo, got) in &lengths[1..] {
+            let want = tempo / 100.0;
+            let ratio = *got as f64 / at100;
+            assert!(
+                (ratio / want - 1.0).abs() < 0.03,
+                "{mode}: tempo {tempo} produced {got} frames against {at100} at tempo 100, \
+                 a ratio of {ratio:.4} where {want:.4} was asked for"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stretched output must be audio from end to end, not a cut or a padded tail.
+///
+/// Regression test, and the check the earlier tempo test was missing: that one only
+/// looked at the length ratio and at a pitch measured on the first half, so it passed
+/// while `--tempo 50` returned the first half of the input at its original speed and
+/// `--tempo 200` returned the input followed by silence. Both had the right duration.
+///
+/// The engines cannot stretch — their resampler rate is the pitch and their granule
+/// scheduler walks the input once, so they emit roughly the input's length however long
+/// the output is asked to be. The stretch is a separate stage; this asserts that stage
+/// actually replaced the padding and the cut with signal.
+#[test]
+fn cli_tempo_output_carries_audio_to_the_end() {
+    let dir = cwd("tempo_content");
+    let sr = 48_000u32;
+    // 4 s, so the quarters are long enough for a stable level and the stretch has
+    // something to work with.
+    let frames = sr as usize * 4;
+    let mut tone = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        let t = i as f64 / sr as f64;
+        // A little amplitude modulation, so a stall in the search would show up as a
+        // level step rather than blending in.
+        let env = 0.8 + 0.2 * (2.0 * std::f64::consts::PI * 3.0 * t).sin();
+        let v = (0.5 * env * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as f32;
+        tone.push(v);
+        tone.push(v);
+    }
+    let input = dir.join("tone.wav");
+    write_wav(&input, &tone, sr, 2);
+
+    for mode in ["td", "vc"] {
+        for tempo in ["200", "50"] {
+            let out = dir.join(format!("{mode}_{tempo}.wav"));
+            let (ok, stdout, err) = run(&[
+                input.to_str().unwrap(),
+                out.to_str().unwrap(),
+                "-m",
+                mode,
+                "-s",
+                "3",
+                "--tempo",
+                tempo,
+            ]);
+            assert!(ok, "{mode} tempo {tempo} failed: {err}");
+            let got = read_audio(&out);
+
+            let want = (frames as f64 * tempo.parse::<f64>().unwrap() / 100.0).round() as usize;
+            assert!(
+                (got.frames() as f64 / want as f64 - 1.0).abs() < 0.02,
+                "{mode} tempo {tempo}: wanted about {want} frames, got {}. stdout: {stdout}",
+                got.frames()
+            );
+
+            // Split into eighths and require every one to carry signal. The last eighth
+            // is the one that used to be silence (stretch) or missing (cut).
+            let nch = 2;
+            let per = got.frames() / 8;
+            let mut levels = Vec::new();
+            for chunk in 0..8 {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for f in chunk * per..(chunk + 1) * per {
+                    for c in 0..nch {
+                        let v = got.samples[f * nch + c] as f64;
+                        sum += v * v;
+                        count += 1;
+                    }
+                }
+                levels.push((sum / count.max(1) as f64).sqrt());
+            }
+            let median = {
+                let mut l = levels.clone();
+                l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                l[l.len() / 2]
+            };
+            assert!(median > 0.05, "{mode} tempo {tempo}: output is silent overall");
+            for (i, level) in levels.iter().enumerate() {
+                assert!(
+                    *level > 0.4 * median,
+                    "{mode} tempo {tempo}: eighth {i} of 8 has no audio (level {level:.4} \
+                     against a median of {median:.4}). Every part of the output must carry \
+                     signal, not a cut or a padded tail. Levels: {levels:?}"
+                );
+            }
+
+            // And the pitch must be the shifted one in the last eighth too, not the
+            // unprocessed input and not silence.
+            let tail = &got.samples[(7 * per) * nch..];
+            let want_hz = 440.0 * 2f64.powf(3.0 / 12.0);
+            let peak = spectral_peak_near(tail, sr, want_hz);
+            let source = spectral_peak_near(tail, sr, 440.0);
+            assert!(
+                peak > 4.0 * source,
+                "{mode} tempo {tempo}: the tail is not at the shifted pitch \
+                 ({want_hz:.0} Hz gives {peak:.3e}, 440 Hz gives {source:.3e})"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Magnitude of the strongest DFT bin within +/-2% of `target_hz`.
+///
+/// A direct transform over a windowed slice of the signal: this runs once per case on
+/// a 1-2 s tone, so an O(n * bins) loop is the clearest thing to write, and it needs
+/// no dependency.
+fn spectral_peak_near(samples: &[f32], rate: u32, target_hz: f64) -> f64 {
+    let channels = 2usize;
+    let mono: Vec<f64> = samples
+        .chunks_exact(channels)
+        .map(|f| (f[0] as f64 + f[1] as f64) * 0.5)
+        .collect();
+    let n = mono.len().min(rate as usize) / 2; // a half-second window is plenty
+    if n < 1024 {
+        return 0.0;
+    }
+    let window: Vec<f64> = (0..n)
+        .map(|i| {
+            let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
+            mono[i] * w
+        })
+        .collect();
+    // Search only the bins inside the +/-2% band around the target.
+    let bin_hz = rate as f64 / n as f64;
+    let lo = ((target_hz * 0.98) / bin_hz).floor().max(1.0) as usize;
+    let hi = ((target_hz * 1.02) / bin_hz).ceil() as usize;
+    let mut best = 0.0f64;
+    for k in lo..=hi {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, v) in window.iter().enumerate() {
+            let a = -2.0 * std::f64::consts::PI * k as f64 * i as f64 / n as f64;
+            re += v * a.cos();
+            im += v * a.sin();
+        }
+        best = best.max((re * re + im * im).sqrt());
+    }
+    best
 }
 
 /// With no `--format` and no output extension, the output format follows the *input*

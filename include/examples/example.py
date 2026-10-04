@@ -84,7 +84,7 @@ def load_library(path: str | None = None) -> ctypes.CDLL:
     ]
 
     lib.rx_vc_init.restype = ctypes.c_void_p
-    lib.rx_vc_init.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_int]
+    lib.rx_vc_init.argtypes = [ctypes.c_uint32, ctypes.c_int]
     lib.rx_vc_free.restype = None
     lib.rx_vc_free.argtypes = [ctypes.c_void_p]
     lib.rx_vc_set_ratio.restype = None
@@ -152,7 +152,7 @@ def main() -> int:
 
     # ---- phase vocoder -----------------------------------------------------
     out[:] = 0.0
-    st = lib.rx_vc_init(SR, NCH, 2)
+    st = lib.rx_vc_init(SR, NCH)
     if not st:
         raise SystemExit("rx_vc_init returned NULL")
     try:
@@ -167,7 +167,7 @@ def main() -> int:
     print(f"vc : {-SEMITONES:+g} semitones -> {n_vc} frames, peak {np.abs(out[: n_vc * NCH]).max():.4f}")
 
     # ---- bad arguments are reported, not undefined -------------------------
-    if lib.rx_vc_init(22050, NCH, 2):
+    if lib.rx_vc_init(22050, NCH):
         raise SystemExit("expected 22050 Hz to be rejected by the vocoder")
     print("vc : 22050 Hz correctly rejected")
     return 0

@@ -10,8 +10,8 @@ This repository contains three entry points, all using the same underlying engin
 
 Radius supports two pitch-shifting engines, selectable at run time:
 
-* **Time domain** (`-m td`, the default) — granule-based, fast, best for monophonic material.
-* **Phase vocoder** (`-m vc`) — the reference's vocoder mode, much slower, better for dense polyphonic music.
+* **Phase vocoder** (`-m vc`, the default) — the reference's vocoder mode, much slower, better for dense polyphonic music.
+* **Time domain** (`-m td`) — granule-based, fast, best for monophonic material.
 
 ## Requirements
 

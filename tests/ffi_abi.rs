@@ -20,7 +20,7 @@ extern "C" {
         out_cap: i64,
     ) -> i64;
     fn rx_td_geometry(sr: u32, quality: i32, solo: i32, out: *mut RxTdGeometry) -> i32;
-    fn rx_vc_init(sr: u32, nch: i32, precision: i32) -> *mut c_void;
+    fn rx_vc_init(sr: u32, nch: i32) -> *mut c_void;
     fn rx_vc_free(st: *mut c_void);
     #[allow(dead_code)]
     fn rx_vc_set_ratio(st: *mut c_void, semis: f64, tempo: f64);
@@ -48,7 +48,7 @@ fn vocoder_ffi_render_is_reachable() {
     }
     let mut out = vec![0.0f32; x.len()];
     let n = unsafe {
-        let h = rx_vc_init(SR, 2, 2);
+        let h = rx_vc_init(SR, 2);
         assert!(!h.is_null());
         rx_vc_set_ratio(h, 3.0, 100.0);
         let n = rx_vc_render(
@@ -113,7 +113,7 @@ fn td_render_through_ffi_matches_rust_api() {
     // Rust API
     let mut st = radius_rs::TdState::new(input.rate, 37, 0, input.channels);
     st.set_ratio(3.0, 100.0);
-    let want = st.render(src, frames);
+    let want = st.render(src, frames, frames);
 
     // C ABI
     let mut out = vec![0.0f32; src.len() + 262144 * input.channels];
@@ -150,7 +150,7 @@ fn ffi_handles_null_and_bad_arguments() {
         rx_vc_free(std::ptr::null_mut());
         assert_eq!(rx_td_init(48000, 37, 0, 0), std::ptr::null_mut());
         // 22050 is not a supported vocoder rate
-        assert_eq!(rx_vc_init(22050, 2, 2), std::ptr::null_mut());
+        assert_eq!(rx_vc_init(22050, 2), std::ptr::null_mut());
         let mut g = RxTdGeometry::default();
         assert_eq!(rx_td_geometry(48000, 37, 0, std::ptr::null_mut()), -1);
         assert_eq!(rx_td_geometry(48000, 37, 0, &mut g), 0);

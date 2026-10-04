@@ -32,6 +32,9 @@ pub mod fft;
 pub mod fft_radix2;
 pub mod interp;
 pub mod simple_rand;
+/// Post-engine time stretching. See the module docs for why it lives here rather than
+/// inside the engines.
+pub mod stretch;
 pub mod tables;
 pub mod ti;
 
@@ -130,7 +133,7 @@ mod tests {
         }
         let mut st = TdState::new(sr, 37, 0, 2);
         st.set_ratio(3.0, 100.0);
-        let y = st.render(&x, n);
+        let y = st.render(&x, n, n);
         assert!(!y.is_empty());
         assert!(y.iter().all(|v| v.is_finite()));
         // duration preserving

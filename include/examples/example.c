@@ -115,7 +115,7 @@ int main(void) {
     /* ---- phase vocoder -----------------------------------------------------
      * Only 44100 and 48000 Hz are supported. Create a fresh handle per render: the
      * renderers are stateful. */
-    void *vc = rx_vc_init(SR, NCH, 2);
+    void *vc = rx_vc_init(SR, NCH);
     if (!vc) {
         fprintf(stderr, "rx_vc_init failed (only 44100/48000 Hz are supported)\n");
         return 1;
@@ -131,7 +131,7 @@ int main(void) {
            -SEMITONES, (long long)n_vc, peak_of(out, (size_t)n_vc * NCH));
 
     /* ---- bad arguments are reported, not undefined ------------------------- */
-    if (rx_vc_init(22050, NCH, 2) != NULL) {
+    if (rx_vc_init(22050, NCH) != NULL) {
         fprintf(stderr, "expected 22050 Hz to be rejected by the vocoder\n");
         return 1;
     }

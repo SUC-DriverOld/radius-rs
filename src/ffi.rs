@@ -79,7 +79,8 @@ pub unsafe extern "C" fn rx_td_render(
     let st = &mut *(st as *mut TdState);
     let n = nframes as usize;
     let src = std::slice::from_raw_parts(input, n * st.nch);
-    let y = st.render(src, n);
+    // The C ABI keeps the reference contract: produce as many frames as were fed.
+    let y = st.render(src, n, n);
     let frames = (y.len() / st.nch).min(out_cap.max(0) as usize);
     if !out.is_null() && frames > 0 {
         std::ptr::copy_nonoverlapping(y.as_ptr(), out, frames * st.nch);
@@ -136,12 +137,18 @@ pub unsafe extern "C" fn rx_td_geometry(
 
 /// `rx_vc_init` — allocate a vocoder state, or NULL when the sample rate is
 /// unsupported (anything other than 44100/48000).
+///
+/// The reference's `precision` argument is deliberately **not** part of this API. It
+/// was never a precision: it indexed the overlap-add write-gain table, so it only
+/// changed the output level, and 3..=9 were byte-identical. The state is created at
+/// the reference's value, which is what the parity corpus is measured at; use the
+/// CLI's `--gain` (or scale the samples) for level.
 #[no_mangle]
-pub extern "C" fn rx_vc_init(sr: u32, nch: c_int, precision: c_int) -> *mut c_void {
+pub extern "C" fn rx_vc_init(sr: u32, nch: c_int) -> *mut c_void {
     if nch <= 0 || !crate::vocoder::supported_rate(sr) {
         return std::ptr::null_mut();
     }
-    let st = Box::new(VocoderState::new(sr, nch as usize, precision));
+    let st = Box::new(VocoderState::new(sr, nch as usize));
     Box::into_raw(st) as *mut c_void
 }
 

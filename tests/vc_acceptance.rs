@@ -85,7 +85,7 @@ fn scheduler_is_structurally_sound_over_a_full_run() {
 
     // And the engine's real 48 kHz geometry consumes a 1 393 598-frame corpus
     // without running short — that is the property the gate has to guarantee.
-    let real = VocoderState::new(48_000, 2, 2);
+    let real = VocoderState::new(48_000, 2);
     let base = real.cfg.step_base;
     let ratio = 2f64.powf(3.0 / 12.0);
     let mut consumed = 0i64;
@@ -132,14 +132,14 @@ fn supported_rates_match_the_engine() {
 
 #[test]
 fn vocoder_config_geometry() {
-    let s48 = VocoderState::new(48000, 2, 2);
+    let s48 = VocoderState::new(48000, 2);
     assert_eq!(s48.cfg.n_fft, 16384);
     assert_eq!(s48.cfg.nb_bins, 8193);
     assert_eq!(s48.cfg.m_fft, 4096);
     assert_eq!(s48.cfg.mb_bins, 2049);
     assert_eq!(s48.cfg.n_write, 7184);
     assert_eq!(s48.cfg.hop, 3592);
-    let s44 = VocoderState::new(44100, 2, 2);
+    let s44 = VocoderState::new(44100, 2);
     assert_eq!(s44.cfg.n_fft, 8192);
     assert_eq!(s44.cfg.nb_bins, 4097);
     assert_eq!(s44.cfg.n_write, 6599);
@@ -148,7 +148,7 @@ fn vocoder_config_geometry() {
 
 #[test]
 fn set_ratio_matches_the_reference_chain() {
-    let mut st = VocoderState::new(48000, 2, 2);
+    let mut st = VocoderState::new(48000, 2);
     st.set_ratio(3.0, 100.0);
     // pr = 2^(3/12); s = 12*log2(pr) in f32; ratio = 2^(s/12)
     let pr = 2f64.powf(0.25);
@@ -171,7 +171,7 @@ fn vocoder_short_render_is_sane() {
         x[2 * i] = v as f32;
         x[2 * i + 1] = v as f32;
     }
-    let mut st = VocoderState::new(SR, 2, 2);
+    let mut st = VocoderState::new(SR, 2);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&x);
     assert!(!out.is_empty(), "vocoder produced no output");
@@ -185,6 +185,187 @@ fn vocoder_short_render_is_sane() {
     assert!(p < 4.0, "vocoder output exploded (peak {p})");
 }
 
+/// The vocoder must cover the whole +/-36 semitone range Audition offers.
+///
+/// Regression test. The vocoder used to go **silent** below about -24 semitones: the
+/// feed loop stopped after `target * pitch_ratio` input frames, which at a low ratio
+/// is far less than the resampler needs, so `pos_1384` never passed the hop,
+/// `writepos` stayed 0, and the drain took nothing. The reference renders -36 fine.
+#[test]
+fn vocoder_covers_the_full_pitch_range() {
+    const SR: u32 = 48000;
+    const FREQ: f64 = 440.0;
+    let frames = SR as usize / 2; // 0.5 s
+    let mut x = vec![0.0f32; frames * 2];
+    for i in 0..frames {
+        let t = i as f64 / SR as f64;
+        let v = 0.5 * (2.0 * std::f64::consts::PI * FREQ * t).sin();
+        x[2 * i] = v as f32;
+        x[2 * i + 1] = v as f32;
+    }
+    for semis in [-36.0f64, -30.0, -24.0, -18.0, 18.0, 24.0, 30.0, 36.0] {
+        let mut st = VocoderState::new(SR, 2);
+        st.set_ratio(semis, 100.0);
+        let out = st.render(&x);
+        assert_eq!(
+            out.len(),
+            x.len(),
+            "{semis} semitones: the vocoder must be duration preserving"
+        );
+        let p = peak(&out);
+        assert!(
+            p > 1e-3,
+            "{semis} semitones: the vocoder went silent (peak {p}). \
+             Check the feed loop, which must feed the whole input at low ratios"
+        );
+        assert!(p < 4.0, "{semis} semitones: output exploded (peak {p})");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "{semis} semitones: non-finite sample"
+        );
+    }
+}
+
+/// The pitch really moves across the range, measured as a spectral peak.
+///
+/// A pure tone makes this exact: the strongest bin must land within a couple of
+/// percent of `440 * 2^(semis/12)`. The earlier octave bug and the silent tail were
+/// both only visible this way.
+#[test]
+fn vocoder_pitch_range_lands_on_the_requested_ratio() {
+    const SR: u32 = 48000;
+    const FREQ: f64 = 440.0;
+    let frames = SR as usize; // 1 s gives enough resolution for the low end
+    let mut x = vec![0.0f32; frames * 2];
+    for i in 0..frames {
+        let t = i as f64 / SR as f64;
+        let v = 0.5 * (2.0 * std::f64::consts::PI * FREQ * t).sin();
+        x[2 * i] = v as f32;
+        x[2 * i + 1] = v as f32;
+    }
+    for semis in [-36.0f64, -24.0, -12.0, 0.0, 12.0, 24.0, 36.0] {
+        let mut st = VocoderState::new(SR, 2);
+        st.set_ratio(semis, 100.0);
+        let out = st.render(&x);
+        let mono: Vec<f64> = out.chunks_exact(2).map(|f| f[0] as f64).collect();
+        let got = strongest_bin_hz(&mono, SR as f64);
+        let want = FREQ * 2f64.powf(semis / 12.0);
+        let err = (got / want - 1.0).abs();
+        assert!(
+            err < 0.03,
+            "{semis} semitones: wanted {want:.1} Hz, strongest bin was {got:.1} Hz \
+             ({:.2}% off)",
+            err * 100.0
+        );
+    }
+}
+
+/// `--no-preserve-voice` is exactly `--formant-shift <semitones>`.
+///
+/// Both mean "no envelope correction": dropping preservation switches the formant
+/// operator off (`active = 0`), while a formant shift equal to the pitch leaves it on
+/// with a ratio of exactly 1.0, which `FormantState::apply` short-circuits. The two
+/// paths must therefore agree bit for bit — this pins that down, and with it both the
+/// operator's `ratio == 1.0` fast path and the `--formant-shift` calibration basis.
+#[test]
+fn no_preserve_voice_equals_formant_shift_at_the_pitch() {
+    const SR: u32 = 48_000;
+    // A harmonic series with a formant, so the envelope is actually doing something.
+    let frames = SR as usize / 2;
+    let mut x = vec![0.0f32; frames * 2];
+    for i in 0..frames {
+        let t = i as f64 / SR as f64;
+        let mut v = 0.0f64;
+        for k in 1..=40 {
+            let f = 180.0 * k as f64;
+            if f > SR as f64 * 0.45 {
+                break;
+            }
+            let env = 1.0 / (1.0 + ((f - 2200.0) / 1100.0).powi(2)) + 0.01;
+            v += env * (2.0 * std::f64::consts::PI * f * t).sin();
+        }
+        let s = 0.4 * v;
+        x[2 * i] = s as f32;
+        x[2 * i + 1] = s as f32;
+    }
+
+    for semis in [3.0f64, -3.0, 7.0, -7.0, 12.0, -12.0] {
+        let mut off = VocoderState::new(SR, 2);
+        off.set_ratio(semis, 100.0);
+        off.set_preserve_voice(false);
+
+        let mut on = VocoderState::new(SR, 2);
+        on.set_ratio(semis, 100.0);
+        on.set_formant_shift(semis);
+
+        assert!(
+            on.preserve_voice(),
+            "{semis}: a formant shift must not switch preservation off — the two settings \
+             agree by different routes, not by both disabling the operator"
+        );
+        assert!(
+            (on.formant.cfg.ratio - 1.0).abs() < 1e-6,
+            "{semis}: a formant shift equal to the pitch must drive the operator's ratio to \
+             exactly 1.0, got {}",
+            on.formant.cfg.ratio
+        );
+
+        let a = off.render(&x);
+        let b = on.render(&x);
+        assert_eq!(a.len(), b.len(), "{semis}: length mismatch");
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "{semis} semitones: --no-preserve-voice and --formant-shift {semis} must be \
+             bit-identical, but the renders differ"
+        );
+    }
+}
+
+/// Frequency of the strongest DFT bin of `x`, refined to sub-bin accuracy.
+fn strongest_bin_hz(x: &[f64], rate: f64) -> f64 {
+    // Use the middle half, windowed, so the granule edges do not dominate.
+    let q = x.len() / 4;
+    let seg = &x[q..3 * q];
+    let n = seg.len();
+    let w: Vec<f64> = (0..n)
+        .map(|i| {
+            let h = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
+            seg[i] * h
+        })
+        .collect();
+    let mut best = (0usize, f64::MIN);
+    for k in 2..n / 2 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, v) in w.iter().enumerate() {
+            let a = -2.0 * std::f64::consts::PI * k as f64 * i as f64 / n as f64;
+            re += v * a.cos();
+            im += v * a.sin();
+        }
+        let m = re * re + im * im;
+        if m > best.1 {
+            best = (k, m);
+        }
+    }
+    // Parabolic refinement around the peak bin.
+    let k = best.0;
+    let mag = |k: usize| -> f64 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, v) in w.iter().enumerate() {
+            let a = -2.0 * std::f64::consts::PI * k as f64 * i as f64 / n as f64;
+            re += v * a.cos();
+            im += v * a.sin();
+        }
+        (re * re + im * im).sqrt()
+    };
+    let (a, b, c) = (mag(k - 1), mag(k), mag(k + 1));
+    let d = if (a - 2.0 * b + c) != 0.0 {
+        0.5 * (a - c) / (a - 2.0 * b + c)
+    } else {
+        0.0
+    };
+    (k as f64 + d) * rate / n as f64
+}
+
 /// The vocoder over the synthetic programme: both directions, both sample rates,
 /// finite, duration preserving, audible, and actually pitched by the ratio.
 ///
@@ -196,7 +377,7 @@ fn vocoder_synthetic_render_is_sane() {
     for (sr, semis) in [(48_000u32, 3.0f64), (48_000, -3.0), (44_100, 3.0)] {
         let frames = (sr as usize / 2).max(1); // 0.5 s keeps the test fast
         let w = synthetic_stereo(sr, frames);
-        let mut st = VocoderState::new(sr, w.channels, 2);
+        let mut st = VocoderState::new(sr, w.channels);
         st.set_ratio(semis, 100.0);
         let out = st.render(&w.samples);
         let label = format!("{sr} Hz {semis:+}");
@@ -241,7 +422,7 @@ fn vocoder_preserves_stereo_separation() {
     }
 
     // 1. an anti-phase pair must stay anti-phase
-    let mut st = VocoderState::new(SR, 2, 2);
+    let mut st = VocoderState::new(SR, 2);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&anti);
     let (l, r) = split(&out);
@@ -253,7 +434,7 @@ fn vocoder_preserves_stereo_separation() {
     );
 
     // 2. a quieter, different right channel must stay quieter and different
-    let mut st = VocoderState::new(SR, 2, 2);
+    let mut st = VocoderState::new(SR, 2);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&lopsided);
     let (l, r) = split(&out);
@@ -277,7 +458,7 @@ fn vocoder_preserves_stereo_separation() {
         mono_pair.push(a as f32);
         mono_pair.push(a as f32);
     }
-    let mut st = VocoderState::new(SR, 2, 2);
+    let mut st = VocoderState::new(SR, 2);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&mono_pair);
     let (l, r) = split(&out);
@@ -314,7 +495,7 @@ fn vocoder_matches_pyradius_reference() {
     };
     let input = read_wav(&path);
     require_audio(&input, &path);
-    let mut st = VocoderState::new(input.rate, input.channels, 2);
+    let mut st = VocoderState::new(input.rate, input.channels);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&input.samples);
     let want = read_wav(&ref_path);
@@ -341,7 +522,7 @@ fn vocoder_acceptance_render() {
     };
     let input = read_wav(&path);
     require_audio(&input, &path);
-    let mut st = VocoderState::new(input.rate, input.channels, 2);
+    let mut st = VocoderState::new(input.rate, input.channels);
     st.set_ratio(3.0, 100.0);
     let out = st.render(&input.samples);
     assert_eq!(out.len(), input.samples.len());

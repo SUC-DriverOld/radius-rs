@@ -36,89 +36,371 @@ pub enum Mode {
     Vc,
 }
 
+/// Widest formant shift that still resolves, in semitones.
+///
+/// Audition's 共振变换 runs to +/-36, but the formant operator's gain map clamps to
+/// +20/-40 dB, so past roughly an octave the correction saturates and the control
+/// stops doing anything: measured on a 200 Hz harmonic series with a formant at
+/// 2 kHz, the formant lands within 0.3% of the same place at +9 and +12. Allowing
+/// +/-36 would mean offering a range whose top half is a plateau.
+pub const FORMANT_SHIFT_LIMIT: f64 = 12.0;
+
+/// Clamp `--formant-shift` into +/-[`FORMANT_SHIFT_LIMIT`].
+///
+/// Clamping rather than rejecting: a value copied from Audition (which goes to 36)
+/// should still render, just at the widest shift this engine can express.
+fn parse_formant_shift(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number of semitones"))?;
+    if !v.is_finite() {
+        return Err(format!("'{s}' is not a finite number of semitones"));
+    }
+    Ok(v.clamp(-FORMANT_SHIFT_LIMIT, FORMANT_SHIFT_LIMIT))
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "radius",
     version,
-    about = "Pitch-shift audio with the Radius TD or phase-vocoder engine.",
-    long_about = "Pitch-shift audio with the Radius TD or phase-vocoder engine.\n\nUse --help for the compact option list; see the README for detailed engine and format notes.",
-    after_help = "EXAMPLES:\n  \
-        radius in.wav -m td -s 3\n  \
-        radius in.wav out.mp3 -m vc -s -3 --mp3-bitrate 320\n  \
-        radius in.wav out.flac --bit-depth 24\n  \
-        radius in.wav out.wav -m td -s 3 --truth reference.wav"
+    about = "Pitch-shift and time-stretch audio with the Radius TD or phase-vocoder engine.",
+    long_about = "Pitch-shift and time-stretch audio with the Radius TD or phase-vocoder engine. \
+        `-h` lists the options one line each. `--help` prints the same list with the reasoning, \
+        the measured trade-offs and the Audition equivalents. The full reference is in \
+        docs/CLI.md."
 )]
 pub struct Cli {
-    /// Input audio file.
-    #[arg(value_name = "INPUT")]
+    #[arg(
+        value_name = "INPUT",
+        help = "Input audio file.",
+        long_help = "Input audio file: any container or codec ffmpeg can read (wav, flac, \
+            ogg/vorbis, mp3, aac/adts, m4a/alac, mkv/webm, aiff, caf, ...). \
+            Its sample rate and channel count are used as-is and written unchanged to the \
+            output. There is deliberately no rate option, so input and output always agree."
+    )]
     pub input: String,
 
-    /// Output audio file. mit it to derive a name from the input.
-    #[arg(value_name = "OUTPUT")]
+    #[arg(
+        value_name = "OUTPUT",
+        help = "Output file. Omit it to name the output after the input.",
+        long_help = "Output file. Omit it and the name is derived from the input as \
+            `<name>_<mode>[_st<N>][_tp<N>]`, written **next to the input**, following the \
+            input's format where that format can be written and falling back to WAV \
+            otherwise. \
+            So `radius in.flac -m vc -s -3 --tempo 200` writes `in_vc_st-3_tp200.flac` beside \
+            `in.flac`. Only the shift is in the name: quality, solo, gain and the FFT backend \
+            are left out. \
+            The extension picks the container unless --format overrides it. An existing file \
+            is never overwritten: ` (1)`, ` (2)`, ... is inserted before the extension until \
+            the name is free, for a name you typed as well as a derived one."
+    )]
     pub output: Option<String>,
 
-    /// Engine: td (default) or vc.
-    #[arg(short, long, value_enum, default_value_t = Mode::Td, value_name = "td|vc")]
+    #[arg(
+        short = 'm',
+        long,
+        value_enum,
+        default_value_t = Mode::Vc,
+        value_name = "td|vc",
+        help = "Engine: td (time domain) or vc (phase vocoder, default).",
+        long_help = "Engine: td (time domain) or vc (phase vocoder, default). \
+            td = the granule engine (rx_td_render): fast, tens of times faster than real \
+            time, best for monophonic material. \
+            vc = the phase vocoder (rx_vc_render), much slower, better on dense \
+            polyphonic music. \
+            The default is vc because it handles mixed material better; --mode td \
+            is there when speed matters or the source is monophonic. \
+            The two take different option sets: --quality and --solo are td only, \
+            --formant-shift and --no-preserve-voice are vc only."
+    )]
     pub mode: Mode,
 
-    /// FFT backend: radix2 preserves reference output; rustfft is faster.
-    #[arg(long, value_enum, default_value_t = FftBackend::Radix2, value_name = "radix2|rustfft")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = FftBackend::Radix2,
+        value_name = "radix2|rustfft",
+        help = "FFT backend; radix2 is reference-exact, rustfft is faster but not exact.",
+        long_help = "FFT backend. Both kernels are always compiled in. \
+            radix2 = this crate's own kernel, bit-exact with the reference (the default). \
+            rustfft = the rustfft crate, mixed-radix: about 1.4x on the vocoder and 2.2x on \
+            td, but the vocoder's output stops matching the reference (correlation ~0.994) \
+            because its peak search and phase unwrapping branch on last-bit differences. \
+            td is bit-identical under both on every input tried so far, but that is an \
+            empirical result on those inputs, not a guarantee. See docs/FFT.md."
+    )]
     pub fft: FftBackend,
 
-    /// Pitch shift in semitones (negative = down).
     #[arg(
-        short,
+        short = 's',
         long,
         default_value_t = 0.0,
         value_name = "SEMITONES",
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        help = "Pitch shift in semitones (negative = down).",
+        long_help = "Pitch shift in semitones; negative shifts down. Fractional values are \
+            fine. \
+            At the default 0 nothing is shifted, so `radius in.wav out.flac` is a pure format \
+            conversion. This is the only control that changes the pitch."
     )]
     pub semitones: f64,
 
-    /// Time stretch percentage (100 = unchanged).
-    #[arg(short, long, default_value_t = 100.0, value_name = "PERCENT")]
+    #[arg(
+        short = 't',
+        long,
+        default_value_t = 100.0,
+        value_name = "PERCENT",
+        help = "Time stretch in percent (100 = unchanged).",
+        long_help = "Time stretch in percent: 100 keeps the duration, 200 doubles it, 50 \
+            halves it. \n\
+            This is a speed control, not a second pitch control: it changes the duration and \
+            leaves the pitch alone, so `-s 3 --tempo 200` is +3 semitones and twice as long. \
+            The engines cannot do this themselves — their resampler rate is the pitch and their \
+            granule scheduler walks the input once, so they only emit about the input's length. \
+            The stretch is applied after them, by overlap-add on the finished signal, which is \
+            why 100 skips it entirely and costs nothing."
+    )]
     pub tempo: f64,
 
-    /// TD quality, 1 (fast) .. 100 (fine).
-    #[arg(short, long, default_value_t = 37, value_name = "1-100")]
+    #[arg(
+        short = 'q',
+        long,
+        default_value_t = 37,
+        value_name = "1-100",
+        help = "TD quality, 1 (coarse) .. 100 (fine).",
+        long_help = "TD only: quality, 1 (coarse) .. 100 (fine). Sets the granule length. \
+            It defines the granule hop, `hop = round(sr * 0.001 * 1.5 * quality)`. At 48 kHz \
+            -q 1 gives hop 72, the default -q 37 gives 2664, -q 100 gives 7200; on a 5 s \
+            slice that is 10 609 / 268 / 100 granules. \
+            What it changes is granularity and transient handling. Speed is nearly flat across \
+            the range (221 ms .. 397 ms for those three), because every granule carries a \
+            fixed 8192-point pitch FFT whose cost does not scale with the hop. \
+            The reference driver's default is 37, and that is what the acceptance corpus is \
+            measured at."
+    )]
     pub quality: i32,
 
-    /// TD steady-state mode: 0 normal, 1 steady.
-    #[arg(long, default_value_t = 0, value_name = "0|1")]
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_name = "0|1",
+        help = "TD only: 0 tracks the pitch each granule, 1 uses a fixed period.",
+        long_help = "TD only: pitch-tracking mode. \
+            0 (default) is the full engine: it re-estimates the pitch on every granule. \
+            1 forces the steady-state path, which uses a fixed period and a pitch-search \
+            range about ten times narrower. \
+            Measured on a 5 s slice, 1 is roughly 3x faster (84 ms against 235 ms) and \
+            produces a different signal (345 granules against 268, peak 1.126 against 1.210). \
+            It is a cheaper analysis, not a better one."
+    )]
     pub solo: i32,
 
-    /// Vocoder precision, 1 (fast) .. 9 (clean).
-    #[arg(short = 'p', long, default_value_t = 2, value_name = "1-9")]
-    pub precision: i32,
+    #[arg(
+        short = 'g',
+        long,
+        default_value_t = 0.0,
+        value_name = "dB",
+        allow_hyphen_values = true,
+        help = "Output gain in dB, applied after the render (0 = unchanged).",
+        long_help = "Output gain in decibels, applied to the finished samples after the \
+            engine. \
+            It is a plain linear scale, so it cannot interact with the reference arithmetic \
+            and `--gain 0` leaves the output bit-exact. Measured: -g -6 scales by exactly \
+            0.501187, -g 6 by exactly 1.995262. \
+            Use this rather than reaching for a level change inside the engine. The render is \
+            not normalised, so a pitch shift can exceed full scale; the CLI warns when it does."
+    )]
+    pub gain: f64,
 
-    /// Force output container.
-    #[arg(short = 'f', long, value_enum, value_name = "wav|flac|ogg|mp3")]
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_name = "N",
+        allow_hyphen_values = true,
+        value_parser = parse_formant_shift,
+        help = "Vocoder only: how the formants follow the pitch shift, in semitones (-12 .. +12).",
+        long_help = "Vocoder only: how the formants adapt to the pitch shift, in semitones \
+            (-12 .. +12). The shift is absolute and independent of --semitones. \
+            0 (the default) shifts the formants and the pitch together, keeping the timbre and \
+            the naturalness; it is the reference behaviour. Above 0 moves them up for a \
+            brighter result, the classic \"male voice sounds female\"; below 0 does the \
+            opposite. \
+            The range stops at +/-12 rather than Audition's +/-36 because the operator's gain \
+            map clamps to +20/-40 dB and saturates past about an octave; out-of-range values \
+            are clamped, not rejected. Needs a pitch shift: nothing happens at --semitones 0, \
+            or under --no-preserve-voice."
+    )]
+    pub formant_shift: f64,
+
+    #[arg(
+        long,
+        help = "Vocoder only: let the spectral envelope follow the pitch (formants not preserved).",
+        long_help = "Vocoder only: drop formant preservation, so the spectral envelope follows \
+            the pitch instead of staying put. \
+            Measured on a 200 Hz harmonic series with a formant at 2 kHz, at +3 semitones: \
+            preserved leaves the formant at 1647 Hz, unpreserved moves it to 2172 Hz, i.e. it \
+            follows the pitch. \
+            This gives byte-identical output to --formant-shift N at the same value as \
+            --semitones. The two only diverge at extreme pitches, where --formant-shift runs \
+            out of correction headroom but this flag still works because it removes the \
+            operator outright. Does nothing at --semitones 0, where the operator is off anyway."
+    )]
+    pub no_preserve_voice: bool,
+
+    #[arg(
+        short = 'f',
+        long,
+        value_enum,
+        value_name = "wav|flac|ogg|mp3",
+        help = "Force the output container instead of taking it from the extension.",
+        long_help = "Force the output container. \
+            Outranks both the output path's extension and the input's format. Useful when the \
+            extension is ambiguous or must stay as-is (out.dat, out.tmp). An unknown extension \
+            without this flag is an error rather than a guess."
+    )]
     pub format: Option<Container>,
 
-    /// WAV/FLAC sample depth.
-    #[arg(short = 'b', long, value_enum, default_value_t = BitDepth::F32,
-          value_name = "16|24|32|32f")]
+    #[arg(
+        short = 'b',
+        long,
+        value_enum,
+        default_value_t = BitDepth::F32,
+        value_name = "16|24|32|32f",
+        help = "WAV/FLAC sample depth (32f is the engines' native float).",
+        long_help = "Sample depth for wav and flac. \
+            32f (default) is IEEE float, which is what both engines natively produce, so \
+            nothing is quantised on the way out. 16 and 24 are integer PCM. \
+            32 is rejected on purpose: ffmpeg has no 32-bit integer PCM encoder, and quietly \
+            writing 24 bit instead would be worse than an error. flac stores 32 and 32f as \
+            24 bit, the deepest subframe the format has. \
+            Integer and lossy targets clamp, so a render that exceeds full scale is reported \
+            rather than silently wrapped. See the clipping section of docs/CLI.md."
+    )]
     pub bit_depth: BitDepth,
 
-    /// Ogg/Vorbis quality, 0..1.
-    #[arg(long, default_value_t = 0.9, value_name = "0.0-1.0")]
+    #[arg(
+        long,
+        default_value_t = 0.9,
+        value_name = "0.0-1.0",
+        help = "Ogg/Vorbis quality, 0..1.",
+        long_help = "Ogg/Vorbis encoder quality, 0..1. \
+            This crate's 0..1 is passed to libvorbis as 0..10. The default 0.9 is the top of \
+            the practical range, so an Ogg output is never the reason for audible loss."
+    )]
     pub ogg_quality: f32,
 
-    /// MP3 constant bitrate (kbit/s).
-    #[arg(long, default_value_t = 320, value_name = "KBPS")]
+    #[arg(
+        long,
+        default_value_t = 320,
+        value_name = "KBPS",
+        help = "MP3 constant bitrate in kbit/s.",
+        long_help = "MP3 constant bitrate in kbit/s: 64, 96, 128, 160, 192, 256 or 320. \
+            The default 320 is the highest LAME offers."
+    )]
     pub mp3_bitrate: u16,
 
-    /// Do not draw the progress bar.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Do not draw the progress bar.",
+        long_help = "Do not draw the progress bar. \
+            The bar goes to stderr and appears only when stderr is a terminal, so pipes and \
+            logs are unaffected anyway. RADIUS_PROGRESS=1 forces it on one line per update, \
+            for logging. Everything machine-readable stays on stdout."
+    )]
     pub no_progress: bool,
 
-    /// Compare output with a reference file.
-    #[arg(long, value_name = "FILE")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Compare the output against a reference file (corr, max |d|).",
+        long_help = "Render a correlation report against a reference file over the common \
+            prefix: sample correlation and maximum absolute difference. \
+            This is the C driver's trailing truth.wav check, and it is how the parity numbers \
+            in docs/VERIFICATION.md are produced."
+    )]
     pub truth: Option<String>,
 
-    /// Print engine diagnostics.
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = "Print engine diagnostics to stderr.",
+        long_help = "Print engine diagnostics to stderr: the final cursors and write position. \
+            For per-stage timing instead, set RADIUS_PROFILE=1. Combine it with \
+            RADIUS_THREADS=1, because the stage timers are thread-local and a worker's time \
+            would otherwise be missing from the report."
+    )]
     pub verbose: bool,
+}
+
+/// Whether to colour warnings for the terminal on stderr.
+///
+/// `NO_COLOR` (set to anything non-empty) vetoes colour first — it is the informal
+/// standard at https://no-color.org and the explicit "I never want this" signal, so
+/// it also overrides `RADIUS_COLOR`. After that `RADIUS_COLOR` forces colour on or
+/// off, which is what makes the yellow testable from a pipe; otherwise colour is used
+/// only when stderr is a terminal, so redirected output stays plain.
+fn colour_warnings() -> bool {
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if let Ok(v) = std::env::var("RADIUS_COLOR") {
+        if !v.is_empty() {
+            return v != "0";
+        }
+    }
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// Print a warning to stderr, in yellow when colour is enabled.
+///
+/// All warnings go through here so they look alike: the same colour, a blank line
+/// before, and no terminal escape at all once output is redirected or `NO_COLOR` is
+/// set.
+pub fn warn(message: &str) {
+    if colour_warnings() {
+        eprintln!("\x1b[33m{message}\x1b[0m");
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+/// Warning for a `--formant-shift` that cannot do anything, or `None`.
+///
+/// There are two ways the formant control ends up inert, and only one of them can be
+/// predicted from the arguments alone:
+///
+/// * **Structural, and caught here.** At `--semitones 0` the operator short-circuits
+///   on `ratio == 1.0`, whatever the formant ratio is. Verified directly: every
+///   `--formant-shift` from -12 to +12 renders byte-identically at pitch 0. This is
+///   also why Audition's 保持语音特性 has nothing to do at pitch 0.
+/// * **Saturation, and *not* caught here.** At a large pitch shift the operator's
+///   +/-20/-40 dB gain clamps can already be consumed by the pitch correction, leaving
+///   no headroom for the extra shift. Measured on a 180 Hz harmonic series with a
+///   formant at 2160 Hz, the achieved shift is +12.7/+11.3/+1.4 semitones for
+///   `--formant-shift` +12 at pitch +3/+12/+24, and the achieved shift is identical
+///   for every formant setting at pitch +36. How early that bites depends on the
+///   source spectrum, not just the arguments, so a pitch threshold would be a guess
+///   and could easily cry wolf. It is documented instead of warned about.
+pub fn formant_shift_warning(cli: &Cli) -> Option<String> {
+    if !matches!(cli.mode, Mode::Vc) || cli.formant_shift == 0.0 {
+        return None;
+    }
+    if cli.no_preserve_voice {
+        return Some(
+            "WARNING: --formant-shift has no effect under --no-preserve-voice, which turns \
+             the formant operator off entirely."
+                .to_string(),
+        );
+    }
+    if cli.semitones == 0.0 {
+        return Some(
+            "WARNING: --formant-shift has no effect at --semitones 0. The formant operator \
+             only runs alongside a pitch shift, because a shift of 0 preserves the formants \
+             exactly and there is nothing left to correct."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// A live progress line on stderr.
@@ -418,7 +700,7 @@ pub fn effective_container(cli: &Cli) -> Option<Container> {
 /// | `tp<tempo>` | tempo != 100 | `tp200`, `tp87.5` |
 ///
 /// So `-m vc -s 0 --tempo 100` yields `name_vc.flac`, and `-m vc -s -3 --tempo 200`
-/// yields `name_vc_st-3_tp200.flac`. Anything else about the run (quality, precision,
+/// yields `name_vc_st-3_tp200.flac`. Anything else about the run (quality, solo, gain,
 /// bit depth, FFT backend) is deliberately not in the name. The extension comes from
 /// the resolved container, not from the input, so the name always describes the file
 /// that will actually be written.
@@ -542,6 +824,60 @@ pub fn describe_container(container: Container, cli: &Cli) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formant_shift_warning_covers_exactly_the_inert_cases() {
+        fn cli(args: &[&str]) -> Cli {
+            let mut v = vec!["radius", "in.wav", "out.wav"];
+            v.extend_from_slice(args);
+            Cli::parse_from(v)
+        }
+
+        // Inert: at pitch 0 the operator short-circuits on `ratio == 1.0`, so every
+        // formant shift renders byte-identically.
+        let w = formant_shift_warning(&cli(&["-m", "vc", "--formant-shift", "6"]))
+            .expect("pitch 0 must warn");
+        assert!(w.contains("--semitones 0"), "{w}");
+
+        // Inert: --no-preserve-voice switches the operator off outright.
+        let w = formant_shift_warning(&cli(&[
+            "-m",
+            "vc",
+            "-s",
+            "3",
+            "--formant-shift",
+            "6",
+            "--no-preserve-voice",
+        ]))
+        .expect("--no-preserve-voice must warn");
+        assert!(w.contains("--no-preserve-voice"), "{w}");
+
+        // Working: a pitch shift with preservation left on.
+        assert!(
+            formant_shift_warning(&cli(&["-m", "vc", "-s", "3", "--formant-shift", "6"])).is_none()
+        );
+
+        // Nothing to report at the default, or where the mode ignores the control.
+        assert!(formant_shift_warning(&cli(&["-m", "vc", "-s", "3"])).is_none());
+        assert!(formant_shift_warning(&cli(&["-m", "td", "--formant-shift", "6"])).is_none());
+    }
+
+    #[test]
+    fn no_color_vetoes_forced_colour() {
+        // NO_COLOR is the explicit "never colour me" signal, so it wins even over an
+        // explicit RADIUS_COLOR=1.
+        // SAFETY: single-threaded within this test, and env mutation is the point.
+        unsafe {
+            std::env::set_var("RADIUS_COLOR", "1");
+            std::env::set_var("NO_COLOR", "1");
+            assert!(!colour_warnings(), "NO_COLOR must veto RADIUS_COLOR");
+            std::env::remove_var("NO_COLOR");
+            assert!(colour_warnings(), "RADIUS_COLOR=1 must force colour");
+            std::env::set_var("RADIUS_COLOR", "0");
+            assert!(!colour_warnings(), "RADIUS_COLOR=0 must disable colour");
+            std::env::remove_var("RADIUS_COLOR");
+        }
+    }
 
     #[test]
     fn clipping_detection_counts_over_and_near() {

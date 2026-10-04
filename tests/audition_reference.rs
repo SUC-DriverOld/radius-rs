@@ -213,7 +213,7 @@ fn td_output_matches_audition_perceptually() {
 
         let mut st = radius_rs::TdState::new(input.rate, 37, 0, input.channels);
         st.set_ratio(semis, 100.0);
-        let got = st.render(&input.samples, input.frames());
+        let got = st.render(&input.samples, input.frames(), input.frames());
         let got_frames = got.len() / input.channels;
         let ratio = got_frames as f64 / want_frames as f64;
         assert!(
@@ -266,7 +266,7 @@ fn vocoder_pitch_matches_audition() {
         };
         ran += 1;
         let want_frames = want.len() / input.channels;
-        let mut st = VocoderState::new(input.rate, input.channels, 2);
+        let mut st = VocoderState::new(input.rate, input.channels);
         st.set_ratio(semis, 100.0);
         let got = st.render(&input.samples);
         assert_eq!(

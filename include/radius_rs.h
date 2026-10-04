@@ -77,10 +77,14 @@ int rx_td_geometry(uint32_t sr, int quality, int solo, rx_td_geometry_t *out);
 
 /* ---- phase vocoder ------------------------------------------------------ */
 
-/* Allocate a vocoder renderer. Only 44100 and 48000 Hz are supported; `nch`
- * must be > 0 and `precision` matches the reference (typical: 2). Returns NULL
- * for an unsupported configuration. */
-void *rx_vc_init(uint32_t sr, int nch, int precision);
+/* Allocate a vocoder renderer. Only 44100 and 48000 Hz are supported and `nch`
+ * must be > 0. Returns NULL for an unsupported configuration.
+ *
+ * There is no `precision` argument. The reference has one, but it was never a
+ * precision: it selected an overlap-add write gain, so it only changed the output
+ * level, and values 3..9 were byte-identical. The state is built at the reference's
+ * value; scale the rendered samples for level. */
+void *rx_vc_init(uint32_t sr, int nch);
 
 /* Release a handle from rx_vc_init. NULL is accepted. */
 void rx_vc_free(void *st);
