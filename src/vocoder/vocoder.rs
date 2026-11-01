@@ -15,7 +15,6 @@
 use crate::fft::with_plan;
 use crate::interp::{interp_nsamples, InterpTable};
 use crate::simple_rand::{noise_template_fill, SimpleRand};
-use crate::vocoder::crossover_tables as tables_data;
 use crate::vocoder::*;
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -173,12 +172,11 @@ const APC_TAU_STEADY_BITS: u32 = 0x3DCC_CCCD;
 
 /// Supported vocoder sample rates.
 ///
-/// The engine's geometry and data banks are rate-parametric: the two snapshot
-/// rates (44.1/48 kHz) run on bit-exact parity tables, every other rate in
-/// `8000..=192000` runs on [`crate::vocoder::rate_gen`]'s generated banks,
-/// which reproduce the DLL's own init-time constructions (measured against
-/// both snapshots; see the `rate_generic` tests). This matches the original
-/// engine, which contains no per-rate tables at all.
+/// Every rate in `8000..=192000` runs on [`crate::vocoder::rate_gen`]'s
+/// banks, designed at init from the rate exactly like the original engine
+/// (which contains no per-rate tables at all). The design laws were measured
+/// on the reference engine's 44.1/48 kHz data before it was retired; the
+/// `rate_generic` tests pin the structural guarantees.
 pub fn supported_rate(sr: u32) -> bool {
     (8000..=192_000).contains(&sr)
 }
@@ -267,7 +265,8 @@ impl VocoderConfig {
     /// existing callers do not break. Prefer [`VocoderConfig::for_rate`].
     pub fn for_rate_with_precision(sr: u32, nch: usize, precision: i32) -> Self {
         let (n_fft, nb_bins, m_fft, mb_bins, n_write, hop) = match sr {
-            // The two snapshot rates: the reference engine's exact constants.
+            // The two reference rates: the engine's exact measured anchors
+            // (n_write 7184/6599 and their FFT classes).
             44100 => (8192usize, 4097usize, 2048usize, 1025usize, 6599usize, 3299i32),
             48000 => (16384usize, 8193usize, 4096usize, 2049usize, 7184usize, 3592i32),
             // Every other rate: the DLL's rate-parametric laws, fitted on the
@@ -614,22 +613,10 @@ impl VocoderState {
         let cfg = cfg;
         let (nb, n_ch) = (cfg.nb_bins, cfg.nch);
         let ring_cap = 4 * cfg.n_write;
-        let (win_table, synth_a, synth_b, v8, v9) = if cfg.sr == 44100 {
-            let win = tables_data::win_44k().to_vec();
-            let (a, b) = tables_data::synth_44k();
-            (win, a.to_vec(), b.to_vec(), 2688usize, 1152usize)
-        } else if cfg.sr == 48000 {
-            let win = tables_data::win_48k().to_vec();
-            let (a, b) = Self::build_synth_windows(cfg.n_write);
-            (win, a, b, 2930usize, 1256usize)
-        } else {
-            // Any other rate: the DLL's own constructions, generated at init
-            // (`rate_gen`). Not bit-identical to a snapshot (there is none at
-            // this rate), but built from the laws measured on both snapshots.
-            let win = crate::vocoder::rate_gen::win_table(cfg.n_write);
-            let (a, b, la, lb) = crate::vocoder::rate_gen::synth_windows(cfg.n_write);
-            (win, a, b, la, lb)
-        };
+        // All rates run on the generated banks — the DLL computes everything
+        // at init from the rate, and so does this engine (rate_gen).
+        let win = crate::vocoder::rate_gen::win_table(cfg.n_write);
+        let (synth_a, synth_b, v8, v9) = crate::vocoder::rate_gen::synth_windows(cfg.n_write);
         let noise_template = vec![0.0f32; 2 * 128 * nb];
         let noise_weight = (0..nb)
             .map(|k| ((k as f32) / nb as f32).powf(F02))
@@ -646,7 +633,7 @@ impl VocoderState {
         });
         Self {
             ring_cap,
-            win_table,
+            win_table: win,
             synth_a,
             synth_b,
             v8_len_a: v8,
@@ -738,29 +725,6 @@ impl VocoderState {
             trace: false,
             cfg,
         }
-    }
-
-    /// `_build_synth_windows` (48 kHz): `HanningWindow^0.7` at two lengths.
-    fn build_synth_windows(n_write: usize) -> (Vec<f32>, Vec<f32>) {
-        let len_a = 2930usize;
-        let len_b = 1256usize;
-        let mut a = vec![0.0f32; n_write];
-        let mut b = vec![0.0f32; n_write];
-        let pi_f = std::f64::consts::PI as f32;
-        let off_b = (n_write / 2) - (len_b / 2);
-        let off_a = (n_write / 2) - (len_a / 2);
-        let scale_a = ((len_b as f32) / (len_a as f32)).sqrt();
-        for i in 0..len_b {
-            let ang = (2.0f32 * pi_f * (i as f32 + 0.5) / len_b as f32) as f64;
-            let val = 0.5f32 * (1.0f32 - (ang.cos() as f32));
-            b[off_b + i] = (val as f64).powf(0.7) as f32;
-        }
-        for i in 0..len_a {
-            let ang = (2.0f32 * pi_f * (i as f32 + 0.5) / len_a as f32) as f64;
-            let val = 0.5f32 * (1.0f32 - (ang.cos() as f32));
-            a[off_a + i] = ((val as f64).powf(0.7) as f32) * scale_a;
-        }
-        (a, b)
     }
 
     /// `set_ratio` — `pitch_chain(semis)` + the driver's `exp2` chain.

@@ -1,11 +1,10 @@
 //! Window/taper table builders shared by the TD and vocoder engines.
 //!
 //! Everything here is *computed*, matching the corresponding C constructor
-//! (`rx_td_build_env_tables`, `rx_td_pitch_set_options`, …). The genuinely
-//! tabulated data the engine reads (crossover FIR banks, vocoder window and
-//! synthesis-window banks) lives in [`crate::tables_data`]; the vocoder schedule is
-//! not tabulated at all, it is computed by
-//! [`crate::vocoder::vc_calc_sched`].
+//! (`rx_td_build_env_tables`, `rx_td_pitch_set_options`, …). The vocoder's
+//! crossover and window banks are computed too, by the rate-generic laws in
+//! [`crate::vocoder::rate_gen`]; the vocoder schedule is not tabulated at
+//! all, it is computed by [`crate::vocoder::vc_calc_sched`].
 
 use crate::consts::{PI_F64, TWO_PI_F};
 

@@ -61,7 +61,6 @@ pub const K07_F: f32 = 0.7;
 pub const EPS1E6_F: f32 = 1e-6;
 
 pub mod acs;
-pub mod crossover_tables;
 pub mod formant;
 pub mod noise;
 pub mod phase;
@@ -70,7 +69,6 @@ pub mod synth;
 pub mod vocoder;
 
 pub use acs::*;
-pub use crossover_tables as tables_data;
 pub use formant::*;
 pub use noise::*;
 pub use phase::*;

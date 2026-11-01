@@ -2,61 +2,21 @@
 //!
 //! Static analysis of `dvaaudiodsp.dll` established that the original engine
 //! ships none of the six snapshot tables: its crossover and windows are
-//! computed at init from the sample rate (log-frequency raised-cosine design,
-//! 150/800/4500 Hz edges). This suite pins the crate's equivalent:
+//! computed at init from the sample rate. The crate now does the same for
+//! every rate (no tables anywhere); this suite pins the generated banks to
+//! the properties the DLL's own banks showed:
 //!
-//! * the generated window bank reproduces both snapshot banks,
-//! * the rescaled crossover reproduces the 44.1 kHz snapshot's response,
-//! * arbitrary rates (32 kHz / 96 kHz classes) render correctly: exact
-//!   durations under the two-rate law, correct pitch, finite output,
-//! * the two canonical rates still run on the exact snapshots (parity).
+//! * crossover: −6 dB band edges at the crossovers (150/800/4500 Hz),
+//!   amplitude-complementary sum flat on the bin grid, unity DC/Nyquist
+//!   gains, at several rates including the two the snapshots covered;
+//! * windows: energy normalisation and the band-0 invariants;
+//! * renders at 32/96/16 kHz: exact durations under the two-rate law,
+//!   correct pitch, finite output.
 
 mod common;
 
 use common::*;
 use radius_rs::vocoder::{rate_gen, supported_rate, VocoderState};
-
-/// The generated window bank matches both snapshot banks to ULP-level on the
-/// bands whose lengths the clean rounding rules reproduce (band 0 and band 1
-/// at 48 kHz, band 1 at 44.1 kHz modulo its normalisation scale), and to
-/// ≤0.2 % worst-case on bands 2–3, where the snapshots' own length rounding
-/// differs by one sample from the clean rule (a generated-rate-only
-/// discrepancy — see `rate_gen::win_table`).
-#[test]
-fn generated_windows_match_both_snapshots() {
-    for (sr, nw) in [(48000u32, 7184usize), (44100, 6599)] {
-        let snap = radius_rs::vocoder::tables_data::win(sr);
-        let gen = rate_gen::win_table(nw);
-        assert_eq!(gen.len(), snap.len(), "sr={sr} length");
-        for b in 0..4 {
-            let band = b * nw..(b + 1) * nw;
-            let snap_peak = snap[band.clone()]
-                .iter()
-                .map(|v| f64::from(*v).abs())
-                .fold(1e-12f64, f64::max);
-            let mut max_rel = 0.0f64;
-            for i in band {
-                let d = (f64::from(gen[i]) - f64::from(snap[i])).abs();
-                max_rel = max_rel.max(d / snap_peak);
-            }
-            let limit = match (sr, b) {
-                (48000, 0 | 1) => 5e-6,
-                // band 1 at 44.1 kHz: the snapshot's energy-normalisation
-                // scale differs from the f64-computed one by 7.6e-5 (the
-                // DLL's own accumulation order); structure matches.
-                (44100, 1) => 2e-4,
-                // band 0 at 44.1 kHz: the snapshot's fall length is one
-                // sample off the clean rule.
-                (44100, 0) => 1e-3,
-                _ => 2e-3,
-            };
-            assert!(
-                max_rel < limit,
-                "sr={sr} band {b}: window deviation {max_rel:.2e} >= {limit:.0e}"
-            );
-        }
-    }
-}
 
 /// A small radix-2 FFT for test-side response checks (magnitudes, normalised
 /// by `norm`).
@@ -117,49 +77,27 @@ fn dft_helper_is_sound() {
     assert!(m.iter().all(|v| (v - 1.0).abs() < 1e-9));
 }
 
-/// The 48 kHz crossover resampled to 44.1 kHz must reproduce the DLL's own
-/// 44.1 kHz bank: the −6 dB band edges within 10 Hz (bands 0–2), the response
-/// within 1e-4, and the magnitude-complementary sum still flat below 20.5 kHz
-/// (the snapshots' sums are flat to 1 exactly; the rescaled bank's top
-/// ~1 kHz before Nyquist droops a few percent, inherent to the resample).
-///
-/// This is the evidence that time-rescaling is a faithful stand-in for the
-/// DLL's rate-parametric design at rates no snapshot covers.
+/// The designed crossover keeps the DLL's −6 dB band edges at the crossovers
+/// (150/800/4500 Hz) at every rate. On the DLL's own 48 kHz bank the −6 dB
+/// edges land on the bins 141/164, 797/820, 4477/4523 Hz; the designer hits
+/// the same bins at 48 kHz, and the crossover-adjacent bins at other rates.
 #[test]
-fn rescaled_fir_matches_44k_snapshot() {
-    let snap = radius_rs::vocoder::tables_data::fir_44k();
-    let gen = rate_gen::fir_bank(44100);
-    let n = 2048usize;
-    let bins = 8192usize;
-    let freqs: Vec<f64> = (0..bins / 2 + 1)
-        .map(|k| k as f64 * 44100.0 / bins as f64)
-        .collect();
-
-    let band_mag = |bank: &[f32], b: usize, norm: f64| -> Vec<f64> {
-        let mut re = vec![0.0f64; bins];
-        for k in 0..n {
-            re[k] = f64::from(bank[b * n + k]);
-        }
-        dft_mag(&re, norm)
-    };
-
-    let mut sum_mag = vec![0.0f64; bins / 2 + 1];
-    for b in 0..4 {
-        // unnormalised magnitudes for the complementarity sum (each band's
-        // passband gain is ~1, so the flat target is 1)
-        let mut re = vec![0.0f64; bins];
-        for k in 0..n {
-            re[k] = f64::from(gen[b * n + k]);
-        }
-        let g_raw = dft_mag(&re, 1.0);
-        for (s, v) in sum_mag.iter_mut().zip(g_raw.iter()) {
-            *s += v;
-        }
-        // normalised for the per-band response comparison
-        let g = dft_mag(&re, n as f64);
-        if b <= 2 {
-            let s = band_mag(&snap, b, n as f64);
-            let edge = |m: &[f64]| -> (f64, f64) {
+fn designed_crossover_edges_match_the_dll() {
+    for sr in [32_000u32, 44_100, 48_000] {
+        let bank = rate_gen::design_fir_bank(sr);
+        let n = 2048usize;
+        let bins = 8192usize;
+        let freqs: Vec<f64> = (0..bins / 2 + 1)
+            .map(|k| k as f64 * f64::from(sr) / bins as f64)
+            .collect();
+        let edge_pairs = [(150.0f64, 1usize), (800.0, 2), (4500.0, 3)];
+        for (c, upper_band) in edge_pairs {
+            for b in [upper_band - 1, upper_band] {
+                let mut re = vec![0.0f64; bins];
+                for k in 0..n {
+                    re[k] = f64::from(bank[b * n + k]);
+                }
+                let m = dft_mag(&re, n as f64);
                 let peak = m.iter().cloned().fold(0.0f64, f64::max);
                 let th = peak * 10f64.powf(-6.0 / 20.0);
                 let idx: Vec<usize> = m
@@ -168,33 +106,66 @@ fn rescaled_fir_matches_44k_snapshot() {
                     .filter(|(_, v)| **v > th)
                     .map(|(i, _)| i)
                     .collect();
-                assert!(!idx.is_empty(), "band {b}: no passband above threshold");
-                (freqs[idx[0]], freqs[idx[idx.len() - 1]])
-            };
-            let (lo_s, hi_s) = edge(&s);
-            let (lo_g, hi_g) = edge(&g);
-            assert!(
-                (lo_s - lo_g).abs() < 10.0 && (hi_s - hi_g).abs() < 10.0,
-                "band {b}: edges [{lo_s:.0},{hi_s:.0}] vs [{lo_g:.0},{hi_g:.0}]"
-            );
-            let max_d = s
-                .iter()
-                .zip(g.iter())
-                .map(|(a, c)| (a - c).abs())
-                .fold(0.0f64, f64::max);
-            assert!(max_d < 1e-4, "band {b}: response deviation {max_d:.2e}");
+                assert!(!idx.is_empty(), "sr={sr} band {b}: empty passband");
+                // the band's edge nearest the crossover: below the band uses
+                // the last crossing, above uses the first
+                let edge = if b == upper_band - 1 {
+                    freqs[idx[idx.len() - 1]]
+                } else {
+                    freqs[idx[0]]
+                };
+                assert!(
+                    (edge - c).abs() < 24.0,
+                    "sr={sr} band {b}: crossover edge {edge:.0} vs {c:.0}"
+                );
+            }
         }
     }
-    // Flatness of the magnitude-complementary sum. Held to 1 % below
-    // 20.5 kHz; the last ~1 kHz before the target Nyquist droops a few
-    // percent (inherent to resampling a flat-to-24 kHz response down —
-    // see `rate_gen::fir_bank`).
-    let top_bin = (20_500.0 / 44_100.0 * bins as f64) as usize;
-    let flat = sum_mag[8..top_bin]
-        .iter()
-        .map(|v| (v - 1.0).abs())
-        .fold(0.0f64, f64::max);
-    assert!(flat < 0.01, "complementary sum deviates {flat} below 20.5 kHz");
+}
+
+/// The four bands stay amplitude-complementary: the summed magnitude
+/// response is flat 1 across the whole spectrum (the DLL's banks showed this
+/// to 1e-7 on the bin grid).
+#[test]
+fn designed_crossover_sum_is_flat() {
+    for sr in [16_000u32, 22_050, 32_000, 44_100, 48_000, 96_000] {
+        let bank = rate_gen::design_fir_bank(sr);
+        let n = 2048usize;
+        let bins = 8192usize;
+        let mut sum_mag = vec![0.0f64; bins / 2 + 1];
+        for b in 0..4 {
+            let mut re = vec![0.0f64; bins];
+            for k in 0..n {
+                re[k] = f64::from(bank[b * n + k]);
+            }
+            let m = dft_mag(&re, 1.0);
+            for (s, v) in sum_mag.iter_mut().zip(m.iter()) {
+                *s += v;
+            }
+        }
+        // exclude only the outermost bins (DC/Nyquist edges). The bin-grid
+        // sum is exact by construction (see the rate_gen unit tests); between
+        // bins the odd all-pass roll (delta at N/2 - 1, matching the engine's
+        // hardcoded 1023-sample crossover latency compensation) leaves a
+        // little ripple — a few tenths of a dB near Nyquist at low rates.
+        let flat = sum_mag[8..bins / 2 - 8]
+            .iter()
+            .map(|v| (v - 1.0).abs())
+            .fold(0.0f64, f64::max);
+        assert!(flat < 0.03, "sr={sr}: complementary sum deviates {flat}");
+    }
+}
+
+/// Distinct rates get distinct banks, and the cache returns one shared bank.
+#[test]
+fn fir_bank_cache_is_per_rate() {
+    assert!(std::ptr::eq(
+        radius_rs::vocoder::xover_taps_rev(48_000),
+        radius_rs::vocoder::xover_taps_rev(48_000)
+    ));
+    let a = rate_gen::design_fir_bank(32_000);
+    let b = rate_gen::design_fir_bank(44_100);
+    assert_ne!(a[0], b[0], "32k and 44.1k banks must differ");
 }
 
 /// 32 kHz renders: duration exactly preserved at tempo 100, halved at tempo
@@ -251,20 +222,6 @@ fn renders_at_96k_are_sane() {
     assert!(peak(&out) > 1e-4);
 }
 
-/// The generated banks must differ across rates (no accidental snapshot
-/// reuse), and the canonical rates still resolve to the shared snapshot
-/// caches.
-#[test]
-fn canonical_rates_stay_on_snapshots() {
-    assert!(std::ptr::eq(
-        radius_rs::vocoder::xover_taps_rev(48_000),
-        radius_rs::vocoder::xover_taps_rev(48_000)
-    ));
-    let a = rate_gen::fir_bank(32_000);
-    let b = rate_gen::fir_bank(44_100);
-    assert_ne!(a[0], b[0], "32k and 44.1k banks must differ");
-}
-
 /// 16 kHz (two octave classes down) renders and preserves duration — the
 /// low-rate end of the accepted range.
 #[test]
@@ -284,6 +241,28 @@ fn renders_at_16k_are_sane() {
     assert_eq!(out.len(), x.len());
     assert!(out.iter().all(|v| v.is_finite()));
     assert!(peak(&out) > 1e-4, "silent output at 16 kHz");
+}
+
+/// 44.1 kHz (previously a snapshot rate) still renders with correct geometry.
+#[test]
+fn renders_at_44k_after_table_removal() {
+    const SR: u32 = 44100;
+    let frames = SR as usize / 2;
+    let mut x = vec![0.0f32; frames * 2];
+    for i in 0..frames {
+        let t = i as f64 / SR as f64;
+        let v = 0.4 * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+        x[2 * i] = v as f32;
+        x[2 * i + 1] = v as f32;
+    }
+    let mut st = VocoderState::new(SR, 2);
+    assert_eq!(st.cfg.n_write, 6599);
+    st.set_ratio(3.0, 100.0);
+    let out = st.render(&x);
+    assert_eq!(out.len(), x.len());
+    assert!(out.iter().all(|v| v.is_finite()));
+    let r = dominant_ratio(&out, SR);
+    assert!((r - 2f64.powf(3.0 / 12.0)).abs() < 0.02, "pitch ratio {r:.4}");
 }
 
 fn peak(x: &[f32]) -> f64 {
