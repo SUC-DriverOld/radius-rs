@@ -188,19 +188,30 @@ pub fn new_progress_counter() -> ProgressCounter {
 }
 
 /// `vc_calc_sched` (`pyradius/tables.py`): `(pos, cdel, in_step, out_step)`.
-pub fn vc_calc_sched(g: i64, ratio: f64, nominal_step: f64) -> (i64, i64, i64, i64) {
+///
+/// The two rates of the tempo mechanism meet here (see [`VocoderState::slope`]):
+/// the **branch** — whether the analysis step widens by √2 — is selected by the
+/// *pitch* ratio, exactly as in the pitch-only reference (that is the table
+/// lookup pyradius mirrors, and the pitch corpus pins it bit-exactly), while
+/// `out_step` always paces the output ring by the **slope** `pitch × stretch`.
+///
+/// So at pitch +3 / tempo 50 the schedule is (222, 132) — the plain law — and
+/// not the √2 pair pyradius would print for a ratio below 1, because the pitch
+/// is still above 1. Measured against the Audition reference render this is the
+/// better law by a wide margin (envelope correlation 0.843 vs 0.789, spectrum
+/// 0.963 vs 0.956); pacing the ring by the stretch alone instead of the slope
+/// collapses it to 0.32.
+pub fn vc_calc_sched(g: i64, pitch_ratio: f64, slope: f64, nominal_step: f64) -> (i64, i64, i64, i64) {
     if g < 5 {
         return (0, 0, 0, 0);
     }
     let grp = (g - 1) / 4;
-    let (in_step, out_step) = if ratio >= 1.0 {
-        (
-            nominal_step.round() as i64,
-            (nominal_step * ratio).round() as i64,
-        )
+    let (in_step, out_step) = if pitch_ratio >= 1.0 {
+        let i = nominal_step.round() as i64;
+        (i, (i as f64 * slope).round() as i64)
     } else {
         let i = (nominal_step * std::f64::consts::SQRT_2).round() as i64;
-        (i, (i as f64 * ratio).round() as i64)
+        (i, (i as f64 * slope).round() as i64)
     };
     let pos = grp * out_step;
     let cdel = if g % 4 == 1 { in_step } else { 0 };
@@ -406,6 +417,25 @@ pub struct VocoderState {
     // ---- ratio ----
     pub ratio: f64,
     pub stretch: f64,
+    /// The schedule slope `stretch * pitch_ratio` — the write rate of the output
+    /// ring per input frame.
+    ///
+    /// Reverse-engineered from `dvaaudiodsp.dll`'s vocoder (`RadiusImplVoc`):
+    /// the renderer keeps three ratios. The pitch ratio `2^(P/12)` drives the
+    /// synthesis interpolation and the final resampler drain, while the *ramp
+    /// slope* `stretch * 2^(P/12)` (renderer+0x20, recomputed by `0x157BC0`)
+    /// drives how far the output ring advances per input frame. Measured live on
+    /// a 200 % / +3 semitone render: the drain phase advances exactly
+    /// 1.189207 (= 2^(3/12)) per output frame, while the ring write cursor
+    /// advances 2.378414 (= 2 * 2^(3/12)) per input frame, so the finished audio
+    /// runs `2.378414 / 1.189207 = 2.0x` as long at the requested pitch.
+    ///
+    /// Here that means: the granule schedule (`vc_calc_sched`) is generated for
+    /// `slope`, so `pos` (the ring write cursor) advances `slope` per input
+    /// frame, while the drain in [`VocoderState::render_to`] still reads at
+    /// `ratio`. A `stretch` of 1.0 leaves `slope == ratio` bit-exactly, so the
+    /// pitch-only path is unchanged.
+    pub slope: f64,
     /// Output gain in dB, applied to the finished samples. 0.0 is a no-op.
     pub gain_db: f64,
     /// Formant (spectral envelope) shift in semitones; `0.0` preserves the formants
@@ -665,6 +695,7 @@ impl VocoderState {
             formant,
             ratio: 1.0,
             stretch: 1.0,
+            slope: 1.0,
             gain_db: 0.0,
             formant_semitones: 0.0,
             pitch_ratio: 1.0,
@@ -700,23 +731,18 @@ impl VocoderState {
     /// `set_ratio` — `pitch_chain(semis)` + the driver's `exp2` chain.
     /// Set the pitch shift (semitones) and the time stretch (percent).
     ///
-    /// # Why the stretch does *not* go into `ratio`
+    /// `ratio` stays the pitch control: the synthesis interpolation and the final
+    /// resampler drain both run at it. The stretch never touches it — feeding the
+    /// tempo into it made `--tempo 200` an octave shift (measured on a 440 Hz tone
+    /// at +3 semitones: 523 Hz / 1047 Hz / 262 Hz).
     ///
-    /// `ratio` is the analysis/synthesis rate, and it is **the pitch control**: the
-    /// granule cursor advances by it, so doubling it doubles the pitch. Feeding the
-    /// tempo into it — which is what this port used to do — made `--tempo 200` raise
-    /// the pitch by an octave and `--tempo 50` drop it by an octave (measured on a
-    /// 440 Hz tone at +3 semitones: 523 Hz / 1047 Hz / 262 Hz).
-    ///
-    /// The stretch belongs on the *output* side instead, where it only changes how
-    /// fast the finished ring is read: `ratio` stays the pitch, the resampler runs at
-    /// `ratio * stretch`, and the frame target is `input * stretch`. That reproduces
-    /// what the reference TD engine does and what the Audition references show —
-    /// `--tempo` changes the duration and leaves the pitch alone.
-    ///
-    /// The reference's own `vc_render` has no tempo parameter at all (its second
-    /// argument is `quality`), so there is no reference behaviour to preserve here;
-    /// the stretch is this crate's addition and has to be wired up explicitly.
+    /// Instead the stretch scales the **schedule slope** [`Self::slope`] — the rate
+    /// the output ring is written at per input frame. This is the division of labour
+    /// measured in `dvaaudiodsp.dll`'s vocoder: the ramp slope stored at
+    /// renderer+0x20 is `stretch * 2^(P/12)` and only drives the granule positions,
+    /// while the renderer's float ratio (+0x1D84) stays at the pitch and drives the
+    /// synthesis. A 200 % tempo therefore doubles the duration and leaves the pitch
+    /// where `semis` put it.
     pub fn set_ratio(&mut self, semis: f64, tempo: f64) {
         self.stretch = tempo / 100.0;
         let pr = 2.0f64.powf(semis / 12.0);
@@ -725,7 +751,11 @@ impl VocoderState {
         self.pitch_ratio = self.ratio;
         self.total_ratio = self.ratio;
         self.cfg.total_ratio = self.ratio;
-        self.comp_1432 = self.ratio * self.hop_1420 as f64;
+        // The schedule slope (see the field doc): the DLL's renderer+0x20, which
+        // scales the output-ring write rate and nothing else. At tempo 100 this
+        // is exactly `ratio`, so the pitch-only path is unchanged.
+        self.slope = self.ratio * self.stretch;
+        self.comp_1432 = self.slope * self.hop_1420 as f64;
         // Keep the formant operator in step: its ratio is the pitch ratio offset by
         // the formant shift, and it must follow the pitch as well.
         self.sync_formant_ratio();
@@ -1281,8 +1311,8 @@ impl VocoderState {
 
     /// `_ev_oac` — `OverlapAddChannel`.
     fn ev_oac(&mut self, ch: usize) {
-        let sched_now = vc_calc_sched(self.g_index, self.ratio, self.cfg.step_base);
-        let sched_next = vc_calc_sched(self.g_index + 1, self.ratio, self.cfg.step_base);
+        let sched_now = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base);
+        let sched_next = vc_calc_sched(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
         let mut a3 = (sched_next.0 - sched_now.0) as i32;
         if a3 <= 0 {
             a3 = self.step_1412;
@@ -1415,8 +1445,8 @@ impl VocoderState {
         if profile_enabled() {
             VC_PROFILE.with(|p| p.borrow_mut().granules += 1);
         }
-        let se_curr = vc_calc_sched(self.g_index, self.ratio, self.cfg.step_base);
-        let se_next = vc_calc_sched(self.g_index + 1, self.ratio, self.cfg.step_base);
+        let se_curr = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base);
+        let se_next = vc_calc_sched(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
         self.pos_1384 = se_curr.0;
         self.writepos_1224 = self.pos_1384 + self.hop_1420 as i64;
         self.sched_cdel = se_curr.1;
@@ -1499,7 +1529,7 @@ impl VocoderState {
             );
         }
         if ph == 0 {
-            self.sched_cdel = vc_calc_sched(self.g_index, self.ratio, self.cfg.step_base).1;
+            self.sched_cdel = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base).1;
             self.ev_cursor_advance();
         } else {
             self.sched_cdel = -1;
@@ -1630,16 +1660,18 @@ impl VocoderState {
 
     /// As [`VocoderState::render`], but producing `target_frames` output frames.
     ///
-    /// `target_frames` is how many frames to make, of which the first
-    /// `x.len() / nch` come from the real signal; any remainder is reached by feeding
-    /// zeros past the end, the same end-of-stream flush the reference performs. The
-    /// caller derives it from the requested time stretch
-    /// (`round(input_frames * tempo / 100)`), because the reference's own
-    /// `vc_render` hardcodes the output to the input length — which is exactly why a
-    /// tempo change had no effect on duration before this existed.
+    /// With a stretch configured ([`VocoderState::set_ratio`]'s `tempo`), the
+    /// caller asks for `round(input_frames * stretch)`: the schedule runs at the
+    /// slope `stretch * pitch_ratio` (see [`Self::slope`]), so the output ring is
+    /// written `stretch` times as fast as the pitch-only run while the drain still
+    /// reads it at the pitch ratio — exactly the two rates measured in
+    /// `dvaaudiodsp.dll` — and the render lands on the stretched duration at the
+    /// unshifted tempo of the pitch. Feeding past the end of the input (as
+    /// zeros) only covers the drain's settling lag, a hop or so, not the whole
+    /// stretched tail.
     ///
-    /// A `target_frames` equal to the input length reproduces [`VocoderState::render`]
-    /// bit for bit.
+    /// A `target_frames` equal to the input length (and a stretch of 1) reproduces
+    /// [`VocoderState::render`] bit for bit.
     pub fn render_to(&mut self, x: &[f32], target_frames: usize) -> Vec<f32> {
         profile_reset();
         let t_render = profile_enabled().then(Instant::now);
@@ -1655,10 +1687,10 @@ impl VocoderState {
         // the pitch ratio alone. Putting the stretch here too is what made `--tempo`
         // an octave shift.
         //
-        // The stretch therefore acts through *how much is fed*: the synthetic timeline
-        // is `stretch` times as long, so the feed continues (past the input, as
-        // silence) until `target * pitch_ratio` frames have been pushed in. That is
-        // the same amount the reference feeds for an unstretched run, times `stretch`.
+        // The stretch acts one layer up, in the schedule slope (`self.slope`): the
+        // ring's write cursor advances `stretch * r` per input frame while this drain
+        // consumes `r` per output frame, so the output runs `stretch` times the input
+        // length at the pitch the synthesis already applied.
         let ratio = self.ratio;
         // Progress is reported against the frames we are actually going to make.
         self.progress_total = target.max(1) as i64;

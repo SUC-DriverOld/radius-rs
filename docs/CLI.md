@@ -98,7 +98,6 @@ The warnings are:
 
 | warning | when |
 |---|---|
-| time stretching is this crate's own | `--tempo` is anything but 100. The engines reproduce libradius for *pitch*; the stretch is a separate overlap-add stage written here, so its result may differ from Audition's. At `--tempo 100` the stage never runs and there is nothing to warn about. |
 | clipping | the render exceeds full scale and the target quantises (see the clipping section below) |
 | `--formant-shift` has no effect at `--semitones 0` | the formant operator only runs alongside a pitch shift. Every value from −12 to +12 renders byte-identically at pitch 0, so the argument genuinely cannot do anything. |
 | `--formant-shift` has no effect under `--no-preserve-voice` | that flag turns the operator off outright |
@@ -115,44 +114,55 @@ All of these are overridable per run, and `--help` prints the same defaults.
 |---|---|---|---|
 | `-m, --mode <td\|vc>` | `td` | `td` is the time-domain granule engine (`rx_td_render`); `vc` is the phase vocoder (`rx_vc_render`). | **声码器模式** off = `td`, on = `vc` |
 | `-s, --semitones <F>` | `0` | Pitch shift in semitones; fractional and negative values are fine. At the default nothing is shifted, so `radius in.wav out.flac` is a lossless format conversion. | **变调** slider (−36 … +36 半音) |
-| `--tempo <F>` | `100` | Time stretch in percent: 100 keeps the duration, 200 doubles it, 50 halves it. The pitch is unaffected — see the note below, because this one is **not** delivered by the engines, and the engines are deliberately told `tempo = 100` so they do not also stretch internally. | **伸缩** slider, same percentage readout |
+| `--tempo <F>` | `100` | Time stretch in percent: 100 keeps the duration, 200 doubles it, 50 halves it. The pitch is unaffected — the engines deliver this themselves (see the note below). | **伸缩** slider, same percentage readout |
 | `--fft <radix2\|rustfft>` | `radix2` | Select the FFT implementation at run time. Both are always compiled in. | — |
 
-### `--tempo` is a stage after the engine, not a knob on it
+### `--tempo` is delivered by the engines, the way `dvaaudiodsp.dll` does it
 
-Both engines apply the pitch with a resampler whose rate *is* the pitch, and their granule scheduler walks the input exactly once. That one mechanism sets both the pitch and how much audio they can emit, so they cannot stretch: given more output frames than the input's length they render the input and then pad with silence, and given fewer they render a prefix of it and stop. Measured on a 4 s tone at `-s 3`, the output was 8.12 s at `-t 200` but only 4.07 s of it was audio, and 1.96 s at `-t 50` containing just the first 1.96 s at the original speed.
+This used to be a post-engine overlap-add stage in this crate; it is now the real
+mechanism, reverse-engineered from Audition's `dsp::stretch::radius::RadiusEngine`
+(notes in [RE-dvaaudiodsp-radius-tempo.md](RE-dvaaudiodsp-radius-tempo.md)). Each
+engine keeps **two rates**:
 
-So `--tempo` is applied **after** the engine, by [`src/stretch.rs`](RUST-API.md): the engines are asked for the natural-length, correctly pitched signal, and that signal is then re-timed by overlap-add with a similarity search (WSOLA), which changes the duration without touching the pitch. The run reports the stage separately:
+* a **drain rate** — the pitch ratio `r = 2^(semitones/12)` — at which its output
+  ring is resampled into the final stream;
+* a **schedule slope** — `r × stretch` — the rate at which the engine's internal
+  output ring advances per input frame.
 
-```text
-render: out=1393118 frames (29.023s)  granule=1702 transient=27 wrap=0  [1350 ms, 21.5x RT]
-tempo: 1393118 -> 2787196 frames (x2.0000)  overlap-add, 1361 windows, mean |offset| 252.2 samples, level +2.59 dB  [1134 ms]
-```
+The stretch scales only the slope. The render then comes out at
+`(slope / drain) = stretch` times the input duration with the pitch still at
+`semitones`, and the output length is exactly `round(input × stretch)` — the same
+arithmetic Audition's reference renders follow (2,787,196 frames for a 2× of this
+corpus' 1,393,598, 696,799 for the 50 % case).
 
-### The engines are told the pitch and nothing else
+In the time-domain engine the slope drives the granule pump — the accumulator
+spawns *extra granules* that replay windows, so the ring holds a time-stretched
+copy of the input (measured: ring write = `slope × input` frames, exact, at 50 %,
+100 % and 200 %) — and the drain resamples it back by the pitch ratio. In the
+vocoder the slope is the out-step of the grain scheduler (`vc_calc_sched`).
 
-`set_ratio` is called with `tempo = 100` on both engines. This is not a detail — passing the real tempo as well makes the engine stretch *internally* too, and then the output is stretched twice:
-
-* The time-domain engine's `total_ratio = pitch_ratio × stretch`, so `-s 3 -t 200` drives it at **2.378**. That doubles the granule overlap and clips: measured on the corpus, the engine's own output peaked at **1.288 with 10 000 samples (0.36%) over full scale**, against 1.111 and 9 samples at tempo 100. The vocoder was less affected because its pitch and stretch ratios are separate, which is why only `--mode td` sounded broken.
-* Once the engine does pitch only, its output peaks at 1.111 like any other tempo, and the result matches Audition: **RMS −8.29 dB against their −7.95, peak 1.284 against 1.279**.
-
-So the split is: **the engine owns pitch, the stretch stage owns duration.** Neither should do the other's job.
-
-Two more consequences worth knowing:
-
-* **`--tempo 100` skips the stage entirely**, so the default path is byte-for-byte what it always was and the parity corpus still holds.
-* The two engines share one stretch implementation, so they cannot disagree about it.
+At `--tempo 100` the slope equals the drain rate and the whole path is
+bit-identical to the pitch-only render, so the parity corpus still holds.
 
 ### The output can exceed full scale, and Audition's does too
 
-A pitch shift raises the level, so the render can peak above 1.0 — and so does Audition's. On the corpus at `-s 3 -t 200`:
+A pitch shift raises the level, so the render can peak above 1.0 — and so does
+Audition's. On the corpus at `+3` semitones:
 
 | | peak | samples over full scale | RMS |
 |---|---|---|---|
-| Audition, time domain | 1.2790 | 0.3301% | −7.95 dB |
-| this crate, time domain | 1.2844 | 0.3615% | −8.29 dB |
-| Audition, vocoder | 1.6449 | 0.3187% | −8.88 dB |
-| this crate, vocoder | 1.6221 | 0.4112% | −8.45 dB |
+| Audition, time domain, tempo 100 | 1.3247 | 0.2202 % | −7.49 dB |
+| this crate, time domain, tempo 100 | 1.2099 | 0.0032 % | −7.69 dB |
+| Audition, time domain, tempo 200 | 1.3256 | 0.8070 % | −7.27 dB |
+| this crate, time domain, tempo 200 | 1.2110 | 0.0020 % | −8.02 dB |
+| Audition, time domain, tempo 50 | 1.2916 | 0.0146 % | −8.00 dB |
+| this crate, time domain, tempo 50 | 1.3155 | 0.0352 % | −8.01 dB |
+| Audition, vocoder, tempo 100 | 1.8183 | 0.8633 % | −8.08 dB |
+| this crate, vocoder, tempo 100 | 1.8940 | 1.1014 % | −7.88 dB |
+| Audition, vocoder, tempo 200 | 1.8329 | 0.7510 % | −8.21 dB |
+| this crate, vocoder, tempo 200 | 1.8519 | 0.8782 % | −8.08 dB |
+| Audition, vocoder, tempo 50 | 1.6253 | 0.4165 % | −8.77 dB |
+| this crate, vocoder, tempo 50 | 1.6059 | 0.6385 % | −8.33 dB |
 
 Float WAV stores those values as they are. An integer or lossy target clamps them, and the CLI warns in yellow when it will (see the warnings section). Use `--gain` to bring the level down first if the target is not float.
 

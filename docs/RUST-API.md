@@ -20,6 +20,11 @@ for i in 0..frames {
 }
 
 // quality 37 / solo 0 are the reference defaults; nch is the channel count.
+// set_ratio takes (semitones, tempo percent): the tempo stretches the schedule
+// slope inside the engine, exactly as dvaaudiodsp.dll does it (see
+// docs/RE-dvaaudiodsp-radius-tempo.md), so 200 doubles the duration at the
+// same pitch. render's third argument is the input frame count; the output is
+// round(input * tempo/100) frames.
 let mut engine = TdState::new(rate, 37, 0, nch);
 engine.set_ratio(3.0, 100.0); // +3 semitones, no time stretch
 
@@ -34,7 +39,7 @@ println!(
 );
 ```
 
-Swap in the vocoder for polyphonic material. It takes the whole buffer and no frame count, because it always returns exactly what it was given:
+Swap in the vocoder for polyphonic material. `render_to` takes a target frame count, so the tempo is delivered by passing a stretched target (`render` without a target keeps the input length):
 
 ```rust
 use radius_rs::VocoderState;
@@ -44,7 +49,7 @@ engine.set_ratio(-3.0, 100.0);                 // semitones, tempo percent
 engine.set_gain(0.0);                          // output gain in dB (0 = bit-exact)
 engine.set_formant_shift(0.0);                 // spectral envelope shift, semitones
 engine.set_preserve_voice(true);               // formant preservation (the default)
-let output = engine.render(&input);
+let output = engine.render(&input);            // or render_to(&input, target)
 ```
 
 ## Reading and writing files

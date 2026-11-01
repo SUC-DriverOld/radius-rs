@@ -189,6 +189,13 @@ fn reference(semis: i32) -> Option<(Vec<f32>, Vec<f32>)> {
     Some((read_wav(&path).samples, read_wav(&input).samples))
 }
 
+/// The engine-tagged Audition render (`au-td+3.wav` &c.) for `semis`.
+fn engine_reference(engine: &str, semis: i32) -> Option<(Vec<f32>, Vec<f32>)> {
+    let path = audition_reference_named(&format!("au-{engine}{semis:+}.wav"))?;
+    let input = acceptance_audio_or_skip(&format!("audition_reference {engine} {semis:+}"))?;
+    Some((read_wav(&path).samples, read_wav(&input).samples))
+}
+
 /// Time-domain render vs the Audition reference: duration, level, contour.
 #[test]
 fn td_output_matches_audition_perceptually() {
@@ -200,7 +207,7 @@ fn td_output_matches_audition_perceptually() {
     require_audio(&input, &input_path);
     let mut ran = 0;
     for semis in [3.0f64, -3.0] {
-        let Some((want, _)) = reference(semis as i32) else {
+        let Some((want, _)) = engine_reference("td", semis as i32) else {
             continue;
         };
         ran += 1;
@@ -242,6 +249,78 @@ fn td_output_matches_audition_perceptually() {
     if ran == 0 {
         eprintln!(
             "SKIP td_output_matches_audition_perceptually: no Audition renders supplied \
+             (set RADIUS_AUDITION_REF_DIR, see tests/common/mod.rs)"
+        );
+    }
+}
+
+/// Tempo renders vs the Audition references: the output *length* is exact and
+/// the perceptual checks (level, contour) stay in the same band as the
+/// duration-preserving renders above.
+///
+/// The references (`au-td+3_200.wav` &c.) come from the same Audition session as
+/// the others: algorithm iZotope Radius, precision High, pitch +3, **伸缩** 200 %
+/// and 50 %, both engine modes. `#[ignore]`d like the vocoder test — four
+/// full-length renders run ~4 min.
+#[test]
+#[ignore = "runs four full-length tempo renders (~4 min)"]
+fn tempo_renders_match_audition() {
+    let Some(input_path) = acceptance_audio_or_skip("tempo_renders_match_audition") else {
+        return;
+    };
+    let input = read_wav(&input_path);
+    require_audio(&input, &input_path);
+    let mut ran = 0;
+    for (engine, tempo) in [("td", 200.0f64), ("td", 50.0), ("vc", 200.0), ("vc", 50.0)] {
+        let Some(path) = audition_reference_named(&format!("au-{engine}+3_{tempo:.0}.wav")) else {
+            continue;
+        };
+        let want = read_wav(&path).samples;
+        ran += 1;
+        let want_frames = want.len() / input.channels;
+        // Audition writes exactly round(input * stretch) frames.
+        let expect = (input.frames() as f64 * tempo / 100.0).round() as usize;
+        assert_eq!(
+            want_frames, expect,
+            "the Audition {engine} {tempo:.0}% reference must be round(input*{:.2})",
+            tempo / 100.0
+        );
+
+        let got = if engine == "td" {
+            let mut st = radius_rs::TdState::new(input.rate, 37, 0, input.channels);
+            st.set_ratio(3.0, tempo);
+            st.render(&input.samples, input.frames(), expect)
+        } else {
+            let mut st = VocoderState::new(input.rate, input.channels);
+            st.set_ratio(3.0, tempo);
+            st.render_to(&input.samples, expect)
+        };
+        let got_frames = got.len() / input.channels;
+        let ratio = got_frames as f64 / want_frames as f64;
+        assert!(
+            (ratio - 1.0).abs() < 0.005,
+            "{engine} {tempo:.0}% duration drift vs Audition: {got_frames} vs {want_frames}"
+        );
+
+        let n = got_frames.min(want_frames);
+        let a = mono(&got[..n * input.channels], input.channels);
+        let b = mono(&want[..n * input.channels], input.channels);
+        let dl = level_db(&a) - level_db(&b);
+        assert!(
+            dl.abs() < 6.0,
+            "{engine} {tempo:.0}% level differs by {dl:+.2} dB from Audition"
+        );
+
+        let r = best_envelope_corr(&envelope(&a, 10.0), &envelope(&b, 10.0), 64);
+        assert!(
+            r > 0.5,
+            "{engine} {tempo:.0}% contour too different from Audition: corr {r:.3}"
+        );
+        println!("{engine} +3 {tempo:.0}%: level {dl:+.2} dB, contour corr {r:.3}");
+    }
+    if ran == 0 {
+        eprintln!(
+            "SKIP tempo_renders_match_audition: no Audition tempo renders supplied \
              (set RADIUS_AUDITION_REF_DIR, see tests/common/mod.rs)"
         );
     }

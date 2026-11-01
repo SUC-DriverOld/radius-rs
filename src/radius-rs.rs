@@ -48,83 +48,12 @@ fn is_passthrough(cli: &Cli) -> bool {
     cli.semitones == 0.0 && cli.tempo == 100.0
 }
 
-/// Give the engine's output the duration `--tempo` asked for, at the pitch it produced.
-///
-/// The engines apply the pitch with a resampler whose rate is also what sets their
-/// output length, and their granule scheduler traverses the input once, so the audio
-/// they emit is capped near the input length:
-///
-/// ```text
-///   4 s source, -s 3, -t 200  ->  8.12 s out, 4.07 s of it audio
-///   8 s source, -s 3, -t 200  -> 16.06 s out, 8.07 s of it audio
-/// ```
-///
-/// So the duration was never the hard part — the content was. This stage takes the
-/// engine's natural-length, correctly pitched signal and re-times it with overlap-add,
-/// which changes the duration without touching the pitch (see [`radius_rs::stretch`]).
-///
-/// This is why the engines are asked for `input.frames()` rather than for the stretched
-/// total: giving them the stretched total only makes them pad or cut, and stretching
-/// that afterwards would re-time the padding. The engine's job is pitch; this stage's
-/// job is duration.
-///
-/// Skipped when the factor is 1, so the default path costs nothing and stays
-/// bit-identical.
-fn stretch_to_target(
-    cli: &Cli,
-    input: &Audio,
-    out: Vec<f32>,
-    nch: usize,
-    sr: u32,
-) -> (Vec<f32>, u32, usize) {
-    let factor = cli.tempo / 100.0;
-    let target = target_frames(cli, input);
-    let have = if nch == 0 { 0 } else { out.len() / nch };
-    if nch == 0 || have == 0 || (factor - 1.0).abs() < 1e-12 {
-        return (out, sr, nch);
-    }
-    let t0 = Instant::now();
-    let (y, stats) = radius_rs::stretch::stretch(&out, nch, target, factor);
-    let dt = t0.elapsed().as_secs_f64();
-    println!(
-        "tempo: {} -> {} frames (x{:.4})  overlap-add, {} windows, mean |offset| {:.1} samples{}  [{:.0} ms]",
-        have,
-        target,
-        factor,
-        stats.frames_out,
-        stats.mean_offset,
-        if stats.clamped > 0 {
-            format!(
-                ", {} at the search limit, level {:+.2} dB",
-                stats.clamped, stats.level_db
-            )
-        } else {
-            format!(", level {:+.2} dB", stats.level_db)
-        },
-        dt * 1000.0
-    );
-    // Make it explicit that this part is not the reference engine's work. The engines
-    // reproduce libradius; the time stretch is this crate's own overlap-add stage, and a
-    // listener comparing against Audition should know which part they are comparing.
-    warn(
-        "WARNING: time stretching is not part of the Radius engine. The engines reproduce \
-         libradius for pitch, but --tempo is applied by this crate's own overlap-add stage \
-         (WSOLA), so its result may differ from Audition's. Pitch shifting at --tempo 100 \
-         does not use it at all.",
-    );
-    (y, sr, nch)
-}
-
 /// How many output frames the run should produce.
 ///
 /// `--tempo` is a speed control: 200 doubles the duration at the same pitch, 50 halves
-/// it. The pitch is what `--semitones` asks for and nothing else.
-///
-/// Both engines are told this count, but **they cannot deliver it**: the resampler rate
-/// that applies the pitch also sets how much they emit, and the granule scheduler walks
-/// the input once, so their audio runs out at roughly the input length. They therefore
-/// return the right *length* with the wrong *content* — cut short when asked for less,
-/// zero-padded when asked for more. [`stretch_to_target`] fixes that afterwards.
+/// it. The pitch is what `--semitones` asks for and nothing else. The engines deliver
+/// this themselves now — the stretch scales their schedule slope — so this is just the
+/// shared target count.
 ///
 /// The guard keeps a nonsense `--tempo` from asking for terabytes; 1000x is far beyond
 /// any musical use.
@@ -199,14 +128,11 @@ fn run(cli: &Cli) -> Result<()> {
         }
     };
 
-    // `--tempo` cannot be delivered by the engines: their resampler rate *is* the
-    // pitch, so it changes pitch and duration together, and the granule scheduler
-    // walks the input once, which caps the audio they can emit at roughly the input
-    // length. It is applied here instead, as overlap-add on the finished signal, which
-    // is what lets the duration change while the pitch the engines produced is left
-    // alone. A factor of exactly 1 (the default) skips this entirely, so the default
-    // path stays byte-for-byte what it was.
-    let (out, sr, nch) = stretch_to_target(cli, &input, out, nch, sr);
+    // `--tempo` is delivered by the engines themselves: the stretch scales the
+    // engine's schedule slope (the rate its output ring advances per input frame),
+    // which changes the duration and nothing else — the two rates measured in
+    // `dvaaudiodsp.dll` (see `VocoderState::slope` / `TdState::set_ratio`). The old
+    // post-engine WSOLA stage was removed with the rest of `src/stretch.rs`.
 
     // What a non-float target would have to do with this signal.
     let clip = analyse_clipping(&out);
@@ -272,12 +198,11 @@ fn run(cli: &Cli) -> Result<()> {
 fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
     let nch = input.channels;
     let mut st = TdState::new(input.sample_rate, cli.quality, cli.solo, nch);
-    // Pitch only: the tempo is applied *after* the engine, by `stretch_to_target`. Passing
-    // it here as well would make the engine stretch too — and its internal stretch is the
-    // resampler ratio, which for a 2x tempo at +3 semitones runs at 2.378 and drives the
-    // granule overlap into clipping (measured: 10 000 samples over full scale against 9 at
-    // tempo 100). The engine's job is pitch; duration is the stretch stage's.
-    st.set_ratio(cli.semitones, 100.0);
+    // The engine delivers both controls, as in the DLL: the total ratio folds the
+    // stretch in as its semitone equivalent (TD slot 13 computes
+    // 2^((P - T)/12) with T the stretch in semitones), while the render target
+    // paces the output timeline to `input * stretch`.
+    st.set_ratio(cli.semitones, cli.tempo);
     st.set_gain(cli.gain);
     let g = st.geometry();
     println!(
@@ -294,17 +219,17 @@ fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
         st.total_ratio
     );
 
-    // Progress: the engine writes the counter, the watchdog polls the same Arc. The
-    // engine renders the *natural* length now — the tempo stretch happens after it —
-    // so the bar must be measured against that, not against the stretched total.
+    // Progress: the engine writes the counter, the watchdog polls the same Arc.
+    // The bar is measured against the stretched total the engine will produce.
     let (counter, total) = progress_pair();
+    let target = target_frames(cli, input);
     let expected = expected_granules(&st, input.frames());
     total.store(expected, std::sync::atomic::Ordering::Relaxed);
     st.set_progress_counter(counter.clone(), expected);
     let progress = Progress::new(!cli.no_progress, "td ", counter, total);
 
     let t0 = Instant::now();
-    let out = st.render(&input.samples, input.frames(), input.frames());
+    let out = st.render(&input.samples, input.frames(), target);
     let dt = t0.elapsed().as_secs_f64();
     progress.finish();
 
@@ -338,12 +263,11 @@ fn render_vc(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
     }
     let nch = input.channels;
     let mut st = VocoderState::new(input.sample_rate, nch);
-    // Pitch only: the tempo is applied *after* the engine, by `stretch_to_target`. Passing
-    // it here as well would make the engine stretch too — and its internal stretch is the
-    // resampler ratio, which for a 2x tempo at +3 semitones runs at 2.378 and drives the
-    // granule overlap into clipping (measured: 10 000 samples over full scale against 9 at
-    // tempo 100). The engine's job is pitch; duration is the stretch stage's.
-    st.set_ratio(cli.semitones, 100.0);
+    // The engine delivers both controls: `semis` is the pitch and `tempo` scales
+    // the schedule slope (the output ring's write rate per input frame), which
+    // stretches the duration without touching the pitch — the division of labour
+    // measured in dvaaudiodsp.dll (renderer+0x20 slope vs +0x1D84 pitch ratio).
+    st.set_ratio(cli.semitones, cli.tempo);
     st.set_gain(cli.gain);
     st.set_formant_shift(cli.formant_shift);
     if cli.no_preserve_voice {
@@ -357,17 +281,16 @@ fn render_vc(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
         st.cfg.n_fft
     );
 
-    // Progress: output frames made against the frames the engine will make. The engine
-    // renders the natural length — the tempo stretch happens after it — so this is the
-    // input length, not the stretched total.
+    // Progress: output frames made against the frames the engine will make —
+    // the stretched total, since the engine now paces itself to `target`.
+    let target = target_frames(cli, input);
     let (counter, total) = progress_pair();
-    let expected = input.frames() as u64;
-    total.store(expected.max(1), std::sync::atomic::Ordering::Relaxed);
-    st.set_progress_counter(counter.clone(), expected as i64);
+    total.store((target as u64).max(1), std::sync::atomic::Ordering::Relaxed);
+    st.set_progress_counter(counter.clone(), target as i64);
     let progress = Progress::new(!cli.no_progress, "vc ", counter, total);
 
     let t0 = Instant::now();
-    let out = st.render_to(&input.samples, input.frames());
+    let out = st.render_to(&input.samples, target);
     let dt = t0.elapsed().as_secs_f64();
     progress.finish();
 

@@ -32,9 +32,6 @@ pub mod fft;
 pub mod fft_radix2;
 pub mod interp;
 pub mod simple_rand;
-/// Post-engine time stretching. See the module docs for why it lives here rather than
-/// inside the engines.
-pub mod stretch;
 pub mod tables;
 pub mod ti;
 

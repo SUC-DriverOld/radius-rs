@@ -66,7 +66,14 @@ pub fn root() -> PathBuf {
 pub fn acceptance_audio() -> PathBuf {
     match std::env::var_os("RADIUS_TEST_AUDIO") {
         Some(p) => PathBuf::from(p),
-        None => root().join("tests").join("test.wav"),
+        None => {
+            let tests = root().join("tests").join("test.wav");
+            if tests.is_file() {
+                return tests;
+            }
+            // this machine keeps the corpus as .local-testdata/au-raw.wav
+            root().join(".local-testdata").join("au-raw.wav")
+        }
     }
 }
 
@@ -92,6 +99,19 @@ pub fn acceptance_audio_or_skip(test: &str) -> Option<PathBuf> {
         path.display()
     );
     None
+}
+
+/// The Audition reference directory: `RADIUS_AUDITION_REF_DIR`, else the first of
+/// `.local-testdata/` (this machine's convention) or `tests/` that exists.
+pub fn audition_reference_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("RADIUS_AUDITION_REF_DIR") {
+        return PathBuf::from(d);
+    }
+    let local = root().join(".local-testdata");
+    if local.is_dir() {
+        return local;
+    }
+    root().join("tests")
 }
 
 /// Assert the input is the material the documented numbers were measured on.
@@ -121,12 +141,25 @@ pub fn require_audio(input: &Wav, path: &Path) {
 /// The Audition reference render for `semis`, if it is present.
 ///
 /// `RADIUS_AUDITION_REF_DIR` overrides the directory. Not part of the crate.
+/// Accepts either the bare `au{semis:+}.wav` name or the engine-tagged
+/// `au-{engine}{semis:+}.wav` / `au-{engine}{semis:+}_{tempo}.wav` form used by
+/// [`audition_reference_named`].
 pub fn audition_reference(semis: i32) -> Option<PathBuf> {
-    let dir = match std::env::var_os("RADIUS_AUDITION_REF_DIR") {
-        Some(d) => PathBuf::from(d),
-        None => root().join("tests"),
-    };
+    let dir = audition_reference_dir();
     let path = dir.join(format!("au{semis:+}.wav"));
+    if path.is_file() {
+        return Some(path);
+    }
+    // this machine keeps the vocoder references as au-vc+3.wav
+    let tagged = dir.join(format!("au-vc{semis:+}.wav"));
+    tagged.is_file().then_some(tagged)
+}
+
+/// An Audition reference by exact file name (e.g. `au-td+3_200.wav`).
+///
+/// Same directory rules as [`audition_reference`]; `None` when absent.
+pub fn audition_reference_named(name: &str) -> Option<PathBuf> {
+    let path = audition_reference_dir().join(name);
     path.is_file().then_some(path)
 }
 

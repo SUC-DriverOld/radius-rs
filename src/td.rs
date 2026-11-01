@@ -727,14 +727,24 @@ impl TdState {
         self.dedup.clear();
 
         let gate = hop + ((hop >> 1) << (if self.state_330 != 0 { 3 } else { 0 })) + 100;
-        // The granule pump runs until the *output* is finished, so its bounds are
-        // driven by `target_out`, not by the input length. When the tempo stretches
-        // the timeline the pump has to keep going past the end of the input (reading
-        // the zero tail), and when it compresses the pump stops early.
-        let nstop = as_u32(target_out as i64) as i64;
-        let total_ext = as_u32(target_out as i64 + 4 * gate + 65536) as i64;
+        // The granule pump runs until the *input* is consumed, not until the
+        // output target: the stretch happens by replaying windows (the
+        // acc-driven extra granules pace the ring at `total_ratio` per input
+        // frame), not by feeding more input. Feeding `target_out` worth of
+        // frames — as this used to, matching `target_out == nframes` at tempo
+        // 100 — made a 2x tempo process 2x the input (half of it zeros past
+        // EOF), doubling the ring and the render. The drain, not the pump, is
+        // what paces the output to `target_out`.
+        let nstop = as_u32(nframes as i64) as i64;
+        // The feed loop's bounds have to cover *both* directions: at tempo > 100
+        // the target exceeds the input and keeps feeding the drain, while at
+        // tempo < 100 the whole input still has to be consumed (the ring needs
+        // `slope * nframes` written however short the output is). Bounding by
+        // the target alone starved a 50 % tempo at ~52 % of the input.
+        let bound = (target_out as i64).max(nframes as i64);
+        let total_ext = as_u32(bound + 4 * gate + 65536) as i64;
         let mut cursor_append: i64 = 0;
-        let loop_bound = as_u32(target_out as i64 + gate + 8 * hop) as i64;
+        let loop_bound = as_u32(bound + gate + 8 * hop) as i64;
         let mut feed_n = 0usize;
         let mut fed_visible: i64;
         let mix_len = self.mix.len();
@@ -1107,12 +1117,20 @@ impl TdState {
                         }
                         out_chunks.push(chunk);
                         out_n += count as usize;
-                        self.write_ptr_acc = wp_acc + self.total_ratio * count as f64;
+                        // The drain consumes exactly `count * pitch_ratio` ring
+                        // frames (it reads at the pitch rate), so the phase must
+                        // advance by that and no more: the stretch already
+                        // happened on the write side, where the acc-driven extra
+                        // granules pace the ring at `total_ratio` (= slope) per
+                        // input frame. Advancing by `total_ratio * count` here
+                        // skipped `(S-1) * consumed` ring frames between drains
+                        // and garbled the output at any tempo != 100.
+                        self.write_ptr_acc = wp_acc + self.pitch_ratio * count as f64;
                     }
                 }
             }
 
-            if cursor_append >= as_u32(target_out as i64 + gate + 8 * hop) as i64 {
+            if cursor_append >= loop_bound {
                 break;
             }
             if fed_pos >= nstop && cursor_append >= nframes as i64 {

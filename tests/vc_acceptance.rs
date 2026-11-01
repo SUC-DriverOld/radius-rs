@@ -13,17 +13,30 @@ use radius_rs::vocoder::{supported_rate, vc_calc_sched, VocoderState};
 fn scheduler_closed_form_matches_reference() {
     // g < 5 is the engine's warm-up window
     for g in 0..5i64 {
-        assert_eq!(vc_calc_sched(g, 1.189207115, 222.0), (0, 0, 0, 0));
+        assert_eq!(vc_calc_sched(g, 1.189207115, 1.189207115, 222.0), (0, 0, 0, 0));
     }
-    // ratio >= 1 -> in_step = round(nominal), out_step = round(nominal*ratio)
-    let (pos, cdel, ins, outs) = vc_calc_sched(9, 2.0, 222.0);
+    // pitch ratio >= 1 -> in_step = round(nominal), out_step = round(nominal*slope)
+    let (pos, cdel, ins, outs) = vc_calc_sched(9, 2.0, 2.0, 222.0);
     assert_eq!((ins, outs), (222, 444));
     assert_eq!(cdel, 222, "g % 4 == 1 carries the input step");
     assert_eq!(pos, ((9 - 1) / 4) * 444);
-    // ratio < 1 -> in_step = round(nominal*sqrt(2))
-    let (_pos, _cdel, ins2, outs2) = vc_calc_sched(9, 0.5, 222.0);
+    // pitch ratio < 1 -> in_step = round(nominal*sqrt(2))
+    let (_pos, _cdel, ins2, outs2) = vc_calc_sched(9, 0.5, 0.5, 222.0);
     assert_eq!(ins2, (222.0f64 * std::f64::consts::SQRT_2).round() as i64);
     assert_eq!(outs2, (ins2 as f64 * 0.5).round() as i64);
+    // the tempo case the branch split is really about: pitch >= 1 with a slope
+    // below 1 takes the *plain* branch (Audition's law, measured against its
+    // +3 / 50 % reference render), while out_step still paces by the slope.
+    let pitch = 2f64.powf(3.0 / 12.0);
+    let slope = pitch * 0.5;
+    let (_p, _c, ins3, outs3) = vc_calc_sched(9, pitch, slope, 222.0);
+    assert_eq!((ins3, outs3), (222, (222.0 * slope).round() as i64));
+    // and a negative pitch under stretch keeps the sqrt(2) step
+    let pitch_m = 2f64.powf(-3.0 / 12.0);
+    let slope_m = pitch_m * 0.5;
+    let (_p, _c, ins4, outs4) = vc_calc_sched(9, pitch_m, slope_m, 222.0);
+    assert_eq!(ins4, (222.0f64 * std::f64::consts::SQRT_2).round() as i64);
+    assert_eq!(outs4, (ins4 as f64 * slope_m).round() as i64);
 }
 
 /// The scheduler the engine actually runs, checked over a whole corpus-length run.
@@ -45,7 +58,7 @@ fn scheduler_is_structurally_sound_over_a_full_run() {
     const RATIO: f64 = 1.4142135623730951;
     const COUNT: i64 = 28993;
 
-    let (_, _, in_step, out_step) = vc_calc_sched(COUNT - 1, RATIO, NOMINAL);
+    let (_, _, in_step, out_step) = vc_calc_sched(COUNT - 1, RATIO, RATIO, NOMINAL);
     assert_eq!(
         (in_step, out_step),
         (222, 314),
@@ -60,7 +73,7 @@ fn scheduler_is_structurally_sound_over_a_full_run() {
     let mut prev_pos = 0i64;
     let mut sum_cdel = 0i64;
     for g in 0..COUNT {
-        let (pos, cdel, ins, outs) = vc_calc_sched(g, RATIO, NOMINAL);
+        let (pos, cdel, ins, outs) = vc_calc_sched(g, RATIO, RATIO, NOMINAL);
         // warm-up: g < 5 emits nothing at all, including no step
         if g < 5 {
             assert_eq!((pos, cdel, ins, outs), (0, 0, 0, 0), "warm-up at g={g}");
@@ -90,7 +103,7 @@ fn scheduler_is_structurally_sound_over_a_full_run() {
     let ratio = 2f64.powf(3.0 / 12.0);
     let mut consumed = 0i64;
     for g in 0..COUNT {
-        consumed += vc_calc_sched(g, ratio, base).1;
+        consumed += vc_calc_sched(g, ratio, ratio, base).1;
     }
     assert!(
         consumed >= 1_393_598,
@@ -107,14 +120,14 @@ fn scheduler_covers_negative_semitones() {
     for semis in [-1.0f64, -3.0, -5.0, -6.0, -12.0] {
         let ratio = 2f64.powf(semis / 12.0);
         assert!(ratio < 1.0);
-        let (_, _, ins, outs) = vc_calc_sched(5, ratio, NOMINAL);
+        let (_, _, ins, outs) = vc_calc_sched(5, ratio, ratio, NOMINAL);
         assert_eq!(ins, (NOMINAL * std::f64::consts::SQRT_2).round() as i64);
         assert_eq!(outs, (ins as f64 * ratio).round() as i64);
         assert!(outs < ins, "down-shifting must consume output slower");
         // and the schedule stays monotone for the whole run
         let mut prev = 0i64;
         for g in 0..5000i64 {
-            let (pos, _, _, _) = vc_calc_sched(g, ratio, NOMINAL);
+            let (pos, _, _, _) = vc_calc_sched(g, ratio, ratio, NOMINAL);
             assert!(pos >= prev, "semis={semis} pos went backwards at g={g}");
             prev = pos;
         }
