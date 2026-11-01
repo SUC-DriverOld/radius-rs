@@ -242,7 +242,7 @@ Overshoot is normal for these algorithms rather than a bug: overlapping granules
 
 ## Sample rates
 
-The TD engine accepts any rate its geometry supports. The vocoder accepts **44100 and 48000** only, like the C `rx_vc_render`; anything else is rejected with a clear message rather than resampled.
+The TD engine accepts any rate its geometry supports. The vocoder accepts **8000–192000 Hz**: 44100 and 48000 run on the reference engine's exact snapshot tables (bit-parity with the 48 kHz corpus), every other rate runs on rate-generic banks generated at init the way the original DLL computes them (static analysis found no per-rate tables in the DLL — see `docs/TABLE_PROVENANCE.md` and the RE notes §12; the generators are validated against both snapshots). Nothing is ever resampled: output rate equals input rate.
 
 ## Examples
 

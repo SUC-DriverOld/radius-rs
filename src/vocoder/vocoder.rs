@@ -171,9 +171,16 @@ const MAG_FLOOR_BITS: u32 = 0x2B8C_BCCC;
 const APC_TAU_TRANSIENT_BITS: u32 = 0x3D4C_CCCD;
 const APC_TAU_STEADY_BITS: u32 = 0x3DCC_CCCD;
 
-/// Supported vocoder sample rates (`rx_vc_render` rejects everything else).
+/// Supported vocoder sample rates.
+///
+/// The engine's geometry and data banks are rate-parametric: the two snapshot
+/// rates (44.1/48 kHz) run on bit-exact parity tables, every other rate in
+/// `8000..=192000` runs on [`crate::vocoder::rate_gen`]'s generated banks,
+/// which reproduce the DLL's own init-time constructions (measured against
+/// both snapshots; see the `rate_generic` tests). This matches the original
+/// engine, which contains no per-rate tables at all.
 pub fn supported_rate(sr: u32) -> bool {
-    sr == 48000 || sr == 44100
+    (8000..=192_000).contains(&sr)
 }
 
 /// A shared "output frames made" counter for progress reporting.
@@ -259,14 +266,35 @@ impl VocoderConfig {
     /// Exposed for the C ABI, which keeps `rx_vc_init`'s third argument so that
     /// existing callers do not break. Prefer [`VocoderConfig::for_rate`].
     pub fn for_rate_with_precision(sr: u32, nch: usize, precision: i32) -> Self {
-        let (n_fft, nb_bins, m_fft, mb_bins, n_write, hop) = if sr == 44100 {
-            (
-                8192usize, 4097usize, 2048usize, 1025usize, 6599usize, 3299i32,
-            )
-        } else {
-            (
-                16384usize, 8193usize, 4096usize, 2049usize, 7184usize, 3592i32,
-            )
+        let (n_fft, nb_bins, m_fft, mb_bins, n_write, hop) = match sr {
+            // The two snapshot rates: the reference engine's exact constants.
+            44100 => (8192usize, 4097usize, 2048usize, 1025usize, 6599usize, 3299i32),
+            48000 => (16384usize, 8193usize, 4096usize, 2049usize, 7184usize, 3592i32),
+            // Every other rate: the DLL's rate-parametric laws, fitted on the
+            // two anchors. Time-domain spans scale with the rate (a ~149.7 ms
+            // write span, hop = half of it); the FFT geometry is
+            // octave-quantised (`n_fft = 16384 << round(log2(sr/48000))`,
+            // i.e. 8192 for the 32 kHz class, 32768 for 96 kHz), with the
+            // 44.1 kHz class boundary taken from its anchor rather than the
+            // rounding (44.1 kHz sits an octave down despite being >0.5 oct).
+            _ => {
+                let shift = ((sr as f64 / 48000.0).log2().round() as i32).clamp(-2, 2);
+                let n_fft = if shift >= 0 {
+                    16384usize << shift
+                } else {
+                    16384usize >> (-shift)
+                };
+                let n_write = ((7184.0 * f64::from(sr) / 48000.0).round()) as usize;
+                let hop = (n_write / 2) as i32;
+                (
+                    n_fft,
+                    n_fft / 2 + 1,
+                    n_fft / 4,
+                    n_fft / 8 + 1,
+                    n_write,
+                    hop,
+                )
+            }
         };
         Self {
             sr,
@@ -590,10 +618,17 @@ impl VocoderState {
             let win = tables_data::win_44k().to_vec();
             let (a, b) = tables_data::synth_44k();
             (win, a.to_vec(), b.to_vec(), 2688usize, 1152usize)
-        } else {
+        } else if cfg.sr == 48000 {
             let win = tables_data::win_48k().to_vec();
             let (a, b) = Self::build_synth_windows(cfg.n_write);
             (win, a, b, 2930usize, 1256usize)
+        } else {
+            // Any other rate: the DLL's own constructions, generated at init
+            // (`rate_gen`). Not bit-identical to a snapshot (there is none at
+            // this rate), but built from the laws measured on both snapshots.
+            let win = crate::vocoder::rate_gen::win_table(cfg.n_write);
+            let (a, b, la, lb) = crate::vocoder::rate_gen::synth_windows(cfg.n_write);
+            (win, a, b, la, lb)
         };
         let noise_template = vec![0.0f32; 2 * 128 * nb];
         let noise_weight = (0..nb)
@@ -1319,11 +1354,9 @@ impl VocoderState {
         }
         let f1412 = self.step_1412.max(0) as i64;
         let p = self.cfg.precision;
-        let a_const = if self.cfg.sr == 44100 {
-            3300i64
-        } else {
-            3592i64
-        };
+        // `a_const` = the band-1 window length (round(n_write/2); the anchors
+        // are 3300 at 44.1 kHz and 3592 at 48 kHz).
+        let a_const = (self.cfg.n_write as i64 + 1) / 2;
         let ring_len = self.cfg.ring_out_len as i64;
         let f1224 = self.pos_1384 - a3 as i64 + self.hop_1420 as i64;
         let nb = self.cfg.ring_out_len;

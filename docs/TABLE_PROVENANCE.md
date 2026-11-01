@@ -69,6 +69,46 @@ bytes inside both artifacts finds nothing, while the live FIR taps are present. 
 this was a **code hygiene** change — no dead weight in `src/`, no misleading
 "reference data" in a shipping module — not a size optimization.
 
+## What the original DLL does (static analysis)
+
+The six tables above are **snapshot** data captured from the reference engine - but
+static analysis of `dvaaudiodsp.dll` (the full reasoning is
+`RE-dvaaudiodsp-radius-tempo.md` section 12) shows the original iZotope Radius
+engine contains **none of them**: byte-signature searches over the whole image find
+no FIR taps (neither f32 nor f64-encoded), no window banks, no synthesis windows,
+and no 44100/48000/32000 literals anywhere in the Radius region to dispatch a
+two-bank design on. The rate arrives as data (the live renderer carries it at
+`+0x60`/`+0x108`), and the engine computes everything at init:
+
+* the crossover is designed by a log-frequency raised-cosine rule - band edges
+  **150 / 800 / 4500 Hz**, transitions at the geometric means of adjacent edges in
+  `log f`, width `0.9 x` the gap, amplitude-complementary across bands - fed to
+  `dsp::FIR::DesignFIR` (1025 bins, 2048 taps, window parameter 9.0). The design
+  is **Hz-anchored**, i.e. rate-independent in continuous time;
+* the window bank follows the Hann laws measured on both snapshots (see
+  `src/vocoder/rate_gen.rs` for the exact rules and their two-point validation).
+
+So the snapshots in this crate are rate-specific *design outputs* the reference
+engine happened to ship as constants at 44.1/48 kHz, not data the algorithm needs
+to look up. For every other rate (the full `8000..=192000` range) this crate
+reconstructs what the DLL would design, in `src/vocoder/rate_gen.rs`:
+
+| data | at 44.1 / 48 kHz | at any other rate |
+|---|---|---|
+| crossover FIR | snapshot tables (bit-parity) | 48 kHz bank time-resampled, band-limited sinc |
+| window bank | snapshot tables (bit-parity) | Hann laws (validated to ~1 ULP against both snapshots) |
+| synthesis pair | 44.1 kHz tables / 48 kHz formula | `Hann^0.7` pair scaled with `n_write` |
+
+The generated forms are *not* bit-identical to a hypothetical DLL design at the
+same rate (there is nothing to compare against - no reference exists outside
+44.1/48 kHz), which is exactly why the canonical rates stay on the snapshots:
+the 48 kHz parity corpus is bit-exact and must stay that way. What the generated
+forms do reproduce is measured structure: the window generator matches both
+snapshots to <=1 ULP on the cleanly-ruled bands, and the rescaled crossover
+reproduces the DLL's own 44.1 kHz bank (its band edges within a few Hz, response
+within ~1e-4 below 20 kHz) - see `tests/rate_generic.rs`.
+
+
 ## How the numbers were obtained
 
 The values were parsed out of the reference engine's C headers by the strictest

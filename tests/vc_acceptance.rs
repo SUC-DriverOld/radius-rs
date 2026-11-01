@@ -136,9 +136,13 @@ fn scheduler_covers_negative_semitones() {
 
 #[test]
 fn supported_rates_match_the_engine() {
+    // The two snapshot rates plus the full rate-generic range.
     assert!(supported_rate(44100));
     assert!(supported_rate(48000));
-    for sr in [8000, 16000, 22050, 32000, 88200, 96000] {
+    for sr in [8000, 11025, 16000, 22050, 32000, 88200, 96000, 192000] {
+        assert!(supported_rate(sr), "{sr} must be accepted");
+    }
+    for sr in [4000, 7999, 192001, 384000] {
         assert!(!supported_rate(sr), "{sr} must be rejected");
     }
 }

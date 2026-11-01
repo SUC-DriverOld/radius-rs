@@ -65,6 +65,7 @@ pub mod crossover_tables;
 pub mod formant;
 pub mod noise;
 pub mod phase;
+pub mod rate_gen;
 pub mod synth;
 pub mod vocoder;
 

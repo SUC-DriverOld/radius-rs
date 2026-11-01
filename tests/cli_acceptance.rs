@@ -452,7 +452,7 @@ fn cli_td_truth_report() {
 }
 
 #[test]
-fn cli_rejects_unsupported_vocoder_rate() {
+fn cli_rate_generic_vocoder_rates() {
     // build a 22.05 kHz wav on the fly from the synthetic input
     let src = read_wav(&input_wav());
     let take = src.rate as usize; // 1 second
@@ -465,7 +465,7 @@ fn cli_rejects_unsupported_vocoder_rate() {
     let path = tmp("rate22050.wav");
     write_wav(&path, &small, 22050, src.channels);
 
-    let out = tmp("bad_rate_vc.wav");
+    let out = tmp("rate22050_vc.wav");
     let (ok, _, err) = run(&[
         path.to_str().unwrap(),
         out.to_str().unwrap(),
@@ -474,8 +474,25 @@ fn cli_rejects_unsupported_vocoder_rate() {
         "-s",
         "3",
     ]);
-    assert!(!ok, "vocoder accepted 22050 Hz");
-    assert!(err.contains("unsupported sr"), "stderr: {err}");
+    // 22.05 kHz is inside the rate-generic range: it must render.
+    assert!(ok, "vocoder refused 22050 Hz: {err}");
+    let rendered = read_wav(&out);
+    assert_eq!(rendered.rate, 22050);
+    assert_eq!(rendered.samples.len(), small.len());
+
+    // A rate outside 8000..=192000 is still rejected.
+    let tiny_path = tmp("rate5000.wav");
+    write_wav(&tiny_path, &small, 5000, src.channels);
+    let (ok2, _, err2) = run(&[
+        tiny_path.to_str().unwrap(),
+        tmp("bad_rate_vc.wav").to_str().unwrap(),
+        "-m",
+        "vc",
+        "-s",
+        "3",
+    ]);
+    assert!(!ok2, "vocoder accepted 5000 Hz");
+    assert!(err2.contains("unsupported sr"), "stderr: {err2}");
 }
 
 /// Every writable container must survive a write/read round trip.

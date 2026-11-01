@@ -279,31 +279,54 @@ static XOVER_TAPS_48K: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new(
 /// `_XOVER_TAPS[44100]`.
 static XOVER_TAPS_44K: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
+/// Generated-rate tap banks (`sr -> reversed taps`), leaked so the `&'static`
+/// contract of [`xover_taps_rev`] survives. Only rates outside the two
+/// snapshot anchors ever land here.
+static XOVER_TAPS_GEN: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, &'static [f32]>>,
+> = std::sync::OnceLock::new();
+
 /// `_xover_taps_rev(sr)` — `taps_rev[b][k] = taps[b][N-1-k]` as `f32`
 /// (`rx_crossover_create` pre-reverses the coefficient table).
 ///
 /// The result is cached per sample rate (`_XOVER_TAPS`), so every
 /// [`Crossover`] shares one immutable bank instead of reversing its own copy.
 ///
-/// # Panics
-/// On a sample rate the engine does not support.
+/// The two snapshot rates use the parity tables. Any other supported rate
+/// gets the 48 kHz bank resampled in time — the DLL's crossover design is
+/// Hz-anchored (fixed 150/800/4500 Hz edges), so its impulse response keeps
+/// its continuous-time shape at every rate; see [`crate::vocoder::rate_gen`].
 pub fn xover_taps_rev(sr: u32) -> &'static [f32] {
-    let cell = match sr {
-        48_000 => &XOVER_TAPS_48K,
-        44_100 => &XOVER_TAPS_44K,
-        other => panic!("crossover tables: unsupported sample rate {other}"),
+    let canonical = match sr {
+        48_000 => Some(&XOVER_TAPS_48K),
+        44_100 => Some(&XOVER_TAPS_44K),
+        _ => None,
     };
-    cell.get_or_init(|| {
-        let fir = super::crossover_tables::fir(sr);
-        let n = fir.len() / XOVER_BANDS;
-        let mut rev = vec![0.0f32; fir.len()];
-        for b in 0..XOVER_BANDS {
-            for k in 0..n {
-                rev[b * n + k] = fir[b * n + (n - 1 - k)];
-            }
+    if let Some(cell) = canonical {
+        return cell.get_or_init(|| reverse_banks(super::crossover_tables::fir(sr)));
+    }
+    let map = XOVER_TAPS_GEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(taps) = guard.get(&sr) {
+        return taps;
+    }
+    let rev = reverse_banks(&crate::vocoder::rate_gen::fir_bank(sr));
+    let leaked: &'static [f32] = Box::leak(rev.into_boxed_slice());
+    guard.insert(sr, leaked);
+    leaked
+}
+
+/// Reverse each band of a `[4][n]` bank in place-order (`taps_rev[b][k] =
+/// taps[b][n-1-k]`).
+fn reverse_banks(fir: &[f32]) -> Vec<f32> {
+    let n = fir.len() / 4;
+    let mut rev = vec![0.0f32; fir.len()];
+    for b in 0..4 {
+        for k in 0..n {
+            rev[b * n + k] = fir[b * n + (n - 1 - k)];
         }
-        rev
-    })
+    }
+    rev
 }
 
 /// Bands in the C table (`[4][2048]`).

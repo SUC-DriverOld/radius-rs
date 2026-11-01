@@ -149,8 +149,9 @@ fn ffi_handles_null_and_bad_arguments() {
         rx_td_free(std::ptr::null_mut());
         rx_vc_free(std::ptr::null_mut());
         assert_eq!(rx_td_init(48000, 37, 0, 0), std::ptr::null_mut());
-        // 22050 is not a supported vocoder rate
-        assert_eq!(rx_vc_init(22050, 2), std::ptr::null_mut());
+        // 22050 is a rate-generic vocoder rate now; 5000 is outside the range
+        assert_ne!(rx_vc_init(22050, 2), std::ptr::null_mut());
+        assert_eq!(rx_vc_init(5000, 2), std::ptr::null_mut());
         let mut g = RxTdGeometry::default();
         assert_eq!(rx_td_geometry(48000, 37, 0, std::ptr::null_mut()), -1);
         assert_eq!(rx_td_geometry(48000, 37, 0, &mut g), 0);
