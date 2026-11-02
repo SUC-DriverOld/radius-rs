@@ -121,6 +121,10 @@ fn cli_progress_bar_is_reported_and_suppressible() {
         stderr.contains("td  [") && stderr.contains('%') && stderr.contains("elapsed"),
         "progress bar missing from stderr:\n{stderr}"
     );
+    assert!(stderr.contains("render complete; finalizing output"), "{stderr}");
+    let percentages: Vec<_> = stderr.lines().filter(|line| line.contains('%')).collect();
+    assert!(percentages.last().unwrap().contains("100.0%"), "{stderr}");
+    assert!(percentages[..percentages.len() - 1].iter().all(|line| !line.contains("100.0%")), "{stderr}");
     // the bar is a status line, not part of the machine-readable result
     assert!(
         !stdout.contains("elapsed,"),
@@ -159,6 +163,19 @@ fn cli_progress_bar_is_reported_and_suppressible() {
         !stderr.contains("elapsed,"),
         "the bar appeared on a non-terminal stderr by default:\n{stderr}"
     );
+}
+
+#[test]
+fn cli_progress_does_not_report_success_when_output_writing_fails() {
+    let input = quiet_slice();
+    let missing_parent = tmp("missing-parent");
+    let output = missing_parent.join("output.wav");
+    let (ok, _, stderr) = run_with_progress(&[
+        input.to_str().unwrap(), output.to_str().unwrap(), "-m", "td", "-s", "3",
+    ]);
+    assert!(!ok, "Writing to a missing directory unexpectedly succeeded");
+    assert!(stderr.contains("render complete; finalizing output"), "{stderr}");
+    assert!(!stderr.contains("100.0%"), "Failed output was reported complete: {stderr}");
 }
 
 /// A render that exceeds full scale must warn for every target that clamps it
