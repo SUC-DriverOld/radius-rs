@@ -365,11 +365,12 @@ pub struct Crossover {
 }
 
 impl Crossover {
-    /// `rx_crossover_create` — build the reversed tap bank for `sr`
-    /// (`48000` / `44100`) and zero the history.
+    /// `rx_crossover_create` — build the reversed tap bank for `sr` (any
+    /// supported rate; the designer computes it from the rate) and zero the
+    /// history.
     ///
     /// # Panics
-    /// On an unsupported sample rate, or `n_bands > 4` (the table has four).
+    /// On an unsupported sample rate, or `n_bands > 4` (the bank has four).
     pub fn new(sr: u32, n_bands: usize) -> Self {
         // `self.N = fir.shape[1]` with a `[4][2048]` table.
         let taps_rev = xover_taps_rev(sr);

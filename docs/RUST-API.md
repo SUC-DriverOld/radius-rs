@@ -82,7 +82,7 @@ There are no optional Cargo features. Both FFT backends are always compiled and 
 
 Both are inherited from the reference engines rather than chosen here:
 
-* **The vocoder accepts 44100 and 48000 Hz only.** Check with `radius_rs::vocoder::supported_rate(rate)`. The TD engine has no such restriction.
+* **The vocoder accepts 8000..=192000 Hz.** Check with `radius_rs::vocoder::supported_rate(rate)`; the engine data (crossover, windows) is designed at init from the rate. The TD engine accepts any rate its geometry supports.
 * **The output length can differ from the input by up to a granule** at the tail, and a render can exceed full scale. The engines are duration- and roughly amplitude-preserving, not normalising. See the clipping section of [CLI.md](CLI.md).
 
 ## Errors

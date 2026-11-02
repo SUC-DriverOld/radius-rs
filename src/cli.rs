@@ -606,16 +606,24 @@ pub fn analyse_clipping(x: &[f32]) -> Clipping {
 
 /// Does this output configuration quantise to a fixed-point representation?
 ///
-/// `32f` WAV is the engines' native format and stores any value the engine can
-/// produce; every other option (integer PCM, FLAC, Ogg, MP3) has to map the
-/// signal into a bounded representation and therefore clamps.
+/// The engines always hand ffmpeg their native `f32` samples, so the question
+/// is whether the *codec* clamps them to `[-1, 1]`:
+///
+/// * `32f` WAV stores any float value the engine can produce — nothing clamps;
+/// * integer PCM WAV and FLAC (which has no float subframe, so every depth
+///   lands in `s16`/`s32`) have to clamp;
+/// * Ogg/Vorbis and MP3 are float codecs fed the `f32` pipe directly — they
+///   encode overshoot rather than clip it (lossily, like everything else they
+///   do), so they do not quantise either.
 pub fn quantises(depth: BitDepth, container: Option<Container>) -> bool {
     match container {
         Some(Container::Wav) => !depth.is_float(),
         // FLAC is lossless for the integer range it stores, but a value outside
-        // [-1, 1] still has to be clamped to get there; the lossy codecs clamp
-        // as well.
-        Some(Container::Flac) | Some(Container::Ogg) | Some(Container::Mp3) => true,
+        // [-1, 1] still has to be clamped to get there.
+        Some(Container::Flac) => true,
+        // Float codecs: the f32 samples go in unclamped and come back out
+        // (approximately) on decode.
+        Some(Container::Ogg) | Some(Container::Mp3) => false,
         // Unknown: fall back to the extension decision, handled by the caller.
         None => !depth.is_float(),
     }
@@ -623,13 +631,14 @@ pub fn quantises(depth: BitDepth, container: Option<Container>) -> bool {
 
 /// Human-readable name of the "keep everything" option, for the warning.
 ///
-/// Only 32-bit float WAV can hold a value outside `[-1, 1]`; every other target
-/// — integer PCM, FLAC (which is lossless *within* its integer range, but still
-/// has to clamp to get there), Ogg and MP3 — has to clamp. Saying "use FLAC" here
-/// would send the user from one clamping format to another.
+/// Only shown for targets that clamp (integer PCM WAV and FLAC). 32-bit float
+/// WAV holds a value outside `[-1, 1]` exactly, and the float codecs (ogg,
+/// mp3) keep it approximately — but they are lossy, so for an exact copy the
+/// hint points at float WAV.
 pub const CLIP_SAFE_HINT: &str =
-    "32-bit float WAV is the only target that stores values beyond [-1, 1] (-f wav -b 32f); \
-     lower the level first if you need an integer or lossy format";
+    "32-bit float WAV stores values beyond [-1, 1] exactly (-f wav -b 32f); \
+     the float codecs (ogg, mp3) keep them approximately; lower the level first \
+     if you need an integer or FLAC target";
 
 /// Build the warning line for a clipped render, or `None` when there is nothing
 /// to report.
@@ -941,15 +950,18 @@ mod tests {
     }
 
     #[test]
-    fn lossless_and_lossy_both_warn() {
+    fn only_fixed_point_targets_warn() {
         let mut x = vec![0.0f32; 100];
         x[0] = 1.5;
         let c = analyse_clipping(&x);
         for (depth, container, want) in [
             (BitDepth::I16, Some(Container::Wav), true),
             (BitDepth::I24, Some(Container::Flac), true),
-            (BitDepth::F32, Some(Container::Ogg), true),
-            (BitDepth::F32, Some(Container::Mp3), true),
+            // FLAC has no float subframe: every depth lands in an integer one.
+            (BitDepth::F32, Some(Container::Flac), true),
+            // Float codecs take the f32 pipe unclamped.
+            (BitDepth::F32, Some(Container::Ogg), false),
+            (BitDepth::I16, Some(Container::Mp3), false),
             (BitDepth::F32, Some(Container::Wav), false),
         ] {
             let w = clip_warning(&c, depth, container);

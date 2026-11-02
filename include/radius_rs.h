@@ -77,8 +77,10 @@ int rx_td_geometry(uint32_t sr, int quality, int solo, rx_td_geometry_t *out);
 
 /* ---- phase vocoder ------------------------------------------------------ */
 
-/* Allocate a vocoder renderer. Only 44100 and 48000 Hz are supported and `nch`
- * must be > 0. Returns NULL for an unsupported configuration.
+/* Allocate a vocoder renderer. Any rate in 8000..=192000 Hz is supported and
+ * `nch` must be > 0. Returns NULL for an unsupported configuration. The
+ * crossover/window/synthesis banks are designed at init from the rate, like
+ * the original DLL.
  *
  * There is no `precision` argument. The reference has one, but it was never a
  * precision: it selected an overlap-add write gain, so it only changed the output

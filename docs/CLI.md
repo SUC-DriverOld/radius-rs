@@ -164,7 +164,7 @@ Audition's. On the corpus at `+3` semitones:
 | Audition, vocoder, tempo 50 | 1.6253 | 0.4165 % | −8.77 dB |
 | this crate, vocoder, tempo 50 | 1.6059 | 0.6385 % | −8.33 dB |
 
-Float WAV stores those values as they are. An integer or lossy target clamps them, and the CLI warns in yellow when it will (see the warnings section). Use `--gain` to bring the level down first if the target is not float.
+Float WAV stores those values as they are, and the float codecs (ogg, mp3) encode them rather than clip. An integer PCM or FLAC target clamps them, and the CLI warns in yellow when it will (see the warnings section). Use `--gain` to bring the level down first if the target is one of those.
 
 ## Engine quality
 
@@ -225,24 +225,28 @@ It appears only when stderr is a terminal, so logs, pipes and scripts are unaffe
 
 ## Clipping
 
-Whether a render that exceeds full scale matters depends on the output format, and the CLI says so instead of letting it pass silently. Of the four targets, only **32-bit float WAV** can store a sample outside `[-1, 1]`; integer PCM, FLAC (lossless *within* its integer range), Ogg and MP3 all have to clamp:
+Whether a render that exceeds full scale matters depends on the output format, and the CLI says so instead of letting it pass silently. The engines always hand ffmpeg their native `f32` samples; the difference is the codec on the other side. **32-bit float WAV** stores a sample outside `[-1, 1]` exactly, and the float codecs **Ogg/Vorbis and MP3** take the same `f32` stream unclamped — they encode the overshoot rather than clip it, approximately, being lossy. Only integer PCM WAV and FLAC (which has no float subframe, so every depth lands in an integer one) have to clamp, and only they warn:
 
 ```
 $ radius in.wav out.flac -m vc --semitones=-3
 WARNING: the render peaks at 1.8278 (> 1.0), so 38422 sample(s) (1.601%) clip when
-written as flac. 32-bit float WAV is the only target that stores values beyond
-[-1, 1] (-f wav -b 32f); lower the level first if you need an integer or lossy
-format. (24 more sample(s) within 0.0001 of full scale)
+written as flac. 32-bit float WAV stores values beyond [-1, 1] exactly
+(-f wav -b 32f); the float codecs (ogg, mp3) keep them approximately; lower the
+level first if you need an integer or FLAC target. (24 more sample(s) within
+0.0001 of full scale)
 
 $ radius in.wav out.wav -m vc --semitones=-3     # -b 32f is the default
-note: peak 1.8278 (> 1.0) — kept exactly because 32-bit float wav stores any value
+note: peak 1.8278 (> 1.0) — kept exactly (32-bit float)
+
+$ radius in.wav out.mp3 -m vc --semitones=-3 --mp3-bitrate 320
+note: peak 1.8278 (> 1.0) — not clipped (float codec; lossy, so approximate)
 ```
 
 Overshoot is normal for these algorithms rather than a bug: overlapping granules and transient re-phasing sum past unity, and the amounts seen here (up to about 1.8 on the acceptance material at −3 semitones) are what the reference engine produces too. The warning exists so that an integer or lossy export is a decision rather than a surprise. It is silent below full scale, and near-full-scale samples are counted separately because `f32` quantisation can round a sample sitting just under 1.0 up to exactly 1.0.
 
 ## Sample rates
 
-The TD engine accepts any rate its geometry supports. The vocoder accepts **8000–192000 Hz**: its crossover, window and synthesis banks are designed at init from the rate, exactly like the original DLL (static analysis found no per-rate tables in the DLL — see `docs/TABLE_PROVENANCE.md` and the RE notes §12; the design laws were fitted on the reference engine's own 44.1/48 kHz data and validated against Audition reference renders). Nothing is ever resampled: output rate equals input rate.
+The TD engine accepts any rate its geometry supports. The vocoder accepts **8000–192000 Hz**: its crossover, window and synthesis banks are designed at init from the rate, exactly like the original DLL (static analysis found no per-rate tables in the DLL — see `docs/TABLE_PROVENANCE.md` and the RE notes §12; the crossover FIR law is decompiled from the DLL and the window laws were measured on the reference engine's own 44.1/48 kHz data, both validated against Audition reference renders). Nothing is ever resampled: output rate equals input rate.
 
 ## Examples
 

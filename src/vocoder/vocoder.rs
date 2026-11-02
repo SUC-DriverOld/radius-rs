@@ -474,7 +474,8 @@ pub struct VocoderState {
 }
 
 impl VocoderState {
-    /// A vocoder for `sr` (44100 or 48000) with `nch` channels.
+    /// A vocoder for `sr` (any rate in 8000..=192000, see [`supported_rate`])
+    /// with `nch` channels.
     pub fn new(sr: u32, nch: usize) -> Self {
         Self::with_config(VocoderConfig::for_rate(sr, nch))
     }
