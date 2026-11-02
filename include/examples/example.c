@@ -113,11 +113,11 @@ int main(void) {
            SEMITONES, (long long)n_td, peak_of(out, (size_t)n_td * NCH));
 
     /* ---- phase vocoder -----------------------------------------------------
-     * Only 44100 and 48000 Hz are supported. Create a fresh handle per render: the
-     * renderers are stateful. */
+     * Any rate in 8000..=192000 Hz is supported. Create a fresh handle per
+     * render: the renderers are stateful. */
     void *vc = rx_vc_init(SR, NCH);
     if (!vc) {
-        fprintf(stderr, "rx_vc_init failed (only 44100/48000 Hz are supported)\n");
+        fprintf(stderr, "rx_vc_init failed (rate outside 8000-192000 Hz?)\n");
         return 1;
     }
     rx_vc_set_ratio(vc, -SEMITONES, 100.0);

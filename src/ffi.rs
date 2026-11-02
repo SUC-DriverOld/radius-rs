@@ -136,7 +136,7 @@ pub unsafe extern "C" fn rx_td_geometry(
 // ---------------------------------------------------------------------------
 
 /// `rx_vc_init` — allocate a vocoder state, or NULL when the sample rate is
-/// unsupported (anything other than 44100/48000).
+/// unsupported (outside 8000..=192000 Hz).
 ///
 /// The reference's `precision` argument is deliberately **not** part of this API. It
 /// was never a precision: it indexed the overlap-add write-gain table, so it only

@@ -242,7 +242,7 @@ Overshoot is normal for these algorithms rather than a bug: overlapping granules
 
 ## Sample rates
 
-The TD engine accepts any rate its geometry supports. The vocoder accepts **8000–192000 Hz**: its crossover, window and synthesis banks are designed at init from the rate, exactly like the original DLL (static analysis found no per-rate tables in the DLL — see `docs/TABLE_PROVENANCE.md` and the RE notes §12; the design laws were fitted on the reference engine's own 44.1/48 kHz data and validated against Audition reference renders). Nothing is ever resampled: output rate equals input rate.
+The TD engine accepts any rate its geometry supports. The vocoder accepts **8000–192000 Hz**: its crossover, window and synthesis banks are designed at init from the rate, exactly like the original DLL (static analysis found no per-rate tables in the DLL — see `docs/TABLE_PROVENANCE.md` and the RE notes §12; the crossover FIR law is decompiled from the DLL and the window laws were measured on the reference engine's own 44.1/48 kHz data, both validated against Audition reference renders). Nothing is ever resampled: output rate equals input rate.
 
 ## Examples
 

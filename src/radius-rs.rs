@@ -257,7 +257,7 @@ fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
 fn render_vc(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
     if !radius_rs::vocoder::supported_rate(input.sample_rate) {
         bail!(
-            "vocoder: unsupported sr={} (44100 and 48000 only)",
+            "vocoder: unsupported sr={} (8000-192000 Hz only)",
             input.sample_rate
         );
     }
