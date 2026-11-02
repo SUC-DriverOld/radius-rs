@@ -338,7 +338,7 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
         stdout.contains(
             "mode=Vc semitones=+0.00 tempo=100.0% fft=Radix2 formant_shift=+0.00 \
              preserve_voice=true gain=+0.00dB \
-             format=Wav bit_depth=F32 ogg_bitrate=512 mp3_bitrate=320"
+             format=Wav bit_depth=F32 ogg_bitrate=500 mp3_bitrate=320"
         ),
         "unexpected defaults banner: {stdout}"
     );
@@ -438,7 +438,7 @@ fn cli_passthrough_to_flac_keeps_every_sample() {
 /// The lossy-codec defaults must be the top of each range.
 #[test]
 fn cli_lossy_defaults_are_the_best_available() {
-    for (ext, expected) in [("ogg", "≈512 kbps"), ("mp3", "320 kbps")] {
+    for (ext, expected) in [("ogg", "≈500 kbps"), ("mp3", "320 kbps")] {
         if !codec_available(ext) {
             continue;
         }
@@ -458,7 +458,7 @@ fn cli_lossy_defaults_are_the_best_available() {
     }
 }
 
-/// `--ogg-bitrate` is the only Ogg knob: the default 512 is the top of the
+/// `--ogg-bitrate` is the only Ogg knob: the default 500 is the top of the
 /// measured range, an explicit request shows in the banner, and the removed
 /// `--ogg-quality` flag errors as unknown rather than being silently ignored.
 #[test]
@@ -762,7 +762,7 @@ fn cli_quality_options_are_honoured() {
     // ---- Ogg bitrate --------------------------------------------------------
     if codec_available("ogg") {
         let mut sizes = Vec::new();
-        for kbps in ["96", "512"] {
+        for kbps in ["96", "500"] {
             let out = tmp(&format!("br_{kbps}.ogg"));
             let _ = std::fs::remove_file(&out);
             let (ok, _, err) = run(&[
@@ -780,7 +780,7 @@ fn cli_quality_options_are_honoured() {
         }
         assert!(
             sizes[0].1 < sizes[1].1,
-            "ogg 512 kbit/s ({}) should exceed 96 kbit/s ({})",
+            "ogg 500 kbit/s ({}) should exceed 96 kbit/s ({})",
             sizes[1].1,
             sizes[0].1
         );
@@ -1197,6 +1197,62 @@ fn cli_output_format_follows_the_input() {
     assert!(ok, "override run failed: {err}");
     assert!(stdout.contains("song_td_st2.mp3"), "stdout: {stdout}");
     assert_eq!(probe_info(&dir.join("song_td_st2.mp3")).codec, "mp3");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `RADIUS_FFMPEG_IO` switches the whole pipeline to the ffmpeg binary
+/// (`RADIUS_FFMPEG` names it when it is not on `PATH`). The run must say so
+/// in its banner, and the pure-Rust readers must still decode what the
+/// ffmpeg writers produced.
+///
+/// Skipped when no ffmpeg can be located: the default pipeline is pure-Rust,
+/// so its tests never need the binary.
+#[test]
+fn cli_env_flag_switches_to_ffmpeg_io() {
+    let program = radius_rs::io::ffmpeg_program();
+    if !radius_rs::io::ffmpeg_available() {
+        eprintln!("skipping: no ffmpeg at {} (set RADIUS_FFMPEG)", program.display());
+        return;
+    }
+    let dir = cwd("ffmpeg_backend");
+    let src = input_wav();
+
+    let out = dir.join("via_ffmpeg.flac");
+    let status = Command::new(bin())
+        .arg(src.to_str().unwrap())
+        .arg(out.to_str().unwrap())
+        .args(["-s", "0"])
+        .env("RADIUS_FFMPEG_IO", "1")
+        .env("RADIUS_FFMPEG", program.as_os_str())
+        .output()
+        .expect("failed to spawn radius");
+    let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
+    assert!(status.status.success(), "ffmpeg-mode run failed: {stderr}");
+    assert!(stdout.contains("io=ffmpeg"), "banner must name the backend: {stdout}");
+    assert!(out.is_file(), "no output written");
+
+    // The file must be FLAC and decodable by the default (pure-Rust) readers;
+    // this test process never sets the flag, so `read` is the Rust pipeline.
+    let back = radius_rs::io::read(&out).unwrap_or_else(|e| panic!("rust reader on ffmpeg output: {e}"));
+    assert_eq!(back.channels, 2);
+    assert_eq!(back.sample_rate, 48_000);
+    assert_eq!(back.frames(), 48_000 * 8);
+
+    // A non-truthy flag must leave the pure-Rust pipeline in charge.
+    let out2 = dir.join("via_rust.flac");
+    let status = Command::new(bin())
+        .arg(src.to_str().unwrap())
+        .arg(out2.to_str().unwrap())
+        .args(["-s", "0"])
+        .env("RADIUS_FFMPEG_IO", "0")
+        .env("RADIUS_FFMPEG", program.as_os_str())
+        .output()
+        .expect("failed to spawn radius");
+    let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(status.status.success(), "rust-mode run failed");
+    assert!(stdout.contains("io=rust"), "banner: {stdout}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

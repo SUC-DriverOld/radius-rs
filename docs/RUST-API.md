@@ -54,7 +54,7 @@ let output = engine.render(&input);            // or render_to(&input, target)
 
 ## Reading and writing files
 
-The same crate does the format work, through pure-Rust codecs compiled in (no ffmpeg, no subprocesses), so a wav to flac conversion is three calls. This is exactly what the `radius` binary does:
+The same crate does the format work, through pure-Rust codecs compiled in (no ffmpeg, no subprocesses), so a wav to flac conversion is three calls — exactly what the `radius` binary does. Setting the environment variable `RADIUS_FFMPEG_IO` to a truthy value (`1`/`true`/`yes`/`on`) routes `read`/`write`/`info` through the `ffmpeg` binary instead — located via `RADIUS_FFMPEG` or `PATH` — with the same signatures and options; `io::use_ffmpeg()` reports which backend the next call takes:
 
 ```rust
 use radius_rs::io::{self as audio, Audio, WriteOptions};
@@ -68,7 +68,7 @@ let out = engine.render(&input.samples, input.frames());
 audio::write(
     "out.flac",
     &Audio { samples: out, sample_rate: input.sample_rate, channels: input.channels },
-    WriteOptions::default(),                 // 32f for wav/flac, ogg ≈512 kbit/s, mp3 320k
+    WriteOptions::default(),                 // 32f for wav/flac, ogg ≈500 kbit/s, mp3 320k
 )?;
 ```
 

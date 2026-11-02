@@ -103,8 +103,15 @@ fn run(cli: &Cli) -> Result<()> {
                     cli.formant_shift, !cli.no_preserve_voice
                 ),
             };
+            // The IO backend is an environment choice, so the banner is the
+            // only place a run records which pipeline actually moved the audio.
+            let io = if radius_rs::io::use_ffmpeg() {
+                "ffmpeg"
+            } else {
+                "rust"
+            };
             format!(
-                "{vc} gain={:+.2}dB format={:?} bit_depth={:?} ogg_bitrate={} mp3_bitrate={}",
+                "{vc} gain={:+.2}dB format={:?} bit_depth={:?} ogg_bitrate={} mp3_bitrate={} io={io}",
                 cli.gain, output_format, cli.bit_depth, cli.ogg_bitrate, cli.mp3_bitrate
             )
         }

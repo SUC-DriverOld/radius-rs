@@ -1,18 +1,24 @@
-//! Audio input and output, entirely in-process through pure-Rust codecs.
+//! Audio input and output through pure-Rust codecs, with an optional ffmpeg
+//! fallback behind an environment flag.
 //!
-//! No external `ffmpeg`, no subprocesses: [`oxiaudio`] decodes every input this
-//! crate accepts (wav, flac, ogg/vorbis, mp3, aac/m4a, aiff, …) and encodes
-//! wav and flac; [`rusty_vorbis`] (in the `ogg` container) and [`rusty_mp3`]
-//! encode the two lossy formats. This makes the day-one crate doc true —
-//! "reads and writes audio through pure-Rust codecs, no `ffmpeg`".
+//! The default pipeline runs entirely in-process, no external `ffmpeg`, no
+//! subprocesses: [`oxiaudio`] decodes every input this crate accepts (wav,
+//! flac, ogg/vorbis, mp3, aac/m4a, aiff, …) and encodes wav; [`flacenc`]
+//! encodes flac; [`rusty_vorbis`] (in the `ogg` container) and [`rusty_mp3`]
+//! encode the two lossy formats.
 //!
-//! # Division of labour
+//! Setting `RADIUS_FFMPEG_IO` to a truthy value switches [`read`], [`write`]
+//! and [`info`] to the pre-pure-Rust pipeline: the `ffmpeg` binary decodes to
+//! raw `f32le` on a pipe and encodes from one. `RADIUS_FFMPEG` names the
+//! binary when it is not on `PATH`. See [`use_ffmpeg`].
+//!
+//! # Division of labour (default pipeline)
 //!
 //! * **read** — [`oxiaudio::decode_file`], whole file, to interleaved `f32`.
 //! * **write** — per container:
 //!   * `wav`: hound via `oxiaudio`, depths 16/24/32-bit integer and 32-bit float.
-//!   * `flac`: flacenc via `oxiaudio`, depths 16 and 24 (24/32/32f all land on
-//!     24-bit integer, like the ffmpeg path did).
+//!   * `flac`: flacenc directly, depths 16 and 24 (24/32/32f all land on
+//!     24-bit integer; see [`write_flac`] for the tuned configuration).
 //!   * `ogg`: [`rusty_vorbis`] wrapped in Ogg pages by the `ogg` crate —
 //!     `oxiaudio`'s own Vorbis encoder is broken (see [`write_ogg`]).
 //!   * `mp3`: [`rusty_mp3::Mp3Encoder`], constant bitrate, gapless LAME tag.
@@ -135,6 +141,60 @@ impl Container {
             Container::Ogg | Container::Mp3 => &[],
         }
     }
+
+    /// ffmpeg's muxer name (only used by the [`RADIUS_FFMPEG_IO`](self) path).
+    fn muxer(self) -> &'static str {
+        match self {
+            Container::Wav => "wav",
+            Container::Flac => "flac",
+            Container::Ogg => "ogg",
+            Container::Mp3 => "mp3",
+        }
+    }
+
+    /// The ffmpeg encoder invocation for this container, from the *current*
+    /// option set: `--ogg-bitrate` becomes libvorbis `-b:a`, `--mp3-bitrate`
+    /// stays lame `-b:a`, integer depths pick the matching `pcm_*le` codec.
+    fn ffmpeg_encoder_args(self, opts: &WriteOptions) -> Vec<String> {
+        let v = |s: &str| s.to_string();
+        match self {
+            Container::Wav => {
+                let codec = match opts.depth {
+                    BitDepth::I16 => "pcm_s16le",
+                    BitDepth::I24 => "pcm_s24le",
+                    BitDepth::I32 => "pcm_s32le",
+                    BitDepth::F32 => "pcm_f32le",
+                };
+                vec![v("-c:a"), v(codec)]
+            }
+            Container::Flac => match opts.depth {
+                // FLAC has no 32-bit integer subframe and cannot store float,
+                // so 24/32/32f all become 24-bit, exactly like the Rust path.
+                BitDepth::I16 => vec![v("-c:a"), v("flac"), v("-sample_fmt"), v("s16")],
+                _ => vec![v("-c:a"), v("flac"), v("-sample_fmt"), v("s32")],
+            },
+            Container::Ogg => {
+                // libvorbis's managed-ABR window (measured on this build:
+                // stereo 44.1 kHz accepts 45k..500k; beyond either end the
+                // encoder fails setup and ffmpeg writes nothing) — clamp the
+                // knob into it rather than fail. The default 500 is exactly
+                // the top of that window; only out-of-range requests move.
+                let kbps = opts.ogg_bitrate.clamp(45, 500);
+                vec![
+                    v("-c:a"),
+                    v("libvorbis"),
+                    v("-b:a"),
+                    format!("{kbps}k"),
+                ]
+            }
+            Container::Mp3 => vec![
+                v("-c:a"),
+                v("libmp3lame"),
+                v("-b:a"),
+                format!("{}k", opts.mp3_kbps),
+            ],
+        }
+    }
 }
 
 /// PCM bit depth to write, when the container is lossless.
@@ -165,7 +225,7 @@ pub struct WriteOptions {
     pub container: Option<Container>,
     /// Ogg/Vorbis target bitrate in kbit/s, VBR: the encoder quality whose
     /// *measured* average bitrate is closest is picked, so the result is
-    /// approximate (roughly ±10% on programme material). Useful range about
+    /// approximate (material-dependent, like any VBR). Useful range about
     /// 30–500 kbit/s stereo and half that mono; requests outside clamp to the
     /// ends. This is the only Ogg knob — the encoder has no true bitrate
     /// management, so CBR is not on offer anywhere in the API.
@@ -179,10 +239,344 @@ impl Default for WriteOptions {
         Self {
             depth: BitDepth::F32,
             container: None,
-            ogg_bitrate: 512,
+            ogg_bitrate: 500,
             mp3_kbps: 320,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// backend selection
+// ---------------------------------------------------------------------------
+
+/// Is the ffmpeg pipeline enabled?
+///
+/// `RADIUS_FFMPEG_IO` selects the IO backend for [`read`], [`write`] and
+/// [`info`]: absent (or any value other than `1`/`true`/`yes`/`on`,
+/// case-insensitive) means the default pure-Rust codecs; a truthy value runs
+/// the `ffmpeg` binary instead, located through `RADIUS_FFMPEG` or `PATH`.
+/// The flag and the binary are separate knobs on purpose: the first chooses
+/// the pipeline, the second where its program lives, and an unset flag with a
+/// set binary path still runs pure-Rust.
+pub fn use_ffmpeg() -> bool {
+    std::env::var_os("RADIUS_FFMPEG_IO")
+        .map(|v| env_flag_is_truthy(&v.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+fn env_flag_is_truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg pipeline (enabled by RADIUS_FFMPEG_IO)
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+
+/// The ffmpeg executable to run: `RADIUS_FFMPEG` if set, otherwise `ffmpeg`
+/// on `PATH`.
+pub fn ffmpeg_program() -> PathBuf {
+    match std::env::var_os("RADIUS_FFMPEG") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from("ffmpeg"),
+    }
+}
+
+/// Is an ffmpeg we can actually run available?
+pub fn ffmpeg_available() -> bool {
+    Command::new(ffmpeg_program())
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The error to report when ffmpeg cannot be started.
+fn not_runnable(program: &Path, e: std::io::Error) -> String {
+    format!(
+        "cannot run {}: {e}\n\
+         Install ffmpeg, or point RADIUS_FFMPEG at it \
+         (e.g. RADIUS_FFMPEG=/opt/ffmpeg/bin/ffmpeg).",
+        program.display()
+    )
+}
+
+/// Run ffmpeg with `args`, feeding `input` on stdin if given, and return stdout.
+///
+/// stderr is captured and used for the error message, because ffmpeg reports
+/// every real problem there and a bare exit status tells the user nothing.
+fn run_ffmpeg(args: &[String], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    let program = ffmpeg_program();
+    let mut cmd = Command::new(&program);
+    cmd.args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| not_runnable(&program, e))?;
+
+    if let Some(bytes) = input {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        // Write from a thread: a single-threaded write-then-read deadlocks once
+        // the output pipe fills, which it does for any non-trivial file.
+        let owned = bytes.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&owned));
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("ffmpeg failed: {e}"))?;
+        let _ = writer.join();
+        if !out.status.success() {
+            return Err(describe_failure(&program, args, &out.stderr));
+        }
+        return Ok(out.stdout);
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("ffmpeg failed: {e}"))?;
+    if !out.status.success() {
+        return Err(describe_failure(&program, args, &out.stderr));
+    }
+    Ok(out.stdout)
+}
+
+fn describe_failure(program: &Path, args: &[String], stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    // The last few non-empty lines carry the actual complaint.
+    let tail: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "{} {} failed:\n  {}",
+        program.display(),
+        args.join(" "),
+        tail.join("\n  ")
+    )
+}
+
+/// ffmpeg's own description of the first audio stream in a file, as this
+/// crate's [`Info`].
+fn info_ffmpeg(path: &Path) -> Result<Info, String> {
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-i".to_string(),
+        path.to_string_lossy().into_owned(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ];
+    let program = ffmpeg_program();
+    let out = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| not_runnable(&program, e))?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let line = text
+        .lines()
+        .find(|l| l.contains("Audio:"))
+        .ok_or_else(|| {
+            format!(
+                "{} is not audio ffmpeg can read:\n  {}",
+                path.display(),
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .last()
+                    .unwrap_or("(no output)")
+            )
+        })?
+        .to_string();
+    let (sample_rate, channels, codec) = parse_stream_line(&line).ok_or_else(|| {
+        format!(
+            "cannot read the stream description for {}:\n  {}",
+            path.display(),
+            line.trim()
+        )
+    })?;
+    Ok(Info {
+        sample_rate,
+        channels,
+        codec,
+        line,
+    })
+}
+
+/// Sample rate, channel count and codec name out of an ffmpeg `Audio:` line.
+///
+/// ```text
+///   Stream #0:0: Audio: pcm_f32le ([3][0][0][0] / 0x0003), 48000 Hz, stereo, flt
+///   Stream #0:0: Audio: flac, 48000 Hz, 5 channels, s32 (24 bit)
+///   Stream #0:0: Audio: vorbis, 44100 Hz, mono, fltp, 80 kb/s
+/// ```
+fn parse_stream_line(line: &str) -> Option<(u32, usize, String)> {
+    let audio = line.find("Audio:")?;
+    let rest = line[audio + "Audio:".len()..].trim_start();
+    let codec: String = rest
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if codec.is_empty() {
+        return None;
+    }
+
+    let hz = line.find(" Hz")?;
+    let before = &line[..hz];
+    let rate_start = before
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let sample_rate: u32 = before[rate_start..].parse().ok()?;
+
+    let after = line[hz + 3..].trim_start_matches([' ', ',']);
+    let channels = if let Some(i) = after.find(" channel") {
+        let digits: String = after[..i]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        digits.parse::<usize>().ok()?
+    } else if after.starts_with("mono") {
+        1
+    } else if after.starts_with("stereo") {
+        2
+    } else {
+        layout_channels(after)?
+    };
+    Some((sample_rate, channels, codec))
+}
+
+/// Channel count for ffmpeg's layout names: `2.1`, `5.1(side)`, `7.1`, ...
+///
+/// The digit before the dot is the number of full-band channels and the digit
+/// after it the LFE count, so `5.1` describes six streams.
+fn layout_channels(after: &str) -> Option<usize> {
+    let (head, tail) = after.split_once('.')?;
+    let head: usize = head.trim().parse().ok()?;
+    let lfe = tail.chars().next()?.to_digit(10)? as usize;
+    Some(head + lfe)
+}
+
+/// Read any audio file ffmpeg can decode, by piping raw `f32le` from it.
+///
+/// This covers every container and codec of the ffmpeg build in use — a
+/// strictly larger set than the pure-Rust readers.
+fn read_ffmpeg(path: &Path) -> Result<Audio, String> {
+    let info = info_ffmpeg(path)?;
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        path.to_string_lossy().into_owned(),
+        "-f".to_string(),
+        "f32le".to_string(),
+        "-acodec".to_string(),
+        "pcm_f32le".to_string(),
+        "-".to_string(),
+    ];
+    let raw = run_ffmpeg(&args, None)?;
+    let samples = bytes_to_f32(&raw);
+    if samples.is_empty() {
+        return Err(format!("{}: decoded to nothing", path.display()));
+    }
+    Ok(Audio {
+        samples,
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+    })
+}
+
+/// Write audio through ffmpeg: raw `f32le` on stdin, encoded file on disk.
+///
+/// The sample rate and channel count are passed through unchanged, and
+/// ffmpeg's view of the result is checked against them afterwards.
+fn write_ffmpeg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), String> {
+    let container = match opts.container {
+        Some(c) => c,
+        None => Container::from_path(path)?,
+    };
+
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-nostdin".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-f".to_string(),
+        "f32le".to_string(),
+        "-ar".to_string(),
+        audio.sample_rate.to_string(),
+        "-ac".to_string(),
+        audio.channels.to_string(),
+        "-i".to_string(),
+        "pipe:0".to_string(),
+    ];
+    args.extend(container.ffmpeg_encoder_args(opts));
+    args.push("-f".to_string());
+    args.push(container.muxer().to_string());
+    args.push("-y".to_string());
+    args.push(path.to_string_lossy().into_owned());
+
+    let raw = f32_to_bytes(&audio.samples);
+    run_ffmpeg(&args, Some(&raw))?;
+
+    // Verify rather than assume: the rate and channel count must be what was
+    // asked for, otherwise every caller's "input and output agree" contract
+    // is a lie.
+    let written = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    if written == 0 {
+        return Err(format!("{}: ffmpeg produced an empty file", path.display()));
+    }
+    let got = info_ffmpeg(path)?;
+    if got.sample_rate != audio.sample_rate || got.channels != audio.channels {
+        return Err(format!(
+            "{}: ffmpeg wrote {} Hz / {} ch but {} Hz / {} ch was requested",
+            path.display(),
+            got.sample_rate,
+            got.channels,
+            audio.sample_rate,
+            audio.channels
+        ));
+    }
+    Ok(())
+}
+
+fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() * 4);
+    for v in x {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +602,9 @@ pub struct Info {
 /// pay nothing beyond a 12-byte read through [`container_of`].
 pub fn info(path: impl AsRef<Path>) -> Result<Info, String> {
     let path = path.as_ref();
+    if use_ffmpeg() {
+        return info_ffmpeg(path);
+    }
     let codec = container_of(path)?;
     let buf = decode(path)?;
     Ok(Info {
@@ -263,11 +660,15 @@ fn decode(path: &Path) -> Result<AudioBuffer<f32>, String> {
 }
 
 /// Read any audio file oxiaudio can decode (wav, flac, ogg/vorbis, mp3,
-/// aac/m4a, aiff, au, musepack, wavpack) to interleaved `f32`.
+/// aac/m4a, aiff, au, musepack, wavpack) to interleaved `f32` — or anything
+/// ffmpeg can decode when [`RADIUS_FFMPEG_IO`](use_ffmpeg) is set.
 pub fn read(path: impl AsRef<Path>) -> Result<Audio, String> {
     let path = path.as_ref();
     if !path.exists() {
         return Err(format!("{}: no such file", path.display()));
+    }
+    if use_ffmpeg() {
+        return read_ffmpeg(path);
     }
     let buf = decode(path)?;
     Ok(Audio {
@@ -310,7 +711,8 @@ fn to_oxi_buffer(audio: &Audio) -> Result<AudioBuffer<f32>, String> {
 /// The nine sample rates MP3 (MPEG-1/2/2.5 Layer III) can carry.
 const MP3_RATES: [u32; 9] = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
 
-/// Write audio to a container, entirely in-process.
+/// Write audio to a container, entirely in-process — or through ffmpeg when
+/// [`RADIUS_FFMPEG_IO`](use_ffmpeg) is set.
 ///
 /// The sample rate and channel count are passed through unchanged, and the
 /// written file is decoded back to verify them.
@@ -325,6 +727,11 @@ pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Resul
     }
     if audio.samples.is_empty() {
         return Err("cannot write an empty signal".into());
+    }
+    if use_ffmpeg() {
+        // ffmpeg's encoders take whatever channel count their codecs support,
+        // and its own error reports the ones that do not.
+        return write_ffmpeg(path, audio, &opts);
     }
     if container == Container::Ogg || container == Container::Mp3 {
         if audio.channels > 2 {
@@ -621,8 +1028,8 @@ fn write_mp3(path: &Path, audio: &Audio, kbps: u16) -> Result<(), String> {
 /// The encoder's own documented scale ends at 0.98 (≈180 kbit/s), but its
 /// rate-distortion λ keeps falling past that and the embedded q4 setup's
 /// codebooks keep accepting the bits: the ceiling is measured, not declared.
-/// q1.8 is where the dense reference passes 512 kbit/s, which is the default
-/// and the top of the exposed range.
+/// q1.8 is where the dense reference reaches ≈500 kbit/s, which is the
+/// default and the top of the exposed range.
 ///
 /// Vorbis here is VBR with **no bitrate management** — the encoder's
 /// `bitrate_bps` field is documented as informational and truly is — so a
@@ -759,6 +1166,87 @@ mod tests {
         let err = read(&p).unwrap_err();
         assert!(err.contains("garbage.bin"), "{err}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn stream_line_parsing() {
+        let stereo = "  Stream #0:0: Audio: pcm_f32le ([3][0][0][0] / 0x0003), 48000 Hz, stereo, flt, 3072 kb/s";
+        assert_eq!(
+            parse_stream_line(stereo),
+            Some((48_000, 2, "pcm_f32le".to_string()))
+        );
+        let mono = "  Stream #0:0: Audio: vorbis, 44100 Hz, mono, fltp, 80 kb/s";
+        assert_eq!(
+            parse_stream_line(mono),
+            Some((44_100, 1, "vorbis".to_string()))
+        );
+        let multi = "  Stream #0:0: Audio: pcm_s16le, 96000 Hz, 5.1(side), s16, 9216 kb/s";
+        assert_eq!(
+            parse_stream_line(multi),
+            Some((96_000, 6, "pcm_s16le".to_string()))
+        );
+        let five = "  Stream #0:0: Audio: flac, 48000 Hz, 5 channels, s32 (24 bit)";
+        assert_eq!(
+            parse_stream_line(five),
+            Some((48_000, 5, "flac".to_string()))
+        );
+        assert_eq!(
+            parse_stream_line("  Stream #0:0: Video: h264, 1280x720"),
+            None
+        );
+    }
+
+    #[test]
+    fn ffmpeg_flag_truthiness() {
+        for v in ["1", "true", "TRUE", "Yes", " on ", "ON"] {
+            assert!(env_flag_is_truthy(v), "{v:?}");
+        }
+        for v in ["", "0", "false", "off", "maybe", "2"] {
+            assert!(!env_flag_is_truthy(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn ffmpeg_encoder_args_follow_the_current_options() {
+        let base = WriteOptions::default();
+        // Ogg takes the bitrate knob, as kilobits for libvorbis -b:a, clamped
+        // into the window ffmpeg's libvorbis actually accepts.
+        assert_eq!(
+            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
+                ogg_bitrate: 256,
+                ..base.clone()
+            }),
+            ["-c:a", "libvorbis", "-b:a", "256k"]
+        );
+        assert_eq!(
+            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
+                ogg_bitrate: 512,
+                ..base.clone()
+            }),
+            ["-c:a", "libvorbis", "-b:a", "500k"]
+        );
+        assert_eq!(
+            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
+                ogg_bitrate: 32,
+                ..base.clone()
+            }),
+            ["-c:a", "libvorbis", "-b:a", "45k"]
+        );
+        // MP3 stays constant-bitrate lame.
+        assert_eq!(
+            Container::Mp3.ffmpeg_encoder_args(&base),
+            ["-c:a", "libmp3lame", "-b:a", "320k"]
+        );
+        // Every WAV depth has its own pcm codec, including 32-bit integer.
+        assert_eq!(
+            Container::Wav.ffmpeg_encoder_args(&base),
+            ["-c:a", "pcm_f32le"]
+        );
+        // FLAC: 16 is s16, everything deeper is 24-in-s32.
+        assert_eq!(
+            Container::Flac.ffmpeg_encoder_args(&base),
+            ["-c:a", "flac", "-sample_fmt", "s32"]
+        );
     }
 
     #[test]
@@ -955,9 +1443,9 @@ mod tests {
     #[test]
     fn ogg_bitrate_lands_near_the_request() {
         let audio = dense_mix(44_100, 44_100 * 4);
-        // Across the whole exposed range, including the default (512) and the
+        // Across the whole exposed range, including the default (500) and the
         // extended-quality region above the encoder's documented 0.98.
-        for kbps in [64u32, 128, 256, 400, 512] {
+        for kbps in [64u32, 128, 256, 400, 500] {
             let p = dir().join(format!("br{kbps}.ogg"));
             write(
                 &p,
@@ -982,15 +1470,15 @@ mod tests {
     /// range is measured, not aspirational.
     #[test]
     fn ogg_default_bitrate_is_the_ceiling() {
-        assert_eq!(WriteOptions::default().ogg_bitrate, 512);
+        assert_eq!(WriteOptions::default().ogg_bitrate, 500);
         let audio = dense_mix(44_100, 44_100 * 4);
         let p = dir().join("default.ogg");
         write(&p, &audio, WriteOptions::default()).unwrap();
         let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0 / 1000.0
             / (audio.frames() as f64 / audio.sample_rate as f64);
         assert!(
-            (470.0..=540.0).contains(&got),
-            "default should land near 512 kbit/s, got {got:.0}"
+            (460.0..=540.0).contains(&got),
+            "default should land near 500 kbit/s, got {got:.0}"
         );
         let _ = std::fs::remove_file(&p);
     }
