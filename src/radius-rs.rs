@@ -116,6 +116,16 @@ fn run(cli: &Cli) -> Result<()> {
         warn(&w);
     }
 
+    let tracking = progress_pair();
+    let mut progress = Progress::new(
+        !cli.no_progress && !is_passthrough(cli),
+        match cli.mode {
+            Mode::Td => "td ",
+            Mode::Vc => "vc ",
+        },
+        tracking.0.clone(),
+        tracking.1.clone(),
+    );
     let (out, sr, nch) = if is_passthrough(cli) {
         println!(
             "render: pass-through (semitones 0 at 100% tempo) — no engine run, samples copied"
@@ -123,10 +133,11 @@ fn run(cli: &Cli) -> Result<()> {
         (input.samples.clone(), input.sample_rate, input.channels)
     } else {
         match cli.mode {
-            Mode::Td => render_td(cli, &input)?,
-            Mode::Vc => render_vc(cli, &input)?,
+            Mode::Td => render_td(cli, &input, tracking)?,
+            Mode::Vc => render_vc(cli, &input, tracking)?,
         }
     };
+    progress.finish_render();
 
     // `--tempo` is delivered by the engines themselves: the stretch scales the
     // engine's schedule slope (the rate its output ring advances per input frame),
@@ -197,10 +208,15 @@ fn run(cli: &Cli) -> Result<()> {
             );
         }
     }
+    progress.finish();
     Ok(())
 }
 
-fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
+fn render_td(
+    cli: &Cli,
+    input: &Audio,
+    tracking: (cli::ProgressSource, cli::ProgressTotal),
+) -> Result<(Vec<f32>, u32, usize)> {
     let nch = input.channels;
     let mut st = TdState::new(input.sample_rate, cli.quality, cli.solo, nch);
     // The engine delivers both controls, as in the DLL: the total ratio folds the
@@ -224,19 +240,17 @@ fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
         st.total_ratio
     );
 
-    // Progress: the engine writes the counter, the watchdog polls the same Arc.
-    // The bar is measured against the stretched total the engine will produce.
-    let (counter, total) = progress_pair();
+    // TD reports completed granules against an input-based estimate.
+    // The watchdog polls the same Arc without doing I/O on the render thread.
+    let (counter, total) = tracking;
     let target = target_frames(cli, input);
     let expected = expected_granules(&st, input.frames());
     total.store(expected, std::sync::atomic::Ordering::Relaxed);
     st.set_progress_counter(counter.clone(), expected);
-    let progress = Progress::new(!cli.no_progress, "td ", counter, total);
 
     let t0 = Instant::now();
     let out = st.render(&input.samples, input.frames(), target);
     let dt = t0.elapsed().as_secs_f64();
-    progress.finish();
 
     let frames = if nch == 0 { 0 } else { out.len() / nch };
     println!(
@@ -259,7 +273,11 @@ fn render_td(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
     Ok((out, input.sample_rate, nch))
 }
 
-fn render_vc(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
+fn render_vc(
+    cli: &Cli,
+    input: &Audio,
+    tracking: (cli::ProgressSource, cli::ProgressTotal),
+) -> Result<(Vec<f32>, u32, usize)> {
     if !radius_rs::vocoder::supported_rate(input.sample_rate) {
         bail!(
             "vocoder: unsupported sr={} (8000-192000 Hz only)",
@@ -289,15 +307,13 @@ fn render_vc(cli: &Cli, input: &Audio) -> Result<(Vec<f32>, u32, usize)> {
     // Progress: output frames made against the frames the engine will make —
     // the stretched total, since the engine now paces itself to `target`.
     let target = target_frames(cli, input);
-    let (counter, total) = progress_pair();
+    let (counter, total) = tracking;
     total.store((target as u64).max(1), std::sync::atomic::Ordering::Relaxed);
     st.set_progress_counter(counter.clone(), target as i64);
-    let progress = Progress::new(!cli.no_progress, "vc ", counter, total);
 
     let t0 = Instant::now();
     let out = st.render_to(&input.samples, target);
     let dt = t0.elapsed().as_secs_f64();
-    progress.finish();
 
     let frames = if nch == 0 { 0 } else { out.len() / nch };
     println!(
