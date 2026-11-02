@@ -161,8 +161,10 @@ fn cli_progress_bar_is_reported_and_suppressible() {
     );
 }
 
-/// A render that exceeds full scale must warn for every target that cannot store
-/// it, and stay quiet for 32-bit float WAV, which can.
+/// A render that exceeds full scale must warn for every target that clamps it
+/// into a fixed-point representation (integer PCM WAV, FLAC), and stay quiet —
+/// a note only — for targets that keep the overshoot: 32-bit float WAV exactly,
+/// and the float codecs (ogg, mp3) approximately.
 #[test]
 fn cli_warns_about_clipping_only_for_formats_that_clamp() {
     let hot = hot_slice();
@@ -193,13 +195,32 @@ fn cli_warns_about_clipping_only_for_formats_that_clamp() {
         peak(&kept.samples)
     );
 
+    // Float codecs take the f32 pipe unclamped: a note, not a warning.
+    for name in ["clip.ogg", "clip.mp3"] {
+        if !codec_available(name) {
+            continue;
+        }
+        let out = tmp(name);
+        let _ = std::fs::remove_file(&out);
+        let mut a: Vec<&str> = args_base.to_vec();
+        a[1] = out.to_str().unwrap();
+        let (ok, stdout, stderr) = run(&a);
+        assert!(ok, "{name} render failed: {stderr}\n{stdout}");
+        assert!(
+            !stderr.contains("WARNING"),
+            "{name}: float codec must not warn:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("note: peak") && stdout.contains("not clipped"),
+            "{name}: expected the float-codec note:\n{stdout}"
+        );
+    }
+
     // Every clamping target must warn, and name itself.
     for (name, extra, expect_format) in [
         ("clip_i16.wav", vec!["-b", "16"], "16-bit PCM wav"),
         ("clip_i24.wav", vec!["-b", "24"], "24-bit PCM wav"),
         ("clip.flac", vec![], "flac"),
-        ("clip.ogg", vec![], "ogg/vorbis"),
-        ("clip.mp3", vec![], "mp3"),
     ] {
         if !codec_available(name) {
             continue;

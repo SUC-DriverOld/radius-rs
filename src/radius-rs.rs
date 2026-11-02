@@ -145,10 +145,15 @@ fn run(cli: &Cli) -> Result<()> {
     if let Some(w) = clip_warning(&clip, cli.bit_depth, Some(container)) {
         warn(&w);
     } else if clip.over > 0 {
-        println!(
-            "note: peak {:.4} (> 1.0) — kept exactly because 32-bit float wav stores any value",
-            clip.peak
-        );
+        // No target clamps in this branch: 32f wav keeps the overshoot
+        // exactly; the float codecs (ogg, mp3) encode it rather than clip it,
+        // approximately, being lossy.
+        let how = if container == radius_rs::io::Container::Wav {
+            "kept exactly (32-bit float)"
+        } else {
+            "not clipped (float codec; lossy, so approximate)"
+        };
+        println!("note: peak {:.4} (> 1.0) — {how}", clip.peak);
     }
 
     let audio_out = Audio {
