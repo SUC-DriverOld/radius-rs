@@ -163,13 +163,13 @@ pub struct WriteOptions {
     pub depth: BitDepth,
     /// `None` means "take the container from the output path's extension".
     pub container: Option<Container>,
-    /// Ogg/Vorbis quality, 0.0 (smallest) .. 1.0 (best). Used only when
-    /// [`WriteOptions::ogg_bitrate`] is `None`.
-    pub ogg_quality: f32,
-    /// Ogg/Vorbbit target bitrate in kbit/s. When set it overrides
-    /// [`WriteOptions::ogg_quality`] by picking the quality level whose measured
-    /// bitrate is closest (Vorbis is VBR, so the result is approximate).
-    pub ogg_bitrate: Option<u32>,
+    /// Ogg/Vorbis target bitrate in kbit/s, VBR: the encoder quality whose
+    /// *measured* average bitrate is closest is picked, so the result is
+    /// approximate (roughly ±10% on programme material). Useful range about
+    /// 30–500 kbit/s stereo and half that mono; requests outside clamp to the
+    /// ends. This is the only Ogg knob — the encoder has no true bitrate
+    /// management, so CBR is not on offer anywhere in the API.
+    pub ogg_bitrate: u32,
     /// MP3 constant bitrate in kbit/s.
     pub mp3_kbps: u16,
 }
@@ -179,8 +179,7 @@ impl Default for WriteOptions {
         Self {
             depth: BitDepth::F32,
             container: None,
-            ogg_quality: 1.0,
-            ogg_bitrate: None,
+            ogg_bitrate: 512,
             mp3_kbps: 320,
         }
     }
@@ -445,12 +444,9 @@ fn write_ogg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), Stri
 
     const HOP: usize = 1024;
 
-    // Our 0..1 CLI scale is the encoder's normalized quality; it is only
-    // defined on [0.05, 0.98].
-    let q = match opts.ogg_bitrate {
-        Some(kbps) => vorbis_quality_for_bitrate(kbps, audio.channels),
-        None => opts.ogg_quality.clamp(0.05, 0.98),
-    };
+    // Bitrate is the only knob: pick the encoder quality whose measured
+    // average bitrate is closest to the request.
+    let q = vorbis_quality_for_bitrate(opts.ogg_bitrate, audio.channels);
 
     let ch = audio.channels;
     let frames = audio.frames();
@@ -465,7 +461,9 @@ fn write_ogg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), Stri
 
     let mut enc = VorbisEncoder::new(VorbisEncoderConfig {
         quality: q,
-        bitrate_bps: opts.ogg_bitrate.map(|k| (k * 1000) as i32).unwrap_or(128_000),
+        // The crate documents this as informational (it never steers rate
+        // control); it travels in the header as the profile's nominal rate.
+        bitrate_bps: (opts.ogg_bitrate * 1000) as i32,
     });
     enc.push_pcm_f32(&fed, ch as u16, audio.sample_rate)
         .map_err(|e| format!("{}: ogg/vorbis: {e}", path.display()))?;
@@ -548,24 +546,42 @@ fn write_mp3(path: &Path, audio: &Audio, kbps: u16) -> Result<(), String> {
 }
 
 /// Measured `quality` → average kbit/s for this crate's Vorbis encoder
-/// (rusty_vorbis, whose embedded setup tops out near q10 ≈ 180 kbit/s stereo),
-/// 44.1 kHz stereo, on a dense musical mix. See `docs/CLI.md`.
+/// (rusty_vorbis), 44.1 kHz stereo, on a dense musical mix (seven-tone chord
+/// with vibrato and noise, four seconds) — the same generator the io test
+/// `dense_mix` builds, so the curve and its check cannot drift apart.
 ///
-/// Vorbis is VBR, so a requested bitrate can only be approximated: this maps
-/// the request to the quality level whose measured rate is closest, scaling for
-/// mono (which roughly halves the bitrate at the same quality). Requests
-/// outside the measured range clamp to its ends.
-const VORBIS_KBPS_AT_Q: [(f32, f32); 10] = [
+/// The encoder's own documented scale ends at 0.98 (≈180 kbit/s), but its
+/// rate-distortion λ keeps falling past that and the embedded q4 setup's
+/// codebooks keep accepting the bits: the ceiling is measured, not declared.
+/// q1.8 is where the dense reference passes 512 kbit/s, which is the default
+/// and the top of the exposed range.
+///
+/// Vorbis here is VBR with **no bitrate management** — the encoder's
+/// `bitrate_bps` field is documented as informational and truly is — so a
+/// requested bitrate can only be approximated: this maps the request to the
+/// quality level whose measured rate is closest, scaling for mono (which
+/// roughly halves the bitrate at the same quality). Requests outside the
+/// measured range clamp to its ends.
+const VORBIS_KBPS_AT_Q: [(f32, f32); 19] = [
     (0.05, 29.0),
     (0.25, 31.0),
-    (0.35, 36.0),
-    (0.45, 40.0),
-    (0.55, 51.0),
-    (0.65, 67.0),
+    (0.35, 34.0),
+    (0.45, 41.0),
+    (0.55, 52.0),
+    (0.65, 70.0),
     (0.75, 100.0),
-    (0.85, 130.0),
+    (0.85, 132.0),
     (0.93, 160.0),
     (0.98, 179.0),
+    (1.00, 187.0),
+    (1.10, 230.0),
+    (1.20, 271.0),
+    (1.30, 309.0),
+    (1.40, 343.0),
+    (1.50, 377.0),
+    (1.60, 415.0),
+    (1.70, 456.0),
+    (1.80, 498.0),
 ];
 
 /// The Vorbis quality level whose measured bitrate is closest to `kbps`.
@@ -841,13 +857,15 @@ mod tests {
     #[test]
     fn ogg_bitrate_lands_near_the_request() {
         let audio = dense_mix(44_100, 44_100 * 4);
-        for kbps in [64u32, 128, 170] {
+        // Across the whole exposed range, including the default (512) and the
+        // extended-quality region above the encoder's documented 0.98.
+        for kbps in [64u32, 128, 256, 400, 512] {
             let p = dir().join(format!("br{kbps}.ogg"));
             write(
                 &p,
                 &audio,
                 WriteOptions {
-                    ogg_bitrate: Some(kbps),
+                    ogg_bitrate: kbps,
                     ..WriteOptions::default()
                 },
             )
@@ -860,6 +878,23 @@ mod tests {
             );
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    /// The default bitrate is the top of the exposed range, and the top of the
+    /// range is measured, not aspirational.
+    #[test]
+    fn ogg_default_bitrate_is_the_ceiling() {
+        assert_eq!(WriteOptions::default().ogg_bitrate, 512);
+        let audio = dense_mix(44_100, 44_100 * 4);
+        let p = dir().join("default.ogg");
+        write(&p, &audio, WriteOptions::default()).unwrap();
+        let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0 / 1000.0
+            / (audio.frames() as f64 / audio.sample_rate as f64);
+        assert!(
+            (470.0..=540.0).contains(&got),
+            "default should land near 512 kbit/s, got {got:.0}"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -916,7 +951,12 @@ mod tests {
         assert!(q_low < q_high, "{q_low} !< {q_high}");
         // Clamping at both ends of the measured curve.
         assert_eq!(vorbis_quality_for_bitrate(1, 2), 0.05);
-        assert_eq!(vorbis_quality_for_bitrate(1_000, 2), 0.98);
+        assert_eq!(vorbis_quality_for_bitrate(1_000, 2), 1.80);
+        // The curve is monotone across its whole length, extended range
+        // included — every step must buy bitrate.
+        for pair in VORBIS_KBPS_AT_Q.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "not monotone at q {}", pair[0].0);
+        }
         // Mono at 64k ≈ stereo at 128k.
         let (m, s) = (vorbis_quality_for_bitrate(64, 1), vorbis_quality_for_bitrate(128, 2));
         assert!((m - s).abs() < 0.15, "mono 64k {m} vs stereo 128k {s}");

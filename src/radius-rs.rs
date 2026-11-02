@@ -104,8 +104,8 @@ fn run(cli: &Cli) -> Result<()> {
                 ),
             };
             format!(
-                "{vc} gain={:+.2}dB format={:?} bit_depth={:?} ogg_quality={:.2} mp3_bitrate={}",
-                cli.gain, output_format, cli.bit_depth, cli.ogg_quality, cli.mp3_bitrate
+                "{vc} gain={:+.2}dB format={:?} bit_depth={:?} ogg_bitrate={} mp3_bitrate={}",
+                cli.gain, output_format, cli.bit_depth, cli.ogg_bitrate, cli.mp3_bitrate
             )
         }
     );

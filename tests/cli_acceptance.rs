@@ -338,13 +338,12 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
         stdout.contains(
             "mode=Vc semitones=+0.00 tempo=100.0% fft=Radix2 formant_shift=+0.00 \
              preserve_voice=true gain=+0.00dB \
-             format=Wav bit_depth=F32 ogg_quality=1.00 mp3_bitrate=320"
+             format=Wav bit_depth=F32 ogg_bitrate=512 mp3_bitrate=320"
         ),
         "unexpected defaults banner: {stdout}"
     );
     assert!(
-        // Anchored with the leading space so it cannot match `ogg_quality=`, which is a
-        // different setting and does appear in this banner.
+        // Anchored with the leading space so it cannot match other settings.
         !stdout.contains(" quality=") && !stdout.contains(" solo="),
         "the td-only knobs must not appear in a vc banner: {stdout}"
     );
@@ -439,7 +438,7 @@ fn cli_passthrough_to_flac_keeps_every_sample() {
 /// The lossy-codec defaults must be the top of each range.
 #[test]
 fn cli_lossy_defaults_are_the_best_available() {
-    for (ext, expected) in [("ogg", "q=1.00"), ("mp3", "320 kbps")] {
+    for (ext, expected) in [("ogg", "≈512 kbps"), ("mp3", "320 kbps")] {
         if !codec_available(ext) {
             continue;
         }
@@ -459,11 +458,11 @@ fn cli_lossy_defaults_are_the_best_available() {
     }
 }
 
-/// `--ogg-bitrate` overrides the quality knob, shows in the banner, and
-/// refuses to be combined with it (a bitrate request and a quality request are
-/// two different answers to the same question).
+/// `--ogg-bitrate` is the only Ogg knob: the default 512 is the top of the
+/// measured range, an explicit request shows in the banner, and the removed
+/// `--ogg-quality` flag errors as unknown rather than being silently ignored.
 #[test]
-fn cli_ogg_bitrate_overrides_quality_and_conflicts() {
+fn cli_ogg_bitrate_is_the_only_knob() {
     if !codec_available("ogg") {
         return;
     }
@@ -487,13 +486,14 @@ fn cli_ogg_bitrate_overrides_quality_and_conflicts() {
     let (ok, _, err) = run(&[
         input_wav().to_str().unwrap(),
         out.to_str().unwrap(),
-        "--ogg-bitrate",
-        "128",
         "--ogg-quality",
         "0.5",
     ]);
-    assert!(!ok, "--ogg-bitrate and --ogg-quality must conflict");
-    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(!ok, "--ogg-quality is gone and must be rejected");
+    assert!(
+        err.contains("unexpected argument"),
+        "clap should name the unknown flag: {err}"
+    );
     let _ = std::fs::remove_file(&out);
 }
 
@@ -759,11 +759,11 @@ fn cli_quality_options_are_honoured() {
         );
     }
 
-    // ---- Ogg quality -------------------------------------------------------
+    // ---- Ogg bitrate --------------------------------------------------------
     if codec_available("ogg") {
         let mut sizes = Vec::new();
-        for q in ["0.1", "0.9"] {
-            let out = tmp(&format!("q_{}.ogg", q.replace('.', "_")));
+        for kbps in ["96", "512"] {
+            let out = tmp(&format!("br_{kbps}.ogg"));
             let _ = std::fs::remove_file(&out);
             let (ok, _, err) = run(&[
                 sliced.to_str().unwrap(),
@@ -772,15 +772,15 @@ fn cli_quality_options_are_honoured() {
                 "td",
                 "-s",
                 "0",
-                "--ogg-quality",
-                q,
+                "--ogg-bitrate",
+                kbps,
             ]);
-            assert!(ok, "ogg q={q} failed: {err}");
-            sizes.push((q, std::fs::metadata(&out).unwrap().len()));
+            assert!(ok, "ogg {kbps} kbit/s failed: {err}");
+            sizes.push((kbps, std::fs::metadata(&out).unwrap().len()));
         }
         assert!(
             sizes[0].1 < sizes[1].1,
-            "ogg q=0.9 ({}) should exceed q=0.1 ({})",
+            "ogg 512 kbit/s ({}) should exceed 96 kbit/s ({})",
             sizes[1].1,
             sizes[0].1
         );

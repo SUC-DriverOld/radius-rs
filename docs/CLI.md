@@ -103,7 +103,7 @@ The warnings are:
 | `--formant-shift` has no effect under `--no-preserve-voice` | that flag turns the operator off outright |
 | `--fft` | `radix2` | Reference-compatible FFT. See [FFT.md](FFT.md) for what `rustfft` costs. |
 | `--bit-depth` | `32f` | 32-bit IEEE float, the engines' **native** output, so nothing is quantised on the way out. Integers re-quantise to 16 or 24 bit on request. |
-| `--ogg-quality` | `0.9` | Top of the practical Vorbis range, so an Ogg output is never the reason for audible loss. |
+| `--ogg-bitrate` | `512` | Top of the measured Vorbis range, so an Ogg output is never the reason for audible loss. |
 | `--mp3-bitrate` | `320` | The highest MP3 constant bitrate LAME offers. |
 
 All of these are overridable per run, and `--help` prints the same defaults.
@@ -187,11 +187,10 @@ Two reference parameters are deliberately absent from the CLI because they canno
 |---|---|---|---|
 | `-f, --format <wav\|flac\|ogg\|mp3>` | from the extension | Force the output container, for when the extension is ambiguous or must stay as-is. | An unknown extension **without** `--format` is an error |
 | `-b, --bit-depth <16\|24\|32\|32f>` | `32f` | Sample depth for wav and flac. `32f` is IEEE float, which is what both engines natively produce; `16`, `24` and `32` are integer PCM. FLAC stores `32` and `32f` as 24 bit, the deepest subframe the format has. | wav: `16`, `24`, `32`, `32f`; flac: `16`, `24` |
-| `--ogg-quality <0.0-1.0>` | `1.0` | Ogg/Vorbis encoder quality, on the pure-Rust encoder's normalized scale. | higher is bigger and better |
-| `--ogg-bitrate <KBPS>` | unset | Target average bitrate for Ogg/Vorbis: the quality whose *measured* bitrate is closest to the request. Vorbis is VBR, so the result is approximate (roughly ±10% on programme-length material); the encoder's embedded profile reaches about 30–180 kbit/s stereo, and requests outside that range clamp to its ends. On very short files the fixed lead/pad overhead (~230 ms of encoded audio) pushes the achieved rate up. | conflicts with `--ogg-quality` |
+| `--ogg-bitrate <KBPS>` | `512` | Target average bitrate for Ogg/Vorbis: the encoder quality whose *measured* bitrate is closest to the request. Vorbis here is VBR with **no bitrate management** — the pure-Rust encoder exposes no CBR mode, its `bitrate` field is a header hint only — so the result is approximate (roughly ±10% on programme-length material) and this knob is the only Ogg control. Useful range about 30–500 kbit/s stereo (half that mono); requests outside clamp to the ends, and on very short files the fixed lead/pad overhead (~230 ms of encoded audio) pushes the achieved rate up. | higher is bigger and better |
 | `--mp3-bitrate <KBPS>` | `320` | MP3 constant bitrate, snapped to the nearest value the MPEG tables carry (64, 96, 128, 160, 192, 256, 320, …). | higher is bigger and better |
 
-The bitrate→quality table behind `--ogg-bitrate` is measured, not theoretical: the curve in `src/io.rs` (`VORBIS_KBPS_AT_Q`) was produced by encoding a dense seven-tone mix with vibrato and noise at 44.1 kHz stereo, four seconds of it, at nineteen quality points. Keep it in mind when reading the numbers: a pure tone codes for a fraction of any target, because VBR spends bits on entropy, not on the knob.
+The bitrate→quality table behind `--ogg-bitrate` is measured, not theoretical: the curve in `src/io.rs` (`VORBIS_KBPS_AT_Q`) was produced by encoding a dense seven-tone mix with vibrato and noise at 44.1 kHz stereo, four seconds of it, at nineteen quality points. An odd corner of that curve: the encoder's own documented quality scale ends at 0.98 (≈180 kbit/s stereo), but its rate-distortion λ keeps falling past that and the embedded codebooks keep accepting the bits — the measured ceiling, q1.8 ≈ 500 kbit/s, is where the default 512 comes from. Keep the curve's basis in mind when reading the numbers: a pure tone codes for a fraction of any target, because VBR spends bits on entropy, not on the knob.
 
 The CLI prints what it actually wrote, for example `wrote out.flac (1393118 frames, 29.023s, flac 24-bit, peak 1.2133)`, so the effective container, depth and achieved peak are always visible.
 

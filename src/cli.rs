@@ -279,26 +279,17 @@ pub struct Cli {
 
     #[arg(
         long,
-        default_value_t = 1.0,
-        value_name = "0.0-1.0",
-        help = "Ogg/Vorbis quality, 0..1.",
-        long_help = "Ogg/Vorbis encoder quality, 0..1, on the pure-Rust encoder's scale. \
-            The default 1.0 is the top of the practical range, so an Ogg output is never \
-            the reason for audible loss. Ignored when --ogg-bitrate is given."
-    )]
-    pub ogg_quality: f32,
-
-    #[arg(
-        long,
+        default_value_t = 512,
         value_name = "KBPS",
-        conflicts_with = "ogg_quality",
-        help = "Ogg/Vorbis target bitrate in kbit/s (approximate).",
-        long_help = "Pick the Ogg/Vorbis quality whose measured bitrate is closest to \
-            KBPS. Vorbis is VBR, so the result is approximate — expect it to land \
-            within roughly ±10%% on typical material. Takes precedence over \
-            --ogg-quality (they conflict)."
+        help = "Ogg/Vorbis target bitrate in kbit/s (approximate, VBR).",
+        long_help = "Ogg/Vorbis target bitrate in kbit/s: the encoder quality whose \
+            *measured* average bitrate is closest is picked. Vorbis here is VBR with no \
+            bitrate management — the pure-Rust encoder has no CBR mode — so the result is \
+            approximate: expect it within roughly ±10%% on typical material. Useful range \
+            about 30–500 kbit/s stereo (half that mono); the default 512 is the top of \
+            the measured curve, and requests outside the range clamp to its ends."
     )]
-    pub ogg_bitrate: Option<u32>,
+    pub ogg_bitrate: u32,
 
     #[arg(
         long,
@@ -698,7 +689,6 @@ pub fn write_options(cli: &Cli) -> WriteOptions {
     WriteOptions {
         depth: cli.bit_depth,
         container: cli.format,
-        ogg_quality: cli.ogg_quality,
         ogg_bitrate: cli.ogg_bitrate,
         mp3_kbps: cli.mp3_bitrate,
     }
@@ -861,10 +851,7 @@ pub fn describe_container(container: Container, cli: &Cli) -> String {
                 "24-bit"
             }
         ),
-        Container::Ogg => match cli.ogg_bitrate {
-            Some(kbps) => format!("ogg/vorbis ≈{kbps} kbps"),
-            None => format!("ogg/vorbis q={:.2}", cli.ogg_quality),
-        },
+        Container::Ogg => format!("ogg/vorbis ≈{} kbps", cli.ogg_bitrate),
         Container::Mp3 => format!("mp3 {} kbps", cli.mp3_bitrate),
     }
 }

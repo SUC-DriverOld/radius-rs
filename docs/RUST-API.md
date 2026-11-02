@@ -68,11 +68,11 @@ let out = engine.render(&input.samples, input.frames());
 audio::write(
     "out.flac",
     &Audio { samples: out, sample_rate: input.sample_rate, channels: input.channels },
-    WriteOptions::default(),                 // 32f for wav/flac, ogg q=1.0, mp3 320k
+    WriteOptions::default(),                 // 32f for wav/flac, ogg ≈512 kbit/s, mp3 320k
 )?;
 ```
 
-`WriteOptions` carries the same knobs as the CLI: `depth`, `container`, `ogg_quality`, `ogg_bitrate` and `mp3_kbps`. [`radius_rs::io::info`] reports what is actually in a file (codec name, rate, channels), and `radius_rs::cli::clip_warning` is the clipping check the binary prints, if you want the same warning in your own tool.
+`WriteOptions` carries the same knobs as the CLI: `depth`, `container`, `ogg_bitrate` (VBR target; the encoder has no CBR mode) and `mp3_kbps`. [`radius_rs::io::info`] reports what is actually in a file (codec name, rate, channels), and `radius_rs::cli::clip_warning` is the clipping check the binary prints, if you want the same warning in your own tool.
 
 ## Feature flags
 
