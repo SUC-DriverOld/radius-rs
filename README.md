@@ -5,7 +5,7 @@ Rust rewrite of the **Radius** time-domain and phase-vocoder pitch-shift algorit
 This repository contains three entry points, all using the same underlying engines:
 
 * **crate**: `radius_rs` — the engines plus the operator modules, usable on an in-memory `f32` buffer
-* **CLI**: `radius` binary — pitch shift and time stretch for any container or codec ffmpeg knows
+* **CLI**: `radius` binary — pitch shift and time stretch for wav, flac, ogg/vorbis and mp3 (plus aac/m4a, aiff and more on input), all through pure-Rust codecs
 * **C ABI**: `cdylib` / `staticlib` with header, usable from C, C++, Python, etc.
 
 Radius supports two pitch-shifting engines, selectable at run time:
@@ -15,16 +15,9 @@ Radius supports two pitch-shifting engines, selectable at run time:
 
 ## Requirements
 
-* **Rust** 1.75 or newer, edition 2021.
-* **ffmpeg** at run time, for any audio I/O. The library itself has no audio codec in it: reading and writing go through ffmpeg, so every format it supports works in both directions.
+* **Rust** 1.85 or newer, edition 2021.
+* Nothing else: audio I/O goes through pure-Rust codecs ([oxiaudio](https://crates.io/crates/oxiaudio), [rusty_vorbis](https://crates.io/crates/rusty_vorbis), [rusty_mp3](https://crates.io/crates/rusty_mp3)) compiled into the binary — no ffmpeg, no subprocesses.
 * A CPU with **AVX and FMA** on x86-64, i.e. Intel Haswell (2013) or AMD Excavator (2015) and newer. [`.cargo/config.toml`](.cargo/config.toml) turns the feature on because the engine mirrors the reference's `a*b + c` as one correctly-rounded operation, and without it every fused multiply-add becomes a software call — worth about 2x on the vocoder. It changes no output bits. See [docs/DESIGN.md](docs/DESIGN.md); build with `RUSTFLAGS=-C target-feature=-fma` to drop the requirement.
-
-ffmpeg is looked up as `ffmpeg` on `PATH`, or wherever `RADIUS_FFMPEG` points:
-
-```bash
-export RADIUS_FFMPEG=/opt/ffmpeg/bin/ffmpeg                 # Linux / macOS
-set RADIUS_FFMPEG=C:\Program Files\ffmpeg\bin\ffmpeg.exe    # Windows
-```
 
 ## Quick start
 

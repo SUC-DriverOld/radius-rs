@@ -80,12 +80,12 @@ cargo test --release -- --ignored          # the slow full-length renders
 cargo test --release -- --include-ignored  # everything, including those
 ```
 
-All of it runs with no external audio files and no extra cargo features. The corpus-dependent assertions, meaning the exact granule and transient counts, the output lengths and the parity against `pyradius`, require the acceptance audio and report `SKIP` without it, and the container round trips skip when ffmpeg is missing.
+All of it runs with no external audio files and no extra cargo features. The corpus-dependent assertions, meaning the exact granule and transient counts, the output lengths and the parity against `pyradius`, require the acceptance audio and report `SKIP` without it; the codec round trips always run, because the codecs are compiled in.
 
 * **engine unit tests** — bit-exact golden vectors minted from the Python reference for every operator: the FFT, `fill_granule` across 16 branch and parameter combinations, `cart_to_polar`, `unwrap_phase`, `ApplyPitchCoherence`, `ResetPhasesForTransients`, `adjust_multiphase_diff`, `SynchronizeStereoPhases`, `Randomize` and `SubstituteNoisyPhases`, `OverlapAddChannel`, `Crossover`, `FormantState`, the transients-info geometry, the sampler, and the constant tables.
 * **TD acceptance** — duration, amplitude and stereo-image preservation, both pitch directions, a *measured* semitone check on a synthetic tone, and the corpus granule and transient counts.
 * **vocoder acceptance** — geometry for both sample rates, the scheduler's structural invariants, a short synthetic render, stereo separation, and an `#[ignore]`d full-length parity run.
-* **CLI acceptance** — help, version and argument errors, a real render, the `--truth` correlation report, rejection of an unsupported vocoder rate, a write and read round trip for every container, the documented defaults including the identity-render note, the progress bar in all three modes, the clipping warning per format, and an exhaustive check of the quality knobs: wav `-b 16/24/32f` are confirmed by ffmpeg to be `pcm_s16le`, `pcm_s24le` and `pcm_f32le` and grow in that order, FLAC 16 and 24 are lossless to within their depth's quantisation step, MP3 320 kbps is larger than 128 kbps, Ogg q=0.9 is larger than q=0.1, `--format` overrides the extension, and an unknown extension is rejected.
+* **CLI acceptance** — help, version and argument errors, a real render, the `--truth` correlation report, rejection of an unsupported vocoder rate, a write and read round trip for every container, the documented defaults including the identity-render note, the progress bar in all three modes, the clipping warning per format, and an exhaustive check of the quality knobs: wav `-b 16/24/32/32f` are confirmed by file size to be 2/3/4/4 bytes per sample and grow in that order, FLAC 16 and 24 are lossless to within their depth's quantisation step, MP3 320 kbps is larger than 128 kbps, Ogg q=1.0 is larger than a low quality, `--ogg-bitrate` lands near its request, `--format` overrides the extension, and an unknown extension is rejected.
 * **C ABI acceptance** — the exported symbols called through `extern "C"`, `rx_td_render` bit-identical to the Rust API, the null and bad-argument contract, and the vocoder render reachable from C.
 * **Audition reference** — the duration, level and energy-contour checks above.
 
@@ -113,7 +113,7 @@ RADIUS_AUDITION_REF_DIR=/path/to/audition_renders \
 
 ## Performance
 
-Release build, one machine, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured, so process start-up and the ffmpeg I/O around it are excluded.
+Release build, one machine, 29.03 s of 48 kHz stereo. Timings are from the CLI's own `render:` line, which reports the time it measured, so process start-up and the file I/O around it are excluded.
 
 | engine | `--fft` | time | throughput |
 |---|---|---|---|

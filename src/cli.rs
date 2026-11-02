@@ -1,8 +1,9 @@
 //! Command line front-end for the TD and vocoder engines.
 //!
-//! Format support is delegated to [`crate::io`], which uses pure-Rust
-//! codecs (symphonia for decoding, hound/flacenc/vorbis/lame for encoding) so
-//! no external `ffmpeg` is required.
+//! Format support is delegated to [`crate::io`]: decoding is [`oxiaudio`]
+//! (wav, flac, ogg/vorbis, mp3, aac/m4a, aiff, …), encoding is oxiaudio
+//! (wav, flac, ogg/vorbis) plus [`rusty_mp3`] (mp3) — all pure Rust, so no
+//! external `ffmpeg` is required.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -73,8 +74,8 @@ pub struct Cli {
     #[arg(
         value_name = "INPUT",
         help = "Input audio file.",
-        long_help = "Input audio file: any container or codec ffmpeg can read (wav, flac, \
-            ogg/vorbis, mp3, aac/adts, m4a/alac, mkv/webm, aiff, caf, ...). \
+        long_help = "Input audio file: any container the pure-Rust decoders take (wav, \
+            flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack). \
             Its sample rate and channel count are used as-is and written unchanged to the \
             output. There is deliberately no rate option, so input and output always agree."
     )]
@@ -269,10 +270,8 @@ pub struct Cli {
         help = "WAV/FLAC sample depth (32f is the engines' native float).",
         long_help = "Sample depth for wav and flac. \
             32f (default) is IEEE float, which is what both engines natively produce, so \
-            nothing is quantised on the way out. 16 and 24 are integer PCM. \
-            32 is rejected on purpose: ffmpeg has no 32-bit integer PCM encoder, and quietly \
-            writing 24 bit instead would be worse than an error. flac stores 32 and 32f as \
-            24 bit, the deepest subframe the format has. \
+            nothing is quantised on the way out. 16, 24 and 32 are integer PCM. \
+            flac stores 32 and 32f as 24 bit, the deepest subframe the format has. \
             Integer and lossy targets clamp, so a render that exceeds full scale is reported \
             rather than silently wrapped. See the clipping section of docs/CLI.md."
     )]
@@ -280,22 +279,35 @@ pub struct Cli {
 
     #[arg(
         long,
-        default_value_t = 0.9,
+        default_value_t = 1.0,
         value_name = "0.0-1.0",
         help = "Ogg/Vorbis quality, 0..1.",
-        long_help = "Ogg/Vorbis encoder quality, 0..1. \
-            This crate's 0..1 is passed to libvorbis as 0..10. The default 0.9 is the top of \
-            the practical range, so an Ogg output is never the reason for audible loss."
+        long_help = "Ogg/Vorbis encoder quality, 0..1, on the pure-Rust encoder's scale. \
+            The default 1.0 is the top of the practical range, so an Ogg output is never \
+            the reason for audible loss. Ignored when --ogg-bitrate is given."
     )]
     pub ogg_quality: f32,
+
+    #[arg(
+        long,
+        value_name = "KBPS",
+        conflicts_with = "ogg_quality",
+        help = "Ogg/Vorbis target bitrate in kbit/s (approximate).",
+        long_help = "Pick the Ogg/Vorbis quality whose measured bitrate is closest to \
+            KBPS. Vorbis is VBR, so the result is approximate — expect it to land \
+            within roughly ±10%% on typical material. Takes precedence over \
+            --ogg-quality (they conflict)."
+    )]
+    pub ogg_bitrate: Option<u32>,
 
     #[arg(
         long,
         default_value_t = 320,
         value_name = "KBPS",
         help = "MP3 constant bitrate in kbit/s.",
-        long_help = "MP3 constant bitrate in kbit/s: 64, 96, 128, 160, 192, 256 or 320. \
-            The default 320 is the highest LAME offers."
+        long_help = "MP3 constant bitrate in kbit/s, snapped to the nearest value the \
+            MPEG tables carry (64, 96, 128, 160, 192, 256, 320, …). \
+            The default 320 is the highest the format offers."
     )]
     pub mp3_bitrate: u16,
 
@@ -606,24 +618,20 @@ pub fn analyse_clipping(x: &[f32]) -> Clipping {
 
 /// Does this output configuration quantise to a fixed-point representation?
 ///
-/// The engines always hand ffmpeg their native `f32` samples, so the question
+/// The engines always hand the codecs their native `f32` samples, so the question
 /// is whether the *codec* clamps them to `[-1, 1]`:
 ///
 /// * `32f` WAV stores any float value the engine can produce — nothing clamps;
 /// * integer PCM WAV and FLAC (which has no float subframe, so every depth
-///   lands in `s16`/`s32`) have to clamp;
+///   lands in 16/24-bit) have to clamp;
 /// * Ogg/Vorbis and MP3 are float codecs fed the `f32` pipe directly — they
 ///   encode overshoot rather than clip it (lossily, like everything else they
-///   do), so they do not quantise either.
+///   do; the MP3 encoder only clamps beyond ±8), so they do not quantise either.
+///
+/// With no container named, only the depth can decide.
 pub fn quantises(depth: BitDepth, container: Option<Container>) -> bool {
     match container {
-        Some(Container::Wav) => !depth.is_float(),
-        // FLAC is lossless for the integer range it stores, but a value outside
-        // [-1, 1] still has to be clamped to get there.
-        Some(Container::Flac) => true,
-        // Float codecs: the f32 samples go in unclamped and come back out
-        // (approximately) on decode.
-        Some(Container::Ogg) | Some(Container::Mp3) => false,
+        Some(c) => c.quantises(depth),
         // Unknown: fall back to the extension decision, handled by the caller.
         None => !depth.is_float(),
     }
@@ -691,6 +699,7 @@ pub fn write_options(cli: &Cli) -> WriteOptions {
         depth: cli.bit_depth,
         container: cli.format,
         ogg_quality: cli.ogg_quality,
+        ogg_bitrate: cli.ogg_bitrate,
         mp3_kbps: cli.mp3_bitrate,
     }
 }
@@ -708,8 +717,7 @@ pub fn write_options(cli: &Cli) -> WriteOptions {
 /// Step 3 is why a bare `radius in.flac` produces FLAC rather than WAV: the output
 /// format follows the input unless told otherwise, and 4 is the fallback for an
 /// input this crate can read but not write (compressed-only containers such as
-/// AAC/M4A, which ffmpeg can encode but which the size/quality knobs here do not
-/// cover).
+/// AAC/M4A, which the decoders take but the encoders here do not produce).
 pub fn effective_container(cli: &Cli) -> Option<Container> {
     if let Some(c) = cli.format {
         return Some(c);
@@ -853,7 +861,10 @@ pub fn describe_container(container: Container, cli: &Cli) -> String {
                 "24-bit"
             }
         ),
-        Container::Ogg => format!("ogg/vorbis q={:.2}", cli.ogg_quality),
+        Container::Ogg => match cli.ogg_bitrate {
+            Some(kbps) => format!("ogg/vorbis ≈{kbps} kbps"),
+            None => format!("ogg/vorbis q={:.2}", cli.ogg_quality),
+        },
         Container::Mp3 => format!("mp3 {} kbps", cli.mp3_bitrate),
     }
 }

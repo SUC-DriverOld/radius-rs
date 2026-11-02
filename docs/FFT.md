@@ -54,7 +54,7 @@ substitute for the vocoder.
 ## Speed
 
 Measured on the same 29.03 s file with one binary, one process at a time, reading the
-engine's own `render:` timing (so process start-up and the ffmpeg I/O are excluded),
+engine's own `render:` timing (so process start-up and the file I/O are excluded),
 selecting the backend with `--fft` (the `RADIUS_FFT` environment variable remains
 available for library callers):
 

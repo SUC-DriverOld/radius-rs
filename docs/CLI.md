@@ -30,7 +30,7 @@ So Audition's −36 … +36 变调 range is real, with two caveats worth knowing
 
 | argument | meaning |
 |---|---|
-| `INPUT` | Input audio file. Any container or codec ffmpeg can read: wav, flac, ogg/vorbis, mp3, aac/adts, m4a/alac, mkv/webm, aiff, caf, … Its **sample rate and channel count are used as-is** and written unchanged to the output. There is deliberately no rate option, so input and output always agree. |
+| `INPUT` | Input audio file. Any container the pure-Rust decoders take: wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack. Its **sample rate and channel count are used as-is** and written unchanged to the output. There is deliberately no rate option, so input and output always agree. Channel counts are carried through the layouts the codecs model: 1, 2, 4, 6, 8 or 12; anything else fails with an error that says so. |
 | `OUTPUT` | **Optional.** Output audio file; the extension selects the container unless `--format` overrides it. An unknown extension without `--format` is an error rather than a guess. Omit it entirely and a name is derived from the input, in the input's own format where that format can be written. |
 
 ## Omitting the output name
@@ -49,7 +49,7 @@ Beside the input rather than in the working directory is deliberate, and matches
 
 Two further rules make this safe to use from a shell loop:
 
-* **The output format follows the input.** With no `--format` and no output extension, the container comes from the input file, so `in.flac` produces FLAC and `in.wav` produces WAV. An input this crate can read but not write — AAC/M4A, for instance, which ffmpeg decodes but for which there is no encoder here — falls back to **WAV**. `--format` outranks both of those, and an explicit output extension outranks the input as well.
+* **The output format follows the input.** With no `--format` and no output extension, the container comes from the input file, so `in.flac` produces FLAC and `in.wav` produces WAV. An input this crate can read but not write — AAC/M4A, for instance, which the decoders take but for which there is no encoder here — falls back to **WAV**. `--format` outranks both of those, and an explicit output extension outranks the input as well.
 * **Nothing is ever overwritten.** If the chosen name already exists, ` (1)`, ` (2)`, … is inserted before the extension until it does not, the way a browser names a second download. This applies to a name you typed as well as to a derived one, so a mistyped output path cannot silently destroy an earlier render.
 
 Quality is never traded for convenience: the bit depth and the lossy-quality defaults are untouched by either rule, so a derived `_vc_st3.flac` is the same 24-bit lossless file you would have got by naming it yourself.
@@ -186,9 +186,12 @@ Two reference parameters are deliberately absent from the CLI because they canno
 | option | default | meaning | notes |
 |---|---|---|---|
 | `-f, --format <wav\|flac\|ogg\|mp3>` | from the extension | Force the output container, for when the extension is ambiguous or must stay as-is. | An unknown extension **without** `--format` is an error |
-| `-b, --bit-depth <16\|24\|32\|32f>` | `32f` | Sample depth for wav and flac. `32f` is IEEE float, which is what both engines natively produce; `16` and `24` are integer PCM. `32` is rejected on purpose: ffmpeg has no 32-bit integer PCM encoder, and quietly writing 24 bit instead would be worse. FLAC stores `32` and `32f` as 24 bit, the deepest subframe the format has. | wav: `16`, `24`, `32f`; flac: `16`, `24` |
-| `--ogg-quality <0.0-1.0>` | `0.9` | Ogg/Vorbis encoder quality. This crate's 0..1 is passed to libvorbis as 0..10. | higher is bigger and better |
-| `--mp3-bitrate <KBPS>` | `320` | MP3 constant bitrate: 64, 96, 128, 160, 192, 256 or 320. | higher is bigger and better |
+| `-b, --bit-depth <16\|24\|32\|32f>` | `32f` | Sample depth for wav and flac. `32f` is IEEE float, which is what both engines natively produce; `16`, `24` and `32` are integer PCM. FLAC stores `32` and `32f` as 24 bit, the deepest subframe the format has. | wav: `16`, `24`, `32`, `32f`; flac: `16`, `24` |
+| `--ogg-quality <0.0-1.0>` | `1.0` | Ogg/Vorbis encoder quality, on the pure-Rust encoder's normalized scale. | higher is bigger and better |
+| `--ogg-bitrate <KBPS>` | unset | Target average bitrate for Ogg/Vorbis: the quality whose *measured* bitrate is closest to the request. Vorbis is VBR, so the result is approximate (roughly ±10% on programme-length material); the encoder's embedded profile reaches about 30–180 kbit/s stereo, and requests outside that range clamp to its ends. On very short files the fixed lead/pad overhead (~230 ms of encoded audio) pushes the achieved rate up. | conflicts with `--ogg-quality` |
+| `--mp3-bitrate <KBPS>` | `320` | MP3 constant bitrate, snapped to the nearest value the MPEG tables carry (64, 96, 128, 160, 192, 256, 320, …). | higher is bigger and better |
+
+The bitrate→quality table behind `--ogg-bitrate` is measured, not theoretical: the curve in `src/io.rs` (`VORBIS_KBPS_AT_Q`) was produced by encoding a dense seven-tone mix with vibrato and noise at 44.1 kHz stereo, four seconds of it, at nineteen quality points. Keep it in mind when reading the numbers: a pure tone codes for a fraction of any target, because VBR spends bits on entropy, not on the knob.
 
 The CLI prints what it actually wrote, for example `wrote out.flac (1393118 frames, 29.023s, flac 24-bit, peak 1.2133)`, so the effective container, depth and achieved peak are always visible.
 
@@ -225,7 +228,7 @@ It appears only when stderr is a terminal, so logs, pipes and scripts are unaffe
 
 ## Clipping
 
-Whether a render that exceeds full scale matters depends on the output format, and the CLI says so instead of letting it pass silently. The engines always hand ffmpeg their native `f32` samples; the difference is the codec on the other side. **32-bit float WAV** stores a sample outside `[-1, 1]` exactly, and the float codecs **Ogg/Vorbis and MP3** take the same `f32` stream unclamped — they encode the overshoot rather than clip it, approximately, being lossy. Only integer PCM WAV and FLAC (which has no float subframe, so every depth lands in an integer one) have to clamp, and only they warn:
+Whether a render that exceeds full scale matters depends on the output format, and the CLI says so instead of letting it pass silently. The engines always hand the codecs their native `f32` samples; the difference is the codec on the other side. **32-bit float WAV** stores a sample outside `[-1, 1]` exactly, and the float codecs **Ogg/Vorbis and MP3** take the same `f32` stream unclamped — they encode the overshoot rather than clip it, approximately, being lossy (the MP3 encoder clamps only beyond ±8, far past anything a render produces). Only integer PCM WAV and FLAC (which has no float subframe, so every depth lands in an integer one) have to clamp, and only they warn:
 
 ```
 $ radius in.wav out.flac -m vc --semitones=-3
@@ -243,6 +246,25 @@ note: peak 1.8278 (> 1.0) — not clipped (float codec; lossy, so approximate)
 ```
 
 Overshoot is normal for these algorithms rather than a bug: overlapping granules and transient re-phasing sum past unity, and the amounts seen here (up to about 1.8 on the acceptance material at −3 semitones) are what the reference engine produces too. The warning exists so that an integer or lossy export is a decision rather than a surprise. It is silent below full scale, and near-full-scale samples are counted separately because `f32` quantisation can round a sample sitting just under 1.0 up to exactly 1.0.
+
+## Codecs
+
+All audio I/O is in-process and pure Rust — the day-one crate doc's promise, finally true:
+
+| direction | format | engine |
+|---|---|---|
+| read | wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack | `oxiaudio` (symphonia underneath) |
+| write | wav (16/24/32-bit integer, 32-bit float) | `oxiaudio` (hound) |
+| write | flac (16/24-bit integer) | `oxiaudio` (flacenc) |
+| write | ogg/vorbis (mono/stereo) | `rusty_vorbis`, framed by the `ogg` crate |
+| write | mp3 (mono/stereo, CBR, gapless LAME tag) | `rusty_mp3` |
+
+Two stories worth knowing:
+
+* **Why not oxiaudio's Vorbis encoder?** It was tried first and is unusable: on real material it writes a stream that both symphonia and ffmpeg decode to garbage (max |diff| ~1e7, SNR below −130 dB), truncates to a block boundary, and its quality knob changes nothing — the same file at q0.2 and q0.9, byte for byte. `rusty_vorbis` (same family as `rusty_mp3`) behaves like a real encoder and took the job.
+* **Ogg length exactness.** The Vorbis encoder hops in 1024-sample blocks and its raw packets make every decoder skip the first hop and never render the last one's overlap. The mux layer compensates: one silent *lead* hop as the overlap partner of the first real hop (its content never survives decoding — copy, reversed copy and zeros all decode identically, so it is zeros), a tail pad so the last real hop gets its partner, a final page granule of `hop + input_frames`, and the first audio packet alone on its page the way libvorbis lays out a stream. Read back through this crate the length equals the input length exactly, sample-aligned at lag zero — pinned by the io and acceptance tests. One honest caveat: a decoder that ignores granule trimming altogether (ffmpeg's vorbis path does) plays about two extra hops of silence around the programme instead; rusty_vorbis cannot produce libvorbis's priming-free first block, so that is the floor for a pure-Rust Vorbis today.
+
+MP3 writing carries a gapless LAME tag (encoder delay and end padding recorded, `rusty_mp3`'s own doing), so tag-aware players decode exactly the rendered length. MP3 itself only carries nine sample rates (8/11.025/12/16/22.05/24/32/44.1/48 kHz); a render at any other rate refuses the mp3 target with the list rather than silently resampling — which is also what ffmpeg did.
 
 ## Sample rates
 

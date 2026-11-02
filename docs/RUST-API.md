@@ -54,13 +54,13 @@ let output = engine.render(&input);            // or render_to(&input, target)
 
 ## Reading and writing files
 
-The same crate does the format work, through ffmpeg, so a wav to flac conversion is three calls. This is exactly what the `radius` binary does:
+The same crate does the format work, through pure-Rust codecs compiled in (no ffmpeg, no subprocesses), so a wav to flac conversion is three calls. This is exactly what the `radius` binary does:
 
 ```rust
 use radius_rs::io::{self as audio, Audio, WriteOptions};
 use radius_rs::TdState;
 
-let input: Audio = audio::read("in.wav")?;   // anything ffmpeg reads
+let input: Audio = audio::read("in.wav")?;   // wav, flac, ogg, mp3, aac/m4a, aiff, …
 let mut engine = TdState::new(input.sample_rate, 37, 0, input.channels);
 engine.set_ratio(3.0, 100.0);
 let out = engine.render(&input.samples, input.frames());
@@ -68,15 +68,15 @@ let out = engine.render(&input.samples, input.frames());
 audio::write(
     "out.flac",
     &Audio { samples: out, sample_rate: input.sample_rate, channels: input.channels },
-    WriteOptions::default(),                 // 32f for wav/flac, ogg q=0.9, mp3 320k
+    WriteOptions::default(),                 // 32f for wav/flac, ogg q=1.0, mp3 320k
 )?;
 ```
 
-`WriteOptions` carries the same knobs as the CLI: `depth`, `container`, `ogg_quality` and `mp3_kbps`. [`radius_rs::io::info`] asks ffmpeg what is actually in a file, [`radius_rs::io::ffmpeg_available`] tells you whether any of this will work at run time, and `radius_rs::cli::clip_warning` is the clipping check the binary prints, if you want the same warning in your own tool.
+`WriteOptions` carries the same knobs as the CLI: `depth`, `container`, `ogg_quality`, `ogg_bitrate` and `mp3_kbps`. [`radius_rs::io::info`] reports what is actually in a file (codec name, rate, channels), and `radius_rs::cli::clip_warning` is the clipping check the binary prints, if you want the same warning in your own tool.
 
 ## Feature flags
 
-There are no optional Cargo features. Both FFT backends are always compiled and selected at run time with [`radius_rs::fft::set_backend`] or the `--fft` flag, and codec support comes from the external ffmpeg binary rather than from a bundled library.
+There are no optional Cargo features. Both FFT backends are always compiled and selected at run time with [`radius_rs::fft::set_backend`] or the `--fft` flag, and codec support comes from the compiled-in pure-Rust codec crates (`oxiaudio`, `rusty_vorbis`, `rusty_mp3`).
 
 ## Two rules worth knowing
 

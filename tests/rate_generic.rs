@@ -13,10 +13,7 @@
 //! * renders at 32/96/16 kHz: exact durations under the two-rate law,
 //!   correct pitch, finite output.
 
-mod common;
-
-use common::*;
-use radius_rs::vocoder::{rate_gen, supported_rate, VocoderState};
+use radius_rs::vocoder::{rate_gen, VocoderState};
 
 /// A small radix-2 FFT for test-side response checks (magnitudes, normalised
 /// by `norm`).

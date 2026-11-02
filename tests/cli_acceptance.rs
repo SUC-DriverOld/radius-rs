@@ -44,7 +44,7 @@ fn run_with_progress(args: &[&str]) -> (bool, String, String) {
 /// Are the codec cases runnable? With ffmpeg doing the encoding there is nothing left
 /// to feature-gate, only a run time capability to check; without it those cases skip.
 fn codec_available(_what: &str) -> bool {
-    ffmpeg_or_skip("the container round trips")
+    codecs_or_skip("the container round trips")
 }
 
 /// Scratch path for this test.
@@ -338,7 +338,7 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
         stdout.contains(
             "mode=Vc semitones=+0.00 tempo=100.0% fft=Radix2 formant_shift=+0.00 \
              preserve_voice=true gain=+0.00dB \
-             format=Wav bit_depth=F32 ogg_quality=0.90 mp3_bitrate=320"
+             format=Wav bit_depth=F32 ogg_quality=1.00 mp3_bitrate=320"
         ),
         "unexpected defaults banner: {stdout}"
     );
@@ -354,22 +354,22 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
     );
     assert!(stdout.contains("wav 32-bit float"), "banner: {stdout}");
 
-    // And the pass-through must be exact: that is the whole point of it. Comparing
-    // through ffmpeg is the honest check now — the samples make a full round trip
-    // through ffmpeg's own f32 WAV encoder and decoder, so this asserts something
-    // stronger than "the bytes I wrote are the bytes I read".
+    // And the pass-through must be exact: that is the whole point of it. The
+    // samples make a full round trip through the crate's own f32 WAV encoder
+    // and decoder, so this asserts something stronger than "the bytes I wrote
+    // are the bytes I read".
     let src = read_audio(&input_wav());
     let got = read_audio(&out);
     assert_eq!(got.frames(), src.frames(), "pass-through changed the length");
     assert_eq!(
         got.samples, src.samples,
-        "a 32-bit float WAV pass-through must survive ffmpeg unchanged"
+        "a 32-bit float WAV pass-through must survive encode/decode unchanged"
     );
 
-    let info = ffmpeg_info(&out);
+    let info = probe_info(&out);
     assert_eq!(
-        info.codec, "pcm_f32le",
-        "the default output container must be 32-bit float WAV, got {}",
+        info.codec, "wav",
+        "the default output container must be WAV, got {}",
         info.line
     );
     assert_eq!(info.sample_rate, 48000, "sample rate must pass through");
@@ -411,8 +411,10 @@ fn cli_passthrough_to_flac_keeps_every_sample() {
         "flac round trip returned {} samples, expected at least {n}",
         got.samples.len()
     );
-    // FLAC here is 24-bit integer PCM, so the samples are the source quantised to
-    // 24 bit: at most half a step (2^-24) away, and never different in sign.
+    // FLAC here is 24-bit integer PCM, so the samples are the source quantised
+    // to 24 bit. flacenc's quantiser truncates toward zero (error up to one
+    // 24-bit step) and decoding into f32 adds up to half a step of its own, so
+    // the bound is two steps, and never a sign change.
     let step = 1.0f32 / (1u32 << 23) as f32;
     let mut worst = 0.0f32;
     let mut worst_at = 0usize;
@@ -424,8 +426,9 @@ fn cli_passthrough_to_flac_keeps_every_sample() {
         }
     }
     assert!(
-        worst <= step,
-        "flac round trip changed sample {worst_at} by {worst:e} (24-bit step is {step:e})"
+        worst <= 2.0 * step,
+        "flac round trip changed sample {worst_at} by {worst:e} (bound is {})",
+        2.0 * step
     );
     assert!(
         got.samples[n..].iter().all(|v| *v == 0.0),
@@ -436,7 +439,7 @@ fn cli_passthrough_to_flac_keeps_every_sample() {
 /// The lossy-codec defaults must be the top of each range.
 #[test]
 fn cli_lossy_defaults_are_the_best_available() {
-    for (ext, expected) in [("ogg", "q=0.90"), ("mp3", "320 kbps")] {
+    for (ext, expected) in [("ogg", "q=1.00"), ("mp3", "320 kbps")] {
         if !codec_available(ext) {
             continue;
         }
@@ -454,6 +457,44 @@ fn cli_lossy_defaults_are_the_best_available() {
             "default .{ext} should be {expected}, banner: {stdout}"
         );
     }
+}
+
+/// `--ogg-bitrate` overrides the quality knob, shows in the banner, and
+/// refuses to be combined with it (a bitrate request and a quality request are
+/// two different answers to the same question).
+#[test]
+fn cli_ogg_bitrate_overrides_quality_and_conflicts() {
+    if !codec_available("ogg") {
+        return;
+    }
+    let out = tmp("bitrate.ogg");
+    let _ = std::fs::remove_file(&out);
+    let (ok, stdout, err) = run(&[
+        input_wav().to_str().unwrap(),
+        out.to_str().unwrap(),
+        "-s",
+        "0",
+        "--ogg-bitrate",
+        "128",
+    ]);
+    assert!(ok, "--ogg-bitrate run failed: {err}");
+    assert!(
+        stdout.contains("ogg/vorbis ≈128 kbps"),
+        "the banner should carry the requested bitrate: {stdout}"
+    );
+    assert!(!stdout.contains("q="), "quality should not appear: {stdout}");
+
+    let (ok, _, err) = run(&[
+        input_wav().to_str().unwrap(),
+        out.to_str().unwrap(),
+        "--ogg-bitrate",
+        "128",
+        "--ogg-quality",
+        "0.5",
+    ]);
+    assert!(!ok, "--ogg-bitrate and --ogg-quality must conflict");
+    assert!(err.contains("cannot be used with"), "{err}");
+    let _ = std::fs::remove_file(&out);
 }
 
 #[test]
@@ -608,9 +649,12 @@ fn cli_quality_options_are_honoured() {
     let src = read_wav(&sliced);
     let n = src.frames();
 
-    // ---- WAV sample depths: 16 < 24 < 32f in bytes -------------------------
+    // ---- WAV sample depths: 16 < 24 < {32, 32f} in bytes --------------------
+    // The probe names only the container ("wav"), so the depth is asserted by
+    // file size: hound writes a constant header, so the data grows as
+    // 2 / 3 / 4 bytes per sample.
     let mut wav_sizes = Vec::new();
-    for depth in ["16", "24", "32f"] {
+    for depth in ["16", "24", "32", "32f"] {
         let out = tmp(&format!("depth_{depth}.wav"));
         let _ = std::fs::remove_file(&out);
         let (ok, _, err) = run(&[
@@ -624,29 +668,28 @@ fn cli_quality_options_are_honoured() {
             depth,
         ]);
         assert!(ok, "wav -b {depth} failed: {err}");
-        // ffmpeg's own name for what it wrote: s16 / s24 / float32.
-        let info = ffmpeg_info(&out);
-        let want = match depth {
-            "16" => "pcm_s16le",
-            "24" => "pcm_s24le",
-            _ => "pcm_f32le",
-        };
-        assert_eq!(info.codec, want, "-b {depth} wrote {}", info.line);
+        let info = probe_info(&out);
+        assert_eq!(info.codec, "wav", "-b {depth} wrote {}", info.line);
         wav_sizes.push((depth, std::fs::metadata(&out).unwrap().len()));
     }
     let s16 = wav_sizes.iter().find(|(d, _)| *d == "16").unwrap().1;
     let s24 = wav_sizes.iter().find(|(d, _)| *d == "24").unwrap().1;
-    let s32 = wav_sizes.iter().find(|(d, _)| *d == "32f").unwrap().1;
+    let s32i = wav_sizes.iter().find(|(d, _)| *d == "32").unwrap().1;
+    let s32f = wav_sizes.iter().find(|(d, _)| *d == "32f").unwrap().1;
     assert!(
-        s16 < s24 && s24 < s32,
-        "wav sizes not monotone: {s16} {s24} {s32}"
+        s16 < s24 && s24 < s32f,
+        "wav sizes not monotone: {s16} {s24} {s32f}"
+    );
+    assert_eq!(
+        s32i, s32f,
+        "32-bit integer and 32-bit float wav are both 4 bytes per sample"
     );
 
     // ---- FLAC depths: lossless, and 16 bit must be the smaller file --------
     //
-    // No size formula here any more: ffmpeg's FLAC encoder actually predicts and
-    // Rice-codes the subframes, so the size depends on the signal. What must hold is
-    // that the stream is lossless at the requested depth and that the shallower depth
+    // No size formula here: the FLAC encoder predicts and Rice-codes the
+    // subframes, so the size depends on the signal. What must hold is that the
+    // stream is lossless at the requested depth and that the shallower depth
     // is not the larger file.
     let mut flac_sizes = Vec::new();
     for depth in ["16", "24"] {
@@ -668,7 +711,9 @@ fn cli_quality_options_are_honoured() {
         assert_eq!(back.channels, 2);
         assert!(back.frames() >= n, "flac -b {depth} lost frames");
         assert!(peak(&back.samples) > 0.01);
-        // Lossless: the decode must match the input within that depth's quantisation.
+        // Lossless: the decode must match the input within that depth's
+        // quantisation. flacenc truncates toward zero (up to one step) and the
+        // f32 decode adds up to half a step, so the bound is two steps.
         let step = 1.0f32 / (1u64 << (depth.parse::<u32>().unwrap() - 1)) as f32;
         let worst = src.samples[..n * src.channels]
             .iter()
@@ -676,8 +721,9 @@ fn cli_quality_options_are_honoured() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            worst <= step,
-            "flac -b {depth} is not lossless: worst error {worst:e} > step {step:e}"
+            worst <= 2.0 * step,
+            "flac -b {depth} is not lossless: worst error {worst:e} > bound {:e}",
+            2.0 * step
         );
         println!("flac -b {depth}: {size} bytes, worst error {worst:e}");
         flac_sizes.push((depth, size));
@@ -1118,36 +1164,39 @@ fn cli_output_format_follows_the_input() {
     let out = dir.join("song_td.flac");
     assert!(out.is_file(), "no .flac output was written");
     assert_eq!(
-        ffmpeg_info(&out).codec,
+        probe_info(&out).codec,
         "flac",
         "the output should have followed the input's format"
     );
 
-    // A format this crate cannot write falls back to WAV. `m4a`/AAC is exactly such
-    // an input: ffmpeg decodes it, but the CLI has no encoder for it, so the fixture
-    // has to be built with ffmpeg directly rather than through the CLI.
+    // A format this crate cannot write falls back to WAV. `m4a`/AAC is exactly
+    // such an input: the decoders take it, but the CLI has no encoder for it,
+    // so the fixture is built with oxiaudio's AAC encoder directly.
     let m4a = dir.join("song.m4a");
-    let st = Command::new(radius_rs::io::ffmpeg_program())
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(&flac)
-        .args(["-c:a", "aac"])
-        .arg(&m4a)
-        .status()
-        .expect("failed to spawn ffmpeg");
-    assert!(st.success(), "could not build the m4a fixture");
+    let buf = oxiaudio::AudioBuffer {
+        samples: a.samples,
+        sample_rate: a.rate,
+        channels: if a.channels == 1 {
+            oxiaudio::ChannelLayout::Mono
+        } else {
+            oxiaudio::ChannelLayout::Stereo
+        },
+        format: oxiaudio::SampleFormat::F32,
+    };
+    oxiaudio::encode_aac_to_file(&buf, &m4a).expect("could not build the m4a fixture");
     let (ok, stdout, err) = run_in(&dir, &["song.m4a", "-m", "td"]);
     assert!(ok, "unsupported-format-input run failed: {err}");
     assert!(
         stdout.contains("song_td.wav"),
         "an unwritable input format must fall back to wav: {stdout}"
     );
-    assert_eq!(ffmpeg_info(&dir.join("song_td.wav")).codec, "pcm_f32le");
+    assert_eq!(probe_info(&dir.join("song_td.wav")).codec, "wav");
 
     // --format outranks the input's format.
     let (ok, stdout, err) = run_in(&dir, &["song.flac", "-m", "td", "-s", "2", "--format", "mp3"]);
     assert!(ok, "override run failed: {err}");
     assert!(stdout.contains("song_td_st2.mp3"), "stdout: {stdout}");
-    assert_eq!(ffmpeg_info(&dir.join("song_td_st2.mp3")).codec, "mp3");
+    assert_eq!(probe_info(&dir.join("song_td_st2.mp3")).codec, "mp3");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

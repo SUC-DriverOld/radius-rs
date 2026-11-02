@@ -163,17 +163,11 @@ pub fn audition_reference_named(name: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Can we run the codec tests? (ffmpeg present and runnable.)
-pub fn ffmpeg_or_skip(test: &str) -> bool {
-    if radius_rs::io::ffmpeg_available() {
-        return true;
-    }
-    eprintln!(
-        "SKIP {test}: ffmpeg is not available (looked for {:?}; set RADIUS_FFMPEG to \
-         point at it). Codec cases need it; the engine tests do not.",
-        radius_rs::io::ffmpeg_program()
-    );
-    false
+/// Can we run the codec tests? Always yes now: reading and writing went
+/// pure-Rust (oxiaudio + rusty_mp3), so there is no external program to find.
+pub fn codecs_or_skip(test: &str) -> bool {
+    let _ = test;
+    true
 }
 
 /// Interleaved `f32` audio plus its format.
@@ -242,8 +236,8 @@ pub fn write_wav_with(
     radius_rs::io::write(path, &a, opts).unwrap_or_else(|e| panic!("{e}"));
 }
 
-/// What ffmpeg says is in a file: codec name, sample rate, channel count.
-pub fn ffmpeg_info(path: &Path) -> radius_rs::io::Info {
+/// What the crate's probe says is in a file: codec name, sample rate, channel count.
+pub fn probe_info(path: &Path) -> radius_rs::io::Info {
     radius_rs::io::info(path).unwrap_or_else(|e| panic!("{e}"))
 }
 

@@ -9,7 +9,8 @@
 //! * **crate** — [`TdState::render`] / [`vocoder::VocoderState::render`] plus the
 //!   lower level operator modules.
 //! * **CLI** — the `radius-rs` binary (feature `cli`) reads and writes
-//!   wav/flac/ogg/mp3/aac through pure-Rust codecs, no `ffmpeg`.
+//!   wav/flac/ogg/mp3 (and reads aac/m4a, aiff and more) through pure-Rust
+//!   codecs, no `ffmpeg`.
 //! * **C ABI** — [`ffi`], exported from `cdylib`/`staticlib` builds against
 //!   `include/radius_rs.h`.
 //!
@@ -40,8 +41,8 @@ pub mod vocoder;
 
 pub mod ffi;
 
-/// Audio input/output, entirely through ffmpeg. See the module docs for how the
-/// binary is located (`RADIUS_FFMPEG`, otherwise `PATH`).
+/// Audio input/output through pure-Rust codecs (oxiaudio, rusty_vorbis,
+/// rusty_mp3). See the module docs for the format matrix.
 pub mod io;
 /// Command line front-end (`radius`).
 pub mod cli;
