@@ -380,22 +380,90 @@ fn write_wav(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> 
         .map_err(|e| format!("{}: wav: {e}", path.display()))
 }
 
+/// Write FLAC through flacenc directly, with the configuration this crate
+/// measured against libFLAC.
+///
+/// Two things here were decided by measurement, not by defaults:
+///
+/// * **The float→int conversion scales by 2^(bits−1) and rounds
+///   half-to-even** (then clamps into the signed range). oxiaudio's
+///   `floor(s · (2^23−1))` truncation has two measured defects: the scale is
+///   not a power of two, so material already on an integer grid (16-bit
+///   sources) lands on ±8-unit jitter at 24-bit — incompressible noise that
+///   made a FLAC *larger* than the same PCM as WAV — and truncation biases
+///   every sample toward zero by up to a full step. With a power-of-two scale
+///   grid-aligned material stays on the grid (so 16-bit sources compress like
+///   16-bit even at 24-bit depth), and rounding halves the worst-case error.
+/// * **The encoder config** is block 8192, qlpc order 24 with direct-MSE
+///   estimation and one MAE refinement step (`flacenc`'s `experimental`
+///   feature). On the dense-mix reference that beats the crate default by
+///   ~10% at 24-bit and lands within a few percent of libFLAC −8 on ordinary
+///   material — and *smaller* than libFLAC at 16-bit and on quiet material;
+///   flacenc only loses (by ~30%) on broadband noise near −34 dBFS, a floor
+///   set by its Rice parameter cap of 14 (the spec allows 30 plus an escape
+///   code), which no config can lift. `OrderSel::BitCount` also looks better
+///   on paper but emits pathological frames at some block sizes (a
+///   reproducible 303 MB file from 8 s of audio), so it is not used.
+/// * **Grid detection** stands in for libFLAC's wasted-bits flag, which
+///   flacenc does not implement: when every sample of a 24-bit render already
+///   sits on the 16-bit grid (a 16-bit source), the file is written as 16-bit
+///   — decoding is bit-identical, and it is exactly what ffmpeg produces for
+///   16-bit input.
+///
+/// 16 stays 16; 24/32/32f all become 24-bit integer, the deepest subframe the
+/// format offers.
 fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> {
-    use oxiaudio::{FlacBitDepth, FlacConfig};
-    // Like the ffmpeg path before it: 16 stays 16; 24/32/32f all become
-    // 24-bit integer, the deepest format the encoder offers.
-    let bit_depth = if depth == BitDepth::I16 {
-        FlacBitDepth::I16
-    } else {
-        FlacBitDepth::I24
-    };
-    let config = FlacConfig {
-        compression: 5,
-        bit_depth,
-    };
-    let buf = to_oxi_buffer(audio)?;
-    oxiaudio::encode_flac_with_config(&buf, path, &config)
-        .map_err(|e| format!("{}: flac: {e}", path.display()))
+    use flacenc::bitsink::ByteSink;
+    use flacenc::component::BitRepr;
+    use flacenc::config;
+    use flacenc::error::Verify;
+    use flacenc::source::MemSource;
+
+    const BLOCK: usize = 8192;
+    let mut bits: u32 = if depth == BitDepth::I16 { 16 } else { 24 };
+    let scale = (1u64 << (bits - 1)) as f32;
+    let max = ((1u64 << (bits - 1)) - 1) as i32;
+    let min = -((1u64 << (bits - 1)) as i32);
+    let mut pcm: Vec<i32> = audio
+        .samples
+        .iter()
+        .map(|&s| (s * scale).round_ties_even() as i32)
+        .map(|v| v.clamp(min, max))
+        .collect();
+
+    // Grid detection, standing in for libFLAC's wasted-bits flag (flacenc has
+    // none): when every sample already sits on the 16-bit grid, a 16-bit
+    // stream decodes to exactly the same floats — and ffmpeg writes exactly
+    // that for a 16-bit source. Without this, the eight constant zero LSBs are
+    // coded into every residual, which flacenc's Rice cap (k ≤ 14) turns into
+    // *expansion*: a 16-bit WAV re-encoded as 24-bit FLAC came out larger than
+    // the WAV itself.
+    if bits == 24 && pcm.iter().all(|v| v & 0xFF == 0) {
+        bits = 16;
+        for v in &mut pcm {
+            *v >>= 8;
+        }
+    }
+
+    let src = MemSource::from_samples(&pcm, audio.channels, bits as usize, audio.sample_rate as usize);
+    let mut cfg = config::Encoder::default();
+    cfg.block_size = BLOCK;
+    cfg.subframe_coding.qlpc.lpc_order = 24;
+    cfg.subframe_coding.qlpc.use_direct_mse = true;
+    cfg.subframe_coding.qlpc.mae_optimization_steps = 1;
+    let cfg = cfg
+        .into_verified()
+        .map_err(|(_, e)| format!("{}: flac: {e}", path.display()))?;
+    let mut stream = flacenc::encode_with_fixed_block_size(&cfg, src, BLOCK)
+        .map_err(|e| format!("{}: flac: {e}", path.display()))?;
+    // flacenc reports the last (partial) block as min_block_size, which makes
+    // min != max; symphonia then rejects the frame sequencing. Pin both.
+    let _ = stream.stream_info_mut().set_block_sizes(BLOCK, BLOCK);
+    let mut sink = ByteSink::with_capacity(stream.count_bits());
+    stream
+        .write(&mut sink)
+        .map_err(|e| format!("{}: flac: {e}", path.display()))?;
+    std::fs::write(path, sink.as_slice()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Write Ogg/Vorbis through rusty_vorbis (the pure-Rust encoder), framed into
@@ -785,6 +853,36 @@ mod tests {
             assert_eq!(info(&p).unwrap().codec, "flac");
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    /// Material already on the 16-bit grid is written as 16-bit FLAC even at
+    /// the default depth: decoding is bit-identical, the size matches what
+    /// ffmpeg produces for a 16-bit source, and the alternative — coding
+    /// eight constant zero LSBs into every residual — made the file larger
+    /// than raw WAV.
+    #[test]
+    fn flac_grid_aligned_material_drops_to_16_bits() {
+        // A tone quantised to the 16-bit grid, like a decoded 16-bit WAV.
+        let q: Vec<f32> = tone(44_100, 2, 4_410)
+            .samples
+            .iter()
+            .map(|&s| (s * 32_768.0).round() / 32_768.0)
+            .collect();
+        let audio = Audio {
+            samples: q.clone(),
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let flac = dir().join("grid.flac");
+        write(&flac, &audio, WriteOptions::default()).unwrap();
+        let back = read(&flac).unwrap();
+        // Bit-exact: 16-bit FLAC decodes to k/32768, which is what we fed it.
+        assert_eq!(back.samples, q, "grid material must survive exactly");
+        // And compact: nothing near the 24-bit raw size it used to approach.
+        let size = std::fs::metadata(&flac).unwrap().len();
+        let raw24 = 4_410 * 2 * 3;
+        assert!(size < raw24 as u64 / 2, "{size} vs raw24 {raw24}");
+        let _ = std::fs::remove_file(&flac);
     }
 
     #[test]

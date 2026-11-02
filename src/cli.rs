@@ -285,9 +285,10 @@ pub struct Cli {
         long_help = "Ogg/Vorbis target bitrate in kbit/s: the encoder quality whose \
             *measured* average bitrate is closest is picked. Vorbis here is VBR with no \
             bitrate management — the pure-Rust encoder has no CBR mode — so the result is \
-            approximate: expect it within roughly ±10%% on typical material. Useful range \
-            about 30–500 kbit/s stereo (half that mono); the default 512 is the top of \
-            the measured curve, and requests outside the range clamp to its ends."
+            approximate, as with any VBR codec: near the request on the calibration \
+            material, but up to ±25%% or more elsewhere (entropy decides, not the knob). \
+            Useful range about 30–500 kbit/s stereo (half that mono); the default 512 is \
+            the top of the measured curve, and requests outside the range clamp to its ends."
     )]
     pub ogg_bitrate: u32,
 
