@@ -405,14 +405,15 @@ pub fn formant_shift_warning(cli: &Cli) -> Option<String> {
 
 /// A live progress line on stderr.
 ///
-/// It runs on a watchdog thread that polls a shared progress closure, so the
-/// renderer itself stays free of I/O. The closure reads an atomic counter that
-/// the renderer updates once per granule; the percentage is derived against an
-/// estimate, so the line is monotone and approximately right rather than exact.
+/// A watchdog polls a shared atomic counter, so the renderer stays free of I/O.
+/// TD counts granules against an estimate; VC counts final output frames.
+/// Live updates stay below 100% until output finalization succeeds.
 pub struct Progress {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     drawn: bool,
+    label: &'static str,
+    started: Instant,
 }
 
 /// A progress source shared between the renderer's thread and the watchdog.
@@ -455,11 +456,14 @@ impl Progress {
             .unwrap_or(false);
         let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let show = enabled && (tty || forced);
+        let started = Instant::now();
         if !show {
             return Self {
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 handle: None,
                 drawn: false,
+                label,
+                started,
             };
         }
         let plain = forced && !tty;
@@ -467,14 +471,20 @@ impl Progress {
         let stop2 = stop.clone();
         let handle = std::thread::spawn(move || {
             const WIDTH: usize = 28;
-            let start = Instant::now();
+            let start = started;
             while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(120));
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let done = counter.load(std::sync::atomic::Ordering::Relaxed);
                 let total = total.load(std::sync::atomic::Ordering::Relaxed).max(1);
-                let frac = (done as f64 / total as f64).clamp(0.0, 1.0);
+                // Only explicit successful completion may display 100%.
+                let frac = (done as f64 / total as f64).clamp(0.0, 0.999);
                 let elapsed = start.elapsed().as_secs_f64();
-                let eta = if frac > 0.02 {
+                let eta = if done >= total {
+                    "finalizing".to_string()
+                } else if frac > 0.02 {
                     format!("{:.1}s left", elapsed * (1.0 - frac) / frac)
                 } else {
                     "eta --".to_string()
@@ -505,6 +515,8 @@ impl Progress {
             stop,
             handle: Some(handle),
             drawn: true,
+            label,
+            started,
         }
     }
 
@@ -513,9 +525,25 @@ impl Progress {
         self.drawn
     }
 
-    /// Stop the watchdog and clear the line.
+    /// Rendering is done, but output validation and encoding still remain.
+    pub fn finish_render(&mut self) {
+        self.stop_now();
+        if self.drawn {
+            eprintln!("{}: render complete; finalizing output...", self.label.trim());
+        }
+    }
+
+    /// Report success only after all output work has completed.
     pub fn finish(mut self) {
         self.stop_now();
+        if self.drawn {
+            eprintln!(
+                "{} [{}] 100.0%  {:.1}s elapsed, completed",
+                self.label,
+                "=".repeat(28),
+                self.started.elapsed().as_secs_f64()
+            );
+        }
     }
 
     fn stop_now(&mut self) {

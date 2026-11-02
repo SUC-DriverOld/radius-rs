@@ -372,7 +372,7 @@ pub struct VocoderState {
     /// renderer runs on this thread. Written with `Relaxed` ordering only: a
     /// progress counter, not a synchronisation primitive.
     progress: ProgressCounter,
-    /// Input frames this render expects (set by [`VocoderState::render`]).
+    /// Final output frames this render expects (set by [`VocoderState::render_to`]).
     progress_total: i64,
     out_reported: i64,
     out_read_pos: i64,
@@ -1401,10 +1401,6 @@ impl VocoderState {
             self.cursor_1376 += self.sched_cdel;
             self.transient_flag_1208 = 0;
             self.out_total += self.sched_cdel;
-            self.progress.store(
-                self.out_total.max(0) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             self.sched_cdel = -1;
             return;
         }
@@ -1431,10 +1427,6 @@ impl VocoderState {
         self.prev_granule_1408 = v157;
         self.transient_flag_1208 = 0;
         self.out_total += v157 as i64;
-        self.progress.store(
-            self.out_total.max(0) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
 
     /// `process_granule` — schedule, warm-up g0..g7, 4-phase chain.
@@ -1770,6 +1762,10 @@ impl VocoderState {
                     profile_add(|p| &mut p.out_copy, t0);
                 }
                 out_n += chunk_n;
+                self.progress.store(
+                    out_n as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 drain_phase += chunk_n as f64 * ratio;
                 if out_n >= target {
                     break;
@@ -1789,7 +1785,7 @@ impl VocoderState {
         self.trace = on;
     }
 
-    /// Progress of the render in flight: `(output frames made, input frames)`.
+    /// Progress of the render in flight, measured in final output frames.
     ///
     /// The returned counter is shared with the state, so it can be polled from
     /// another thread while [`VocoderState::render`] runs.
