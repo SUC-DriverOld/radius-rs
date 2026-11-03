@@ -68,3 +68,10 @@ Everything detailed lives in [`docs/`](docs/):
 | [docs/DESIGN.md](docs/DESIGN.md) | self-containment, float discipline, and the deliberate behaviour differences |
 | [docs/FFT.md](docs/FFT.md) | the two FFT backends and the measured tradeoff between them |
 | [docs/TABLE_PROVENANCE.md](docs/TABLE_PROVENANCE.md) | where every compiled-in constant table comes from |
+
+## License
+
+Copyright (c) 2026 Sucial.
+
+Licensed under the GNU Lesser General Public License, version 3 or (at your option) any later version (`LGPL-3.0-or-later`).
+See [LICENSE](LICENSE) for LGPLv3 and [COPYING](COPYING) for the GPLv3 terms it incorporates.
