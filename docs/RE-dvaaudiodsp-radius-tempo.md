@@ -558,3 +558,28 @@ pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
 
 本节所有地址基于当前 IDB（RE 文档 §6–§8 同一构建）；pyradius 注释里的
 `@0x16D354` 等地址属于另一构建，不可混用。
+
+### 13.5 发射层架构（2026-11-03 深挖，sub_180149F80）
+
+瞬态重定时的**真实机制**：不是扭曲 pos/writepos，而是**逐粒 ratio 调制**。
+
+- `sub_180149F80`（0x117E 字节）每个通道一条发射循环（ch1 直取，ch2 经
+  a2+3664 的 DataTail 环），共享 a2+480 的**事件队列**（0x30 字节节点，
+  MemoryRecycler 回收）：节点 `[+32]` = 输入断点位置、`[+40]` = ratio
+  （int 位型）。
+- 循环体（L560-587 / L736-762）：
+  `emit(engine+8, state+352, ch, hop=[a2+592]+[a2+600], ring_off=pos mod hop,
+  out, out_off, n_out=(node_pos−acc)/ratio, ratio, ratio_d, 1)`；发射后
+  `[a2+408] = 下一节点[+40]` 换 ratio，节点回收。
+- 输入累计器（ch2 = [a2+792] double）按 `n_out×ratio` 前进；**调度表/环
+  偏移格子完全不动**（ring_off = pos mod hop）——ratio 断点在格子内改变
+  出步长。
+- hop = [592]+[600] 两段和（疑稳态 hop + settle/瞬态增量，写入点待查）。
+- 我们端口的等效实现路径（下一步）：机器计划窗 (in_hop H_j, out_step S_j)
+  ⇒ 有效 ratio_j = S_j/H_j，作为**发射级 ratio 断点**注入（不动表格子、
+  不动 pos），影响谱峰定位/相位推进/OAC 窗伸缩的 per-granule ratio 钩子。
+  现有 `ts_hop_override` 的 pos 扭曲方案已被此发现证伪（corr 崩 0.10 的
+  根因）。
+- x64dbg 脚本：`.tmp/x64dbg/`（call.py、dump_renderer.py、trace_emitter.py、
+  trace_granules.py）；IDA 侧 `.tmp/ida/decomp_to_file.py`（xrefs_to 用
+  `addrs=[...]`，decompile 用 `addr=...`）。
