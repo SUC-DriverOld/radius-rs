@@ -2,11 +2,8 @@
 //!
 //! # No third-party dev-dependencies
 //!
-//! WAV files are read and written through the crate's own
-//! [`radius_rs::io::wav`], so `cargo test` needs no extra crate. Codec cases
-//! (FLAC/Ogg/MP3) go through ffmpeg like the library does, and **skip** when ffmpeg is
-//! not available rather than failing: the engine tests are the point, the codec round
-//! trips are a bonus.
+//! Audio files use the crate's own [`radius_rs::io`] codecs. The default
+//! codec tests run without external programs or additional dev-dependencies.
 //!
 //! # Test audio is not shipped
 //!
@@ -164,7 +161,7 @@ pub fn audition_reference_named(name: &str) -> Option<PathBuf> {
 }
 
 /// Can we run the codec tests? Always yes now: reading and writing went
-/// pure-Rust (oxiaudio + rusty_mp3), so there is no external program to find.
+/// pure-Rust (Symphonia and the format-specific writers), so there is no external program to find.
 pub fn codecs_or_skip(test: &str) -> bool {
     let _ = test;
     true
@@ -202,19 +199,19 @@ impl From<radius_rs::io::Audio> for Wav {
     }
 }
 
-/// Read any audio file. Always through ffmpeg, like the library.
+/// Read any audio file through the library's selected backend.
 pub fn read_wav(path: &Path) -> Wav {
     read_audio(path)
 }
 
-/// Read any audio file through the crate's reader (which is ffmpeg).
+/// Read any audio file through the crate's reader.
 pub fn read_audio(path: &Path) -> Wav {
     radius_rs::io::read(path)
         .unwrap_or_else(|e| panic!("{e}"))
         .into()
 }
 
-/// Write 32-bit float WAV through ffmpeg.
+/// Write 32-bit float WAV through the crate's writer.
 pub fn write_wav(path: &Path, samples: &[f32], rate: u32, channels: usize) {
     write_wav_with(path, samples, rate, channels, Default::default())
 }
@@ -300,11 +297,7 @@ pub fn synthetic_stereo(rate: u32, frames: usize) -> Wav {
         let gap_end = gap_start + (rate as usize * 60 / 1000);
         let in_gap = i >= gap_start && i < gap_end;
 
-        let s = if in_gap {
-            0.0
-        } else {
-            (s * env * 0.55) as f32
-        };
+        let s = if in_gap { 0.0 } else { (s * env * 0.55) as f32 };
         samples.push(s);
         // small but non-zero channel difference so the stereo paths are live
         samples.push(if in_gap {

@@ -1,34 +1,27 @@
 //! Audio input and output through pure-Rust codecs, with an optional ffmpeg
 //! fallback behind an environment flag.
 //!
-//! The default pipeline runs entirely in-process, no external `ffmpeg`, no
-//! subprocesses: [`oxiaudio`] decodes every input this crate accepts (wav,
-//! flac, ogg/vorbis, mp3, aac/m4a, aiff, …) and encodes wav; [`flacenc`]
-//! encodes flac; [`rusty_vorbis`] (in the `ogg` container) and [`rusty_mp3`]
-//! encode the two lossy formats.
+//! The default pipeline runs entirely in-process. [`symphonia`] decodes
+//! WAV, FLAC, Ogg/Vorbis, MP3, AAC/M4A and AIFF; [`hound`] writes WAV;
+//! [`flacenc`] writes FLAC; [`rusty_vorbis`] plus [`ogg`] and [`rusty_mp3`]
+//! write the lossy formats.
 //!
-//! Setting `RADIUS_FFMPEG_IO` to a truthy value switches [`read`], [`write`]
-//! and [`info`] to the pre-pure-Rust pipeline: the `ffmpeg` binary decodes to
+//! Setting `RADIUS_FFMPEG_IO` to a truthy value switches [`read`](crate::io::read()), [`write`](crate::io::write())
+//! and [`info`](crate::io::info()) to the pre-pure-Rust pipeline: the `ffmpeg` binary decodes to
 //! raw `f32le` on a pipe and encodes from one. `RADIUS_FFMPEG` names the
-//! binary when it is not on `PATH`. See [`use_ffmpeg`].
+//! binary when it is not on `PATH`. See [`use_ffmpeg`](crate::io::use_ffmpeg()).
 //!
 //! # Division of labour (default pipeline)
 //!
-//! * **read** — [`oxiaudio::decode_file`], whole file, to interleaved `f32`.
-//! * **write** — per container:
-//!   * `wav`: hound via `oxiaudio`, depths 16/24/32-bit integer and 32-bit float.
-//!   * `flac`: flacenc directly, depths 16 and 24 (24/32/32f all land on
-//!     24-bit integer; see [`write_flac`] for the tuned configuration).
-//!   * `ogg`: [`rusty_vorbis`] wrapped in Ogg pages by the `ogg` crate —
-//!     `oxiaudio`'s own Vorbis encoder is broken (see [`write_ogg`]).
-//!   * `mp3`: [`rusty_mp3::Mp3Encoder`], constant bitrate, gapless LAME tag.
+//! * **read** — Symphonia, whole file, to interleaved `f32`.
+//! * **write** — hound (WAV: 16/24/32-bit integer or 32-bit float), flacenc
+//!   (FLAC: 16/24-bit integer), rusty_vorbis plus ogg, or rusty_mp3.
+//! * **info** — container and first audio-track headers, without decoding PCM.
 //!
 //! # Container and channel limits
 //!
-//! `oxiaudio` models channel layouts as a fixed set, so only 1, 2, 4, 6, 8 and
-//! 12 channels round-trip correctly; the Vorbis and MP3 encoders take 1 or 2.
-//! Anything else fails with an error that says so, rather than silently
-//! relabelling the audio.
+//! Channel counts are retained directly, including 3/5/7-channel inputs.
+//! FLAC supports 1–8 channels; the Vorbis and MP3 writers support 1 or 2.
 //!
 //! # Sample rate and channels are never resampled or remixed
 //!
@@ -38,7 +31,13 @@
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
-use oxiaudio::{AudioBuffer, ChannelLayout, SampleFormat};
+use symphonia::core::{
+    codecs::audio::AudioDecoderOptions,
+    errors::Error as DecodeError,
+    formats::{probe::Hint, FormatOptions, FormatReader, Track},
+    io::MediaSourceStream,
+    meta::MetadataOptions,
+};
 
 /// Interleaved `f32` audio plus its format.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +154,7 @@ impl Container {
     /// The ffmpeg encoder invocation for this container, from the *current*
     /// option set: `--ogg-bitrate` becomes libvorbis `-b:a`, `--mp3-bitrate`
     /// stays lame `-b:a`, integer depths pick the matching `pcm_*le` codec.
-    fn ffmpeg_encoder_args(self, opts: &WriteOptions) -> Vec<String> {
+    fn ffmpeg_encoder_args(self, opts: &WriteOptions, rate: u32, channels: usize) -> Vec<String> {
         let v = |s: &str| s.to_string();
         match self {
             Container::Wav => {
@@ -168,25 +167,12 @@ impl Container {
                 vec![v("-c:a"), v(codec)]
             }
             Container::Flac => match opts.depth {
-                // FLAC has no 32-bit integer subframe and cannot store float,
+                // This FLAC output path supports 16/24-bit integer PCM only,
                 // so 24/32/32f all become 24-bit, exactly like the Rust path.
                 BitDepth::I16 => vec![v("-c:a"), v("flac"), v("-sample_fmt"), v("s16")],
                 _ => vec![v("-c:a"), v("flac"), v("-sample_fmt"), v("s32")],
             },
-            Container::Ogg => {
-                // libvorbis's managed-ABR window (measured on this build:
-                // stereo 44.1 kHz accepts 45k..500k; beyond either end the
-                // encoder fails setup and ffmpeg writes nothing) — clamp the
-                // knob into it rather than fail. The default 500 is exactly
-                // the top of that window; only out-of-range requests move.
-                let kbps = opts.ogg_bitrate.clamp(45, 500);
-                vec![
-                    v("-c:a"),
-                    v("libvorbis"),
-                    v("-b:a"),
-                    format!("{kbps}k"),
-                ]
-            }
+            Container::Ogg => ffmpeg_vorbis_args(opts.ogg_bitrate, rate, channels),
             Container::Mp3 => vec![
                 v("-c:a"),
                 v("libmp3lame"),
@@ -195,6 +181,73 @@ impl Container {
             ],
         }
     }
+}
+
+/// libvorbis's managed bitrate limits depend on both sample rate and channel
+/// count. These per-channel bounds follow its lib/modes/setup_*.h templates;
+/// a stereo-only 45..500 kbit/s clamp cannot initialise mono or low-rate audio.
+fn ffmpeg_vorbis_args(kbps: u32, rate: u32, channels: usize) -> Vec<String> {
+    // (rate minimum, maximum, stereo min/max, uncoupled min/max), bits/s/ch.
+    const SETUPS: [(u32, u32, u32, u32, u32, u32); 6] = [
+        (8_000, 9_000, 6_000, 32_000, 8_000, 42_000),
+        (9_000, 15_000, 8_000, 44_000, 12_000, 50_000),
+        (15_000, 19_000, 12_000, 86_000, 16_000, 100_000),
+        (19_000, 26_000, 15_000, 86_000, 16_000, 90_000),
+        (26_000, 40_000, 18_000, 190_000, 30_000, 190_000),
+        (40_000, 50_000, 22_500, 250_000, 32_000, 240_000),
+    ];
+    let mut bounds: Option<(u32, u32)> = None;
+    for (low, high, stereo_min, stereo_max, uncoupled_min, uncoupled_max) in SETUPS {
+        if (low..=high).contains(&rate) {
+            let (min, max) = if channels == 2 {
+                (stereo_min.min(uncoupled_min), stereo_max.max(uncoupled_max))
+            } else {
+                (uncoupled_min, uncoupled_max)
+            };
+            bounds = Some(match bounds {
+                Some((lo, hi)) => (lo.min(min), hi.max(max)),
+                None => (min, max),
+            });
+        }
+    }
+    // libvorbis has a separate coupled 5.1 template, including rates >50 kHz.
+    if channels == 6 && (40_000..=70_000).contains(&rate) {
+        bounds = Some(match bounds {
+            Some((lo, hi)) => (lo.min(14_000), hi.max(240_000)),
+            None => (14_000, 240_000),
+        });
+    }
+    let target = u64::from(kbps.clamp(1, 500)) * 1000;
+    let mut args = vec!["-c:a".into(), "libvorbis".into()];
+    if let Some((min, max)) = bounds {
+        let bitrate = target.clamp(
+            u64::from(min) * channels as u64,
+            u64::from(max) * channels as u64,
+        );
+        args.extend(["-b:a".into(), format!("{}k", bitrate / 1000)]);
+    } else {
+        // The generic high/low-rate templates have no managed-bitrate modes.
+        // Use VBR there, interpolating the nominal 44.1 kHz quality curve.
+        let rates = if channels == 2 {
+            [
+                22.5, 32.0, 40.0, 48.0, 56.0, 64.0, 80.0, 96.0, 112.0, 128.0, 160.0, 250.0,
+            ]
+        } else {
+            [
+                32.0, 48.0, 60.0, 70.0, 80.0, 86.0, 96.0, 110.0, 120.0, 140.0, 160.0, 240.0,
+            ]
+        };
+        let per_channel =
+            (target as f64 / 1000.0 / channels.max(1) as f64).clamp(rates[0], rates[11]);
+        let index = rates
+            .windows(2)
+            .position(|p| per_channel <= p[1])
+            .unwrap_or(10);
+        let quality =
+            index as f64 - 1.0 + (per_channel - rates[index]) / (rates[index + 1] - rates[index]);
+        args.extend(["-q:a".into(), format!("{quality:.4}")]);
+    }
+    args
 }
 
 /// PCM bit depth to write, when the container is lossless.
@@ -251,8 +304,8 @@ impl Default for WriteOptions {
 
 /// Is the ffmpeg pipeline enabled?
 ///
-/// `RADIUS_FFMPEG_IO` selects the IO backend for [`read`], [`write`] and
-/// [`info`]: absent (or any value other than `1`/`true`/`yes`/`on`,
+/// `RADIUS_FFMPEG_IO` selects the IO backend for [`read`](crate::io::read()), [`write`](crate::io::write()) and
+/// [`info`](crate::io::info()): absent (or any value other than `1`/`true`/`yes`/`on`,
 /// case-insensitive) means the default pure-Rust codecs; a truthy value runs
 /// the `ffmpeg` binary instead, located through `RADIUS_FFMPEG` or `PATH`.
 /// The flag and the binary are separate knobs on purpose: the first chooses
@@ -326,24 +379,26 @@ fn run_ffmpeg(args: &[String], input: Option<&[u8]>) -> Result<Vec<u8>, String> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| not_runnable(&program, e))?;
+    let mut child = cmd.spawn().map_err(|e| not_runnable(&program, e))?;
 
     if let Some(bytes) = input {
         let mut stdin = child.stdin.take().expect("stdin was piped");
-        // Write from a thread: a single-threaded write-then-read deadlocks once
-        // the output pipe fills, which it does for any non-trivial file.
-        let owned = bytes.to_vec();
-        let writer = std::thread::spawn(move || stdin.write_all(&owned));
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("ffmpeg failed: {e}"))?;
-        let _ = writer.join();
-        if !out.status.success() {
-            return Err(describe_failure(&program, args, &out.stderr));
-        }
-        return Ok(out.stdout);
+        // Drain output concurrently with writing input to avoid pipe deadlocks.
+        // A scoped thread borrows PCM bytes instead of copying the whole render.
+        return std::thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(bytes));
+            let out = child
+                .wait_with_output()
+                .map_err(|e| format!("ffmpeg failed: {e}"))?;
+            let sent = writer
+                .join()
+                .map_err(|_| "ffmpeg input writer panicked".to_string())?;
+            if !out.status.success() {
+                return Err(describe_failure(&program, args, &out.stderr));
+            }
+            sent.map_err(|e| format!("ffmpeg did not consume the complete audio input: {e}"))?;
+            Ok(out.stdout)
+        });
     }
 
     let out = child
@@ -383,6 +438,10 @@ fn info_ffmpeg(path: &Path) -> Result<Info, String> {
         "-nostdin".to_string(),
         "-i".to_string(),
         path.to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:a:0".to_string(),
+        "-t".to_string(),
+        "0".to_string(),
         "-f".to_string(),
         "null".to_string(),
         "-".to_string(),
@@ -410,6 +469,9 @@ fn info_ffmpeg(path: &Path) -> Result<Info, String> {
             )
         })?
         .to_string();
+    if !out.status.success() {
+        return Err(describe_failure(&program, &args, &out.stderr));
+    }
     let (sample_rate, channels, codec) = parse_stream_line(&line).ok_or_else(|| {
         format!(
             "cannot read the stream description for {}:\n  {}",
@@ -478,10 +540,27 @@ fn parse_stream_line(line: &str) -> Option<(u32, usize, String)> {
 /// The digit before the dot is the number of full-band channels and the digit
 /// after it the LFE count, so `5.1` describes six streams.
 fn layout_channels(after: &str) -> Option<usize> {
-    let (head, tail) = after.split_once('.')?;
-    let head: usize = head.trim().parse().ok()?;
-    let lfe = tail.chars().next()?.to_digit(10)? as usize;
-    Some(head + lfe)
+    let name = after.split(',').next()?.trim();
+    match name {
+        "quad" | "quad(side)" => Some(4),
+        "hexagonal" => Some(6),
+        "octagonal" | "cube" => Some(8),
+        "hexadecagonal" => Some(16),
+        "downmix" => Some(2),
+        _ => {
+            // Sum all numeric components, including height channels in 7.1.4.
+            let numeric = name.split('(').next()?;
+            if !numeric.contains('.') {
+                return None;
+            }
+            numeric
+                .split('.')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .map(|parts| parts.into_iter().sum())
+        }
+    }
 }
 
 /// Read any audio file ffmpeg can decode, by piping raw `f32le` from it.
@@ -497,6 +576,8 @@ fn read_ffmpeg(path: &Path) -> Result<Audio, String> {
         "error".to_string(),
         "-i".to_string(),
         path.to_string_lossy().into_owned(),
+        "-map".to_string(),
+        "0:a:0".to_string(),
         "-f".to_string(),
         "f32le".to_string(),
         "-acodec".to_string(),
@@ -504,6 +585,12 @@ fn read_ffmpeg(path: &Path) -> Result<Audio, String> {
         "-".to_string(),
     ];
     let raw = run_ffmpeg(&args, None)?;
+    if raw.len() % 4 != 0 || raw.len() / 4 % info.channels != 0 {
+        return Err(format!(
+            "{}: ffmpeg returned incomplete audio frames",
+            path.display()
+        ));
+    }
     let samples = bytes_to_f32(&raw);
     if samples.is_empty() {
         return Err(format!("{}: decoded to nothing", path.display()));
@@ -539,7 +626,7 @@ fn write_ffmpeg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), S
         "-i".to_string(),
         "pipe:0".to_string(),
     ];
-    args.extend(container.ffmpeg_encoder_args(opts));
+    args.extend(container.ffmpeg_encoder_args(opts, audio.sample_rate, audio.channels));
     args.push("-f".to_string());
     args.push(container.muxer().to_string());
     args.push("-y".to_string());
@@ -595,73 +682,132 @@ pub struct Info {
     pub line: String,
 }
 
-/// What decodes to what, without touching the audio itself.
+/// Probe the first audio track's container, sample rate and channel count.
 ///
-/// The container comes from the file's magic number (cheap, no decode); the
-/// rate and channels come from decoding. Callers that only need [`Info::codec`]
-/// pay nothing beyond a 12-byte read through [`container_of`].
+/// This reads stream headers without decoding the complete signal.
 pub fn info(path: impl AsRef<Path>) -> Result<Info, String> {
     let path = path.as_ref();
     if use_ffmpeg() {
         return info_ffmpeg(path);
     }
-    let codec = container_of(path)?;
-    let buf = decode(path)?;
-    Ok(Info {
-        sample_rate: buf.sample_rate,
-        channels: buf.channels.channel_count(),
-        line: format!("{codec}, {} Hz, {} ch", buf.sample_rate, buf.channels),
-        codec,
-    })
+    let format = probe(path)?;
+    stream_info(format.as_ref(), path)
 }
 
-/// Container name from the file's magic number alone.
-fn container_of(path: &Path) -> Result<String, String> {
-    use oxiaudio::AudioFormatHint;
-    let hint = oxiaudio::detect_format_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let name = match hint {
-        AudioFormatHint::Wav => "wav",
-        AudioFormatHint::Flac => "flac",
-        AudioFormatHint::Ogg => "vorbis",
-        AudioFormatHint::Mp3 => "mp3",
-        AudioFormatHint::Aac => "aac",
-        AudioFormatHint::M4a => "aac",
-        AudioFormatHint::Aiff => "aiff",
-        AudioFormatHint::Au => "au",
-        AudioFormatHint::Musepack => "mpc",
-        AudioFormatHint::WavPack => "wavpack",
-    };
-    Ok(name.to_string())
+fn probe(path: &Path) -> Result<Box<dyn FormatReader>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+    symphonia::default::get_probe()
+        .probe(
+            &hint,
+            source,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn first_audio_track<'a>(format: &'a dyn FormatReader, path: &Path) -> Result<&'a Track, String> {
+    format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.as_ref().and_then(|p| p.audio()).is_some())
+        .ok_or_else(|| format!("{}: no audio track", path.display()))
+}
+
+fn stream_info(format: &dyn FormatReader, path: &Path) -> Result<Info, String> {
+    let track = first_audio_track(format, path)?;
+    let params = track.codec_params.as_ref().and_then(|p| p.audio()).unwrap();
+    let sample_rate = params
+        .sample_rate
+        .filter(|&r| r > 0)
+        .ok_or_else(|| format!("{}: missing audio sample rate", path.display()))?;
+    let channels = params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .filter(|&c| c > 0)
+        .ok_or_else(|| format!("{}: missing audio channel count", path.display()))?;
+    let codec = match format.format_info().short_name {
+        "wave" => "wav",
+        "ogg" => "vorbis",
+        "isomp4" => "aac",
+        other => other,
+    }
+    .to_string();
+    Ok(Info {
+        sample_rate,
+        channels,
+        line: format!("{codec}, {sample_rate} Hz, {channels} ch"),
+        codec,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // reading
 // ---------------------------------------------------------------------------
 
-/// Decode any audio file oxiaudio supports to interleaved `f32`.
-fn decode(path: &Path) -> Result<AudioBuffer<f32>, String> {
-    let buf = oxiaudio::decode_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ch = buf.channels.channel_count();
-    if ch == 0 || buf.samples.is_empty() {
+/// Decode directly through Symphonia, retaining the actual channel count.
+fn decode(path: &Path) -> Result<Audio, String> {
+    let mut format = probe(path)?;
+    let info = stream_info(format.as_ref(), path)?;
+    let track = first_audio_track(format.as_ref(), path)?;
+    let track_id = track.id;
+    let params = track.codec_params.as_ref().and_then(|p| p.audio()).unwrap();
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut samples = Vec::new();
+    let mut packet_samples = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(DecodeError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                if decoded.spec().rate() != info.sample_rate
+                    || decoded.spec().channels().count() != info.channels
+                {
+                    return Err(format!(
+                        "{}: audio format changed while decoding",
+                        path.display()
+                    ));
+                }
+                decoded.copy_to_vec_interleaved::<f32>(&mut packet_samples);
+                samples.extend_from_slice(&packet_samples);
+            }
+            Err(DecodeError::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    if samples.is_empty() {
         return Err(format!("{}: decoded to nothing", path.display()));
     }
-    // A buffer whose length does not divide by its channel count cannot be
-    // framed; a decoder that mislabelled the channel count shows up here.
-    if buf.samples.len() % ch != 0 {
+    if samples.len() % info.channels != 0 {
         return Err(format!(
-            "{}: {} samples do not divide into {} channels; the file's channel count \
-             is outside the 1/2/4/6/8/12 layouts oxiaudio models",
-            path.display(),
-            buf.samples.len(),
-            ch
+            "{}: decoded samples do not form whole frames",
+            path.display()
         ));
     }
-    Ok(buf)
+    Ok(Audio {
+        samples,
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+    })
 }
 
-/// Read any audio file oxiaudio can decode (wav, flac, ogg/vorbis, mp3,
-/// aac/m4a, aiff, au, musepack, wavpack) to interleaved `f32` — or anything
-/// ffmpeg can decode when [`RADIUS_FFMPEG_IO`](use_ffmpeg) is set.
+/// Read WAV, FLAC, Ogg/Vorbis, MP3, AAC/ADTS, M4A or AIFF as interleaved
+/// `f32`, or anything ffmpeg supports when [`use_ffmpeg`](crate::io::use_ffmpeg()) is enabled.
 pub fn read(path: impl AsRef<Path>) -> Result<Audio, String> {
     let path = path.as_ref();
     if !path.exists() {
@@ -670,52 +816,23 @@ pub fn read(path: impl AsRef<Path>) -> Result<Audio, String> {
     if use_ffmpeg() {
         return read_ffmpeg(path);
     }
-    let buf = decode(path)?;
-    Ok(Audio {
-        samples: buf.samples,
-        sample_rate: buf.sample_rate,
-        channels: buf.channels.channel_count(),
-    })
+    decode(path)
 }
 
 // ---------------------------------------------------------------------------
 // writing
 // ---------------------------------------------------------------------------
 
-/// Build the interleaved-f32 buffer the oxiaudio encoders take.
-///
-/// Fails for channel counts outside the 1/2/4/6/8/12 layouts oxiaudio models
-/// rather than letting them be relabelled as stereo.
-fn to_oxi_buffer(audio: &Audio) -> Result<AudioBuffer<f32>, String> {
-    let layout = match audio.channels {
-        1 => ChannelLayout::Mono,
-        2 => ChannelLayout::Stereo,
-        4 => ChannelLayout::Quad,
-        6 => ChannelLayout::Surround51,
-        8 => ChannelLayout::Surround71,
-        12 => ChannelLayout::Atmos714,
-        other => {
-            return Err(format!(
-                "{other} channels: the pure-Rust codecs model 1/2/4/6/8/12 only"
-            ))
-        }
-    };
-    Ok(AudioBuffer {
-        samples: audio.samples.clone(),
-        sample_rate: audio.sample_rate,
-        channels: layout,
-        format: SampleFormat::F32,
-    })
-}
-
 /// The nine sample rates MP3 (MPEG-1/2/2.5 Layer III) can carry.
-const MP3_RATES: [u32; 9] = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000];
+const MP3_RATES: [u32; 9] = [
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
 
 /// Write audio to a container, entirely in-process — or through ffmpeg when
 /// [`RADIUS_FFMPEG_IO`](use_ffmpeg) is set.
 ///
 /// The sample rate and channel count are passed through unchanged, and the
-/// written file is decoded back to verify them.
+/// written file is probed to verify them.
 pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Result<(), String> {
     let path = path.as_ref();
     let container = match opts.container {
@@ -728,6 +845,15 @@ pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Resul
     if audio.samples.is_empty() {
         return Err("cannot write an empty signal".into());
     }
+    if audio.sample_rate == 0 {
+        return Err("cannot write audio with zero sample rate".into());
+    }
+    if audio.samples.len() % audio.channels != 0 {
+        return Err("audio samples must form whole frames".into());
+    }
+    if audio.channels > u16::MAX as usize {
+        return Err("audio channel count exceeds 65535".into());
+    }
     if use_ffmpeg() {
         // ffmpeg's encoders take whatever channel count their codecs support,
         // and its own error reports the ones that do not.
@@ -738,7 +864,11 @@ pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Resul
             return Err(format!(
                 "{}: the {} encoder takes 1 or 2 channels, not {}",
                 path.display(),
-                if container == Container::Ogg { "Vorbis" } else { "MP3" },
+                if container == Container::Ogg {
+                    "Vorbis"
+                } else {
+                    "MP3"
+                },
                 audio.channels
             ));
         }
@@ -755,7 +885,10 @@ pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Resul
         .map_err(|e| format!("{}: {e}", path.display()))?
         .len();
     if written == 0 {
-        return Err(format!("{}: the encoder produced an empty file", path.display()));
+        return Err(format!(
+            "{}: the encoder produced an empty file",
+            path.display()
+        ));
     }
     // Verify rather than assume: the rate and channel count must be what was
     // asked for, otherwise every caller's "input and output agree" contract is
@@ -774,17 +907,52 @@ pub fn write(path: impl AsRef<Path>, audio: &Audio, opts: WriteOptions) -> Resul
     Ok(())
 }
 
+/// Convert against a power-of-two PCM grid and round once, including 32-bit
+/// PCM where `i32::MAX as f32` would round up beyond the signed range.
+fn quantise_pcm(sample: f32, bits: u32) -> i32 {
+    let scale = (1u64 << (bits - 1)) as f64;
+    (sample as f64 * scale)
+        .round_ties_even()
+        .clamp(-scale, scale - 1.0) as i32
+}
+
 fn write_wav(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> {
-    use oxiaudio::WavBitDepth;
-    let depth = match depth {
-        BitDepth::I16 => WavBitDepth::I16,
-        BitDepth::I24 => WavBitDepth::I24,
-        BitDepth::I32 => WavBitDepth::I32,
-        BitDepth::F32 => WavBitDepth::F32,
+    let bits = match depth {
+        BitDepth::I16 => 16,
+        BitDepth::I24 => 24,
+        BitDepth::I32 | BitDepth::F32 => 32,
     };
-    let buf = to_oxi_buffer(audio)?;
-    oxiaudio::encode_wav_with_config(&buf, path, depth)
-        .map_err(|e| format!("{}: wav: {e}", path.display()))
+    let bytes_per_frame = audio
+        .channels
+        .checked_mul(bits as usize / 8)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| format!("{}: wav: frame size exceeds the WAV limit", path.display()))?;
+    audio
+        .sample_rate
+        .checked_mul(u32::from(bytes_per_frame))
+        .ok_or_else(|| format!("{}: wav: byte rate exceeds the WAV limit", path.display()))?;
+    let spec = hound::WavSpec {
+        channels: audio.channels as u16,
+        sample_rate: audio.sample_rate,
+        bits_per_sample: bits,
+        sample_format: if depth.is_float() {
+            hound::SampleFormat::Float
+        } else {
+            hound::SampleFormat::Int
+        },
+    };
+    let encode = || -> Result<(), hound::Error> {
+        let mut writer = hound::WavWriter::create(path, spec)?;
+        for &sample in &audio.samples {
+            if depth.is_float() {
+                writer.write_sample(sample)?;
+            } else {
+                writer.write_sample(quantise_pcm(sample, u32::from(bits)))?;
+            }
+        }
+        writer.finalize()
+    };
+    encode().map_err(|e| format!("{}: wav: {e}", path.display()))
 }
 
 /// Write FLAC through flacenc directly, with the configuration this crate
@@ -817,8 +985,8 @@ fn write_wav(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> 
 ///   — decoding is bit-identical, and it is exactly what ffmpeg produces for
 ///   16-bit input.
 ///
-/// 16 stays 16; 24/32/32f all become 24-bit integer, the deepest subframe the
-/// format offers.
+/// 16 stays 16; 24/32/32f all become 24-bit integer, the deepest sample
+/// depth supported by this output path.
 fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> {
     use flacenc::bitsink::ByteSink;
     use flacenc::component::BitRepr;
@@ -852,7 +1020,12 @@ fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String>
         }
     }
 
-    let src = MemSource::from_samples(&pcm, audio.channels, bits as usize, audio.sample_rate as usize);
+    let src = MemSource::from_samples(
+        &pcm,
+        audio.channels,
+        bits as usize,
+        audio.sample_rate as usize,
+    );
     let mut cfg = config::Encoder::default();
     cfg.block_size = BLOCK;
     cfg.subframe_coding.qlpc.lpc_order = 24;
@@ -938,7 +1111,7 @@ fn write_ogg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), Stri
         quality: q,
         // The crate documents this as informational (it never steers rate
         // control); it travels in the header as the profile's nominal rate.
-        bitrate_bps: (opts.ogg_bitrate * 1000) as i32,
+        bitrate_bps: (opts.ogg_bitrate.clamp(1, 500) * 1000) as i32,
     });
     enc.push_pcm_f32(&fed, ch as u16, audio.sample_rate)
         .map_err(|e| format!("{}: ogg/vorbis: {e}", path.display()))?;
@@ -958,7 +1131,18 @@ fn write_ogg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), Stri
     let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut wtr = PacketWriter::new(std::io::BufWriter::new(file));
     let serial = 0x7261_6473; // "rads"
-    for (n, pkt) in packets.into_iter().enumerate() {
+    for (n, mut pkt) in packets.into_iter().enumerate() {
+        if n == 0 {
+            // rusty_vorbis emits a fixed 128k nominal header despite its config.
+            // Replace only the identification header, retaining its block sizes.
+            pkt.data = rusty_vorbis::write_ident_header(
+                ch as u8,
+                audio.sample_rate,
+                rusty_vorbis::BS0_LOG2,
+                rusty_vorbis::BS1_LOG2,
+                (opts.ogg_bitrate.clamp(1, 500) * 1000) as i32,
+            );
+        }
         // Page shape, following libvorbis: the three headers each end their
         // own page; the FIRST audio packet also ends its own page, whose
         // granule (the packet's pts) tells decoders how much of the first
@@ -981,7 +1165,9 @@ fn write_ogg(path: &Path, audio: &Audio, opts: &WriteOptions) -> Result<(), Stri
         wtr.write_packet(pkt.data, serial, info, granule)
             .map_err(|e| format!("{}: ogg: {e}", path.display()))?;
     }
-    Ok(())
+    wtr.into_inner()
+        .flush()
+        .map_err(|e| format!("{}: ogg: {e}", path.display()))
 }
 
 fn write_mp3(path: &Path, audio: &Audio, kbps: u16) -> Result<(), String> {
@@ -1190,6 +1376,18 @@ mod tests {
             parse_stream_line(five),
             Some((48_000, 5, "flac".to_string()))
         );
+        for (layout, channels) in [
+            ("quad", 4),
+            ("hexagonal", 6),
+            ("7.1.4", 12),
+            ("hexadecagonal", 16),
+        ] {
+            let line = format!("Stream #0:0: Audio: pcm_f32le, 44100 Hz, {layout}, flt");
+            assert_eq!(
+                parse_stream_line(&line),
+                Some((44_100, channels, "pcm_f32le".into()))
+            );
+        }
         assert_eq!(
             parse_stream_line("  Stream #0:0: Video: h264, 1280x720"),
             None
@@ -1212,39 +1410,51 @@ mod tests {
         // Ogg takes the bitrate knob, as kilobits for libvorbis -b:a, clamped
         // into the window ffmpeg's libvorbis actually accepts.
         assert_eq!(
-            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
-                ogg_bitrate: 256,
-                ..base.clone()
-            }),
+            Container::Ogg.ffmpeg_encoder_args(
+                &WriteOptions {
+                    ogg_bitrate: 256,
+                    ..base.clone()
+                },
+                44_100,
+                2
+            ),
             ["-c:a", "libvorbis", "-b:a", "256k"]
         );
         assert_eq!(
-            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
-                ogg_bitrate: 512,
-                ..base.clone()
-            }),
+            Container::Ogg.ffmpeg_encoder_args(
+                &WriteOptions {
+                    ogg_bitrate: 512,
+                    ..base.clone()
+                },
+                44_100,
+                2
+            ),
             ["-c:a", "libvorbis", "-b:a", "500k"]
         );
         assert_eq!(
-            Container::Ogg.ffmpeg_encoder_args(&WriteOptions {
-                ogg_bitrate: 32,
-                ..base.clone()
-            }),
+            Container::Ogg.ffmpeg_encoder_args(
+                &WriteOptions {
+                    ogg_bitrate: 32,
+                    ..base.clone()
+                },
+                44_100,
+                2
+            ),
             ["-c:a", "libvorbis", "-b:a", "45k"]
         );
         // MP3 stays constant-bitrate lame.
         assert_eq!(
-            Container::Mp3.ffmpeg_encoder_args(&base),
+            Container::Mp3.ffmpeg_encoder_args(&base, 44_100, 2),
             ["-c:a", "libmp3lame", "-b:a", "320k"]
         );
         // Every WAV depth has its own pcm codec, including 32-bit integer.
         assert_eq!(
-            Container::Wav.ffmpeg_encoder_args(&base),
+            Container::Wav.ffmpeg_encoder_args(&base, 44_100, 2),
             ["-c:a", "pcm_f32le"]
         );
         // FLAC: 16 is s16, everything deeper is 24-in-s32.
         assert_eq!(
-            Container::Flac.ffmpeg_encoder_args(&base),
+            Container::Flac.ffmpeg_encoder_args(&base, 44_100, 2),
             ["-c:a", "flac", "-sample_fmt", "s32"]
         );
     }
@@ -1384,7 +1594,11 @@ mod tests {
         assert_eq!(info(&p).unwrap().codec, "vorbis");
         // The muxing contract: the decoded length is the input length exactly
         // (lead hop skipped, tail pad trimmed by the final granule).
-        assert_eq!(back.frames(), audio.frames(), "ogg must be sample-exact in length");
+        assert_eq!(
+            back.frames(),
+            audio.frames(),
+            "ogg must be sample-exact in length"
+        );
         // Lossy, but this tame a tone must come back close, with no lag.
         // (The encoder's own floor reconstruction puts ~0.09 of noise on a
         // pure sine; the head blend contributes about as much.)
@@ -1456,7 +1670,8 @@ mod tests {
                 },
             )
             .unwrap();
-            let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0 / 1000.0
+            let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0
+                / 1000.0
                 / (audio.frames() as f64 / audio.sample_rate as f64);
             assert!(
                 ((got - kbps as f64).abs() / kbps as f64) < 0.35,
@@ -1474,7 +1689,8 @@ mod tests {
         let audio = dense_mix(44_100, 44_100 * 4);
         let p = dir().join("default.ogg");
         write(&p, &audio, WriteOptions::default()).unwrap();
-        let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0 / 1000.0
+        let got = std::fs::metadata(&p).unwrap().len() as f64 * 8.0
+            / 1000.0
             / (audio.frames() as f64 / audio.sample_rate as f64);
         assert!(
             (460.0..=540.0).contains(&got),
@@ -1522,12 +1738,162 @@ mod tests {
 
     #[test]
     fn five_channels_wav_round_trips_but_oggs_fail_clearly() {
-        // 5 channels: outside the layouts oxiaudio models, so writing must say
-        // so rather than mislabel the stream as stereo.
         let audio = tone(44_100, 5, 100);
         let p = dir().join("five.wav");
+        write(&p, &audio, WriteOptions::default()).unwrap();
+        assert_eq!(read(&p).unwrap(), audio);
+        std::fs::remove_file(p).unwrap();
+        let p = dir().join("five.ogg");
         let err = write(&p, &audio, WriteOptions::default()).unwrap_err();
-        assert!(err.contains("1/2/4/6/8/12"), "{err}");
+        assert!(err.contains("1 or 2 channels"), "{err}");
+    }
+
+    #[test]
+    fn nonstandard_input_channel_counts_preserve_frames_and_samples() {
+        for channels in [3, 5, 7] {
+            let p = dir().join(format!("input_{channels}ch.wav"));
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: 44_100,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&p, spec).unwrap();
+            for sample in 0..channels * 100 {
+                writer.write_sample(sample as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+            let back = read(&p).unwrap();
+            assert_eq!(back.channels, channels as usize);
+            assert_eq!(back.frames(), 100);
+            let expected: Vec<f32> = (0..channels * 100).map(|v| v as f32 / 32768.0).collect();
+            assert_eq!(back.samples, expected);
+            assert_eq!(info(&p).unwrap().channels, channels as usize);
+            let flac = dir().join(format!("input_{channels}ch.flac"));
+            write(&flac, &back, WriteOptions::default()).unwrap();
+            assert_eq!(read(&flac).unwrap(), back);
+            std::fs::remove_file(flac).unwrap();
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn multichannel_wav_honours_integer_depths() {
+        for channels in [4, 6, 8, 12] {
+            for (depth, bits) in [
+                (BitDepth::I16, 16),
+                (BitDepth::I24, 24),
+                (BitDepth::I32, 32),
+            ] {
+                let p = dir().join(format!("depth_{channels}ch_{bits}.wav"));
+                write(
+                    &p,
+                    &tone(44_100, channels, 100),
+                    WriteOptions {
+                        depth,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let spec = hound::WavReader::open(&p).unwrap().spec();
+                assert_eq!(spec.bits_per_sample, bits, "{channels}ch {depth:?}");
+                assert_eq!(
+                    spec.sample_format,
+                    hound::SampleFormat::Int,
+                    "{channels}ch {depth:?}"
+                );
+                std::fs::remove_file(p).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn integer_wav_preserves_samples_already_on_the_pcm_grid() {
+        let samples = [-32768, -16384, -1, 0, 1, 16384, 32767]
+            .into_iter()
+            .map(|v| v as f32 / 32768.0)
+            .collect();
+        let audio = Audio {
+            samples,
+            sample_rate: 44_100,
+            channels: 1,
+        };
+        for depth in [BitDepth::I16, BitDepth::I24, BitDepth::I32] {
+            let p = dir().join(format!("pcm_grid_{depth:?}.wav"));
+            write(
+                &p,
+                &audio,
+                WriteOptions {
+                    depth,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(read(&p).unwrap().samples, audio.samples, "{depth:?}");
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn incomplete_frames_are_rejected_before_creating_output() {
+        let audio = Audio {
+            samples: vec![0.1; 5],
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        for container in [
+            Container::Wav,
+            Container::Flac,
+            Container::Ogg,
+            Container::Mp3,
+        ] {
+            let p = dir().join(format!("incomplete_frame.{}", container.extension()));
+            let _ = std::fs::remove_file(&p);
+            let err = write(&p, &audio, WriteOptions::default()).unwrap_err();
+            assert!(err.contains("whole frames"), "{container:?}: {err}");
+            assert!(!p.exists(), "{container:?} created an invalid output");
+        }
+    }
+
+    #[test]
+    fn zero_sample_rate_is_rejected_before_creating_output() {
+        let audio = Audio {
+            samples: vec![0.1; 10],
+            sample_rate: 0,
+            channels: 1,
+        };
+        for container in [
+            Container::Wav,
+            Container::Flac,
+            Container::Ogg,
+            Container::Mp3,
+        ] {
+            let p = dir().join(format!("zero_rate.{}", container.extension()));
+            let _ = std::fs::remove_file(&p);
+            let err = write(&p, &audio, WriteOptions::default()).unwrap_err();
+            assert!(err.contains("sample rate"), "{container:?}: {err}");
+            assert!(!p.exists(), "{container:?} created an invalid output");
+        }
+    }
+
+    #[test]
+    fn ogg_extreme_bitrate_clamps_the_nominal_header() {
+        let p = dir().join("extreme_bitrate.ogg");
+        write(
+            &p,
+            &tone(44_100, 2, 100),
+            WriteOptions {
+                ogg_bitrate: u32::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut reader = ogg::PacketReader::new(std::fs::File::open(&p).unwrap());
+        let header = reader.read_packet_expected().unwrap();
+        let nominal = i32::from_le_bytes(header.data[20..24].try_into().unwrap());
+        assert_eq!(nominal, 500_000);
+        drop(reader);
+        std::fs::remove_file(p).unwrap();
     }
 
     #[test]
@@ -1544,7 +1910,10 @@ mod tests {
             assert!(pair[1].1 > pair[0].1, "not monotone at q {}", pair[0].0);
         }
         // Mono at 64k ≈ stereo at 128k.
-        let (m, s) = (vorbis_quality_for_bitrate(64, 1), vorbis_quality_for_bitrate(128, 2));
+        let (m, s) = (
+            vorbis_quality_for_bitrate(64, 1),
+            vorbis_quality_for_bitrate(128, 2),
+        );
         assert!((m - s).abs() < 0.15, "mono 64k {m} vs stereo 128k {s}");
     }
 }

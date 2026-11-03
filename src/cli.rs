@@ -1,16 +1,15 @@
 //! Command line front-end for the TD and vocoder engines.
 //!
-//! Format support is delegated to [`crate::io`]: decoding is [`oxiaudio`]
-//! (wav, flac, ogg/vorbis, mp3, aac/m4a, aiff, …), encoding is oxiaudio
-//! (wav, flac, ogg/vorbis) plus [`rusty_mp3`] (mp3) — all pure Rust, so no
-//! external `ffmpeg` is required.
+//! Format support is delegated to [`crate::io`]: Symphonia decodes,
+//! hound writes WAV, flacenc writes FLAC, and rusty_vorbis/rusty_mp3 write
+//! lossy audio. All run in-process unless `RADIUS_FFMPEG_IO` is enabled.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::fft::Backend;
 use crate::io::{BitDepth, Container, WriteOptions};
 use clap::{Parser, ValueEnum};
-use crate::fft::Backend;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum FftBackend {
@@ -75,7 +74,8 @@ pub struct Cli {
         value_name = "INPUT",
         help = "Input audio file.",
         long_help = "Input audio file: any container the pure-Rust decoders take (wav, \
-            flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack). \
+            flac, ogg/vorbis, mp3, aac/adts, m4a, aiff). \
+            Set RADIUS_FFMPEG_IO=1 for additional formats supported by ffmpeg. \
             Its sample rate and channel count are used as-is and written unchanged to the \
             output. There is deliberately no rate option, so input and output always agree."
     )]
@@ -271,7 +271,7 @@ pub struct Cli {
         long_help = "Sample depth for wav and flac. \
             32f (default) is IEEE float, which is what both engines natively produce, so \
             nothing is quantised on the way out. 16, 24 and 32 are integer PCM. \
-            flac stores 32 and 32f as 24 bit, the deepest subframe the format has. \
+            flac stores 32 and 32f as 24 bit, the deepest depth this writer supports. \
             Integer and lossy targets clamp, so a render that exceeds full scale is reported \
             rather than silently wrapped. See the clipping section of docs/CLI.md."
     )]
@@ -286,7 +286,7 @@ pub struct Cli {
             *measured* average bitrate is closest is picked. Vorbis here is VBR with no \
             bitrate management — the pure-Rust encoder has no CBR mode — so the result is \
             approximate, as with any VBR codec: near the request on the calibration \
-            material, but up to ±25%% or more elsewhere (entropy decides, not the knob). \
+            material, but up to ±25% or more elsewhere (entropy decides, not the knob). \
             Useful range about 30–500 kbit/s stereo (half that mono); the default \
             500 is the ceiling of the measured curve, and requests outside the \
             range clamp to its ends."
@@ -534,7 +534,10 @@ impl Progress {
     pub fn finish_render(&mut self) {
         self.stop_now();
         if self.drawn {
-            eprintln!("{}: render complete; finalizing output...", self.label.trim());
+            eprintln!(
+                "{}: render complete; finalizing output...",
+                self.label.trim()
+            );
         }
     }
 

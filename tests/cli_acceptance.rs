@@ -2,7 +2,7 @@
 //!
 //! These drive the release binary the way a user does: build an input, render it, and
 //! read the result back. Every container the CLI writes is decoded again through the
-//! CLI's own reader, so the check uses ffmpeg exactly the way the library does.
+//! CLI's own reader. Additional backend tests use ffmpeg when available.
 
 mod common;
 
@@ -41,26 +41,20 @@ fn run_with_progress(args: &[&str]) -> (bool, String, String) {
     )
 }
 
-/// Are the codec cases runnable? With ffmpeg doing the encoding there is nothing left
-/// to feature-gate, only a run time capability to check; without it those cases skip.
+/// The default codec cases need no external programs.
 fn codec_available(_what: &str) -> bool {
     codecs_or_skip("the container round trips")
 }
 
 /// Scratch path for this test.
 ///
-/// Unique per *call*, because cargo runs tests in parallel and writing now goes through
-/// an ffmpeg subprocess, so two tests sharing a fixed name can genuinely overlap. Each
-/// test therefore keeps its own paths in local variables, as below.
+/// Unique per call, so concurrent tests never write to the same file.
 fn tmp(name: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join("radius_rs_cli_tests");
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join(format!(
-        "{:03}_{name}",
-        N.fetch_add(1, Ordering::Relaxed)
-    ))
+    dir.join(format!("{:03}_{name}", N.fetch_add(1, Ordering::Relaxed)))
 }
 
 /// A slice of the synthetic programme with a chosen peak.
@@ -97,7 +91,12 @@ fn one_second_slice() -> std::path::PathBuf {
     let src = read_audio(&input_wav());
     let n = src.rate as usize;
     let path = tmp("slice.wav");
-    write_wav(&path, &src.samples[..n * src.channels], src.rate, src.channels);
+    write_wav(
+        &path,
+        &src.samples[..n * src.channels],
+        src.rate,
+        src.channels,
+    );
     path
 }
 
@@ -121,10 +120,18 @@ fn cli_progress_bar_is_reported_and_suppressible() {
         stderr.contains("td  [") && stderr.contains('%') && stderr.contains("elapsed"),
         "progress bar missing from stderr:\n{stderr}"
     );
-    assert!(stderr.contains("render complete; finalizing output"), "{stderr}");
+    assert!(
+        stderr.contains("render complete; finalizing output"),
+        "{stderr}"
+    );
     let percentages: Vec<_> = stderr.lines().filter(|line| line.contains('%')).collect();
     assert!(percentages.last().unwrap().contains("100.0%"), "{stderr}");
-    assert!(percentages[..percentages.len() - 1].iter().all(|line| !line.contains("100.0%")), "{stderr}");
+    assert!(
+        percentages[..percentages.len() - 1]
+            .iter()
+            .all(|line| !line.contains("100.0%")),
+        "{stderr}"
+    );
     // the bar is a status line, not part of the machine-readable result
     assert!(
         !stdout.contains("elapsed,"),
@@ -171,11 +178,22 @@ fn cli_progress_does_not_report_success_when_output_writing_fails() {
     let missing_parent = tmp("missing-parent");
     let output = missing_parent.join("output.wav");
     let (ok, _, stderr) = run_with_progress(&[
-        input.to_str().unwrap(), output.to_str().unwrap(), "-m", "td", "-s", "3",
+        input.to_str().unwrap(),
+        output.to_str().unwrap(),
+        "-m",
+        "td",
+        "-s",
+        "3",
     ]);
     assert!(!ok, "Writing to a missing directory unexpectedly succeeded");
-    assert!(stderr.contains("render complete; finalizing output"), "{stderr}");
-    assert!(!stderr.contains("100.0%"), "Failed output was reported complete: {stderr}");
+    assert!(
+        stderr.contains("render complete; finalizing output"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("100.0%"),
+        "Failed output was reported complete: {stderr}"
+    );
 }
 
 /// A render that exceeds full scale must warn for every target that clamps it
@@ -359,7 +377,11 @@ fn cli_bare_invocation_uses_the_documented_defaults() {
     // are the bytes I read".
     let src = read_audio(&input_wav());
     let got = read_audio(&out);
-    assert_eq!(got.frames(), src.frames(), "pass-through changed the length");
+    assert_eq!(
+        got.frames(),
+        src.frames(),
+        "pass-through changed the length"
+    );
     assert_eq!(
         got.samples, src.samples,
         "a 32-bit float WAV pass-through must survive encode/decode unchanged"
@@ -481,7 +503,10 @@ fn cli_ogg_bitrate_is_the_only_knob() {
         stdout.contains("ogg/vorbis ≈128 kbps"),
         "the banner should carry the requested bitrate: {stdout}"
     );
-    assert!(!stdout.contains("q="), "quality should not appear: {stdout}");
+    assert!(
+        !stdout.contains("q="),
+        "quality should not appear: {stdout}"
+    );
 
     let (ok, _, err) = run(&[
         input_wav().to_str().unwrap(),
@@ -730,7 +755,10 @@ fn cli_quality_options_are_honoured() {
     }
     let f16 = flac_sizes.iter().find(|(d, _)| *d == "16").unwrap().1;
     let f24 = flac_sizes.iter().find(|(d, _)| *d == "24").unwrap().1;
-    assert!(f16 < f24, "flac 16-bit ({f16}) should be smaller than 24-bit ({f24})");
+    assert!(
+        f16 < f24,
+        "flac 16-bit ({f16}) should be smaller than 24-bit ({f24})"
+    );
 
     // ---- MP3 bitrate: 320 kbps must be bigger than 128 --------------------
     if codec_available("mp3") {
@@ -865,9 +893,15 @@ fn cli_derives_the_output_name_when_none_is_given() {
     assert!(dir.join("song_td.wav").is_file());
 
     // semitones and tempo appear, mode first, in that order
-    let (ok, stdout, err) = run_in(&dir, &["song.wav", "-m", "vc", "-s", "-3", "--tempo", "200"]);
+    let (ok, stdout, err) = run_in(
+        &dir,
+        &["song.wav", "-m", "vc", "-s", "-3", "--tempo", "200"],
+    );
     assert!(ok, "run failed: {err}");
-    assert!(stdout.contains("song_vc_st-3_tp200.wav"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("song_vc_st-3_tp200.wav"),
+        "stdout: {stdout}"
+    );
     assert!(dir.join("song_vc_st-3_tp200.wav").is_file());
 
     // a whole-number shift reads `st3`, not `st3.0`
@@ -1067,7 +1101,10 @@ fn cli_tempo_output_carries_audio_to_the_end() {
                 l.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 l[l.len() / 2]
             };
-            assert!(median > 0.05, "{mode} tempo {tempo}: output is silent overall");
+            assert!(
+                median > 0.05,
+                "{mode} tempo {tempo}: output is silent overall"
+            );
             for (i, level) in levels.iter().enumerate() {
                 assert!(
                     *level > 0.4 * median,
@@ -1169,21 +1206,10 @@ fn cli_output_format_follows_the_input() {
         "the output should have followed the input's format"
     );
 
-    // A format this crate cannot write falls back to WAV. `m4a`/AAC is exactly
-    // such an input: the decoders take it, but the CLI has no encoder for it,
-    // so the fixture is built with oxiaudio's AAC encoder directly.
+    // A format without a writer falls back to WAV. Keep a tiny AAC fixture so
+    // this check needs neither an AAC encoder dependency nor an external tool.
     let m4a = dir.join("song.m4a");
-    let buf = oxiaudio::AudioBuffer {
-        samples: a.samples,
-        sample_rate: a.rate,
-        channels: if a.channels == 1 {
-            oxiaudio::ChannelLayout::Mono
-        } else {
-            oxiaudio::ChannelLayout::Stereo
-        },
-        format: oxiaudio::SampleFormat::F32,
-    };
-    oxiaudio::encode_aac_to_file(&buf, &m4a).expect("could not build the m4a fixture");
+    std::fs::write(&m4a, include_bytes!("fixtures/tone.m4a")).unwrap();
     let (ok, stdout, err) = run_in(&dir, &["song.m4a", "-m", "td"]);
     assert!(ok, "unsupported-format-input run failed: {err}");
     assert!(
@@ -1193,7 +1219,10 @@ fn cli_output_format_follows_the_input() {
     assert_eq!(probe_info(&dir.join("song_td.wav")).codec, "wav");
 
     // --format outranks the input's format.
-    let (ok, stdout, err) = run_in(&dir, &["song.flac", "-m", "td", "-s", "2", "--format", "mp3"]);
+    let (ok, stdout, err) = run_in(
+        &dir,
+        &["song.flac", "-m", "td", "-s", "2", "--format", "mp3"],
+    );
     assert!(ok, "override run failed: {err}");
     assert!(stdout.contains("song_td_st2.mp3"), "stdout: {stdout}");
     assert_eq!(probe_info(&dir.join("song_td_st2.mp3")).codec, "mp3");
@@ -1211,7 +1240,10 @@ fn cli_output_format_follows_the_input() {
 fn cli_env_flag_switches_to_ffmpeg_io() {
     let program = radius_rs::io::ffmpeg_program();
     if !radius_rs::io::ffmpeg_available() {
-        eprintln!("skipping: no ffmpeg at {} (set RADIUS_FFMPEG)", program.display());
+        eprintln!(
+            "skipping: no ffmpeg at {} (set RADIUS_FFMPEG)",
+            program.display()
+        );
         return;
     }
     let dir = cwd("ffmpeg_backend");
@@ -1229,12 +1261,16 @@ fn cli_env_flag_switches_to_ffmpeg_io() {
     let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
     assert!(status.status.success(), "ffmpeg-mode run failed: {stderr}");
-    assert!(stdout.contains("io=ffmpeg"), "banner must name the backend: {stdout}");
+    assert!(
+        stdout.contains("io=ffmpeg"),
+        "banner must name the backend: {stdout}"
+    );
     assert!(out.is_file(), "no output written");
 
     // The file must be FLAC and decodable by the default (pure-Rust) readers;
     // this test process never sets the flag, so `read` is the Rust pipeline.
-    let back = radius_rs::io::read(&out).unwrap_or_else(|e| panic!("rust reader on ffmpeg output: {e}"));
+    let back =
+        radius_rs::io::read(&out).unwrap_or_else(|e| panic!("rust reader on ffmpeg output: {e}"));
     assert_eq!(back.channels, 2);
     assert_eq!(back.sample_rate, 48_000);
     assert_eq!(back.frames(), 48_000 * 8);
@@ -1256,3 +1292,131 @@ fn cli_env_flag_switches_to_ffmpeg_io() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn cli_ffmpeg_ogg_bitrate_limits_follow_rate_and_channels() {
+    if !radius_rs::io::ffmpeg_available() {
+        return;
+    }
+    for (rate, channels) in [(44_100, 1), (16_000, 2), (8_000, 1), (96_000, 2)] {
+        let input = tmp(&format!("vorbis_{rate}_{channels}.wav"));
+        let audio = radius_rs::io::Audio {
+            samples: (0..rate as usize / 10 * channels)
+                .map(|i| (i as f32 * 0.01).sin() * 0.2)
+                .collect(),
+            sample_rate: rate,
+            channels,
+        };
+        radius_rs::io::write(&input, &audio, Default::default()).unwrap();
+        for bitrate in [1, 500] {
+            let output = tmp(&format!("vorbis_{rate}_{channels}_{bitrate}.ogg"));
+            let run = Command::new(bin())
+                .arg(&input)
+                .arg(&output)
+                .args(["--no-progress", "--ogg-bitrate", &bitrate.to_string()])
+                .env("RADIUS_FFMPEG_IO", "1")
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{rate}Hz {channels}ch {bitrate}k: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let back = radius_rs::io::read(&output).unwrap();
+            assert_eq!(back.sample_rate, rate);
+            assert_eq!(back.channels, channels);
+            assert_eq!(back.frames(), audio.frames());
+            std::fs::remove_file(output).unwrap();
+        }
+        std::fs::remove_file(input).unwrap();
+    }
+}
+
+#[test]
+fn cli_ffmpeg_uses_the_first_audio_track_for_metadata_and_samples() {
+    if !radius_rs::io::ffmpeg_available() {
+        return;
+    }
+    let first = tmp("first_track.wav");
+    let second = tmp("second_track.wav");
+    let input = tmp("multiple_tracks.mka");
+    let output = tmp("first_track_output.wav");
+    let audio = radius_rs::io::Audio {
+        samples: vec![0.25; 4_410],
+        sample_rate: 44_100,
+        channels: 1,
+    };
+    radius_rs::io::write(&first, &audio, Default::default()).unwrap();
+    radius_rs::io::write(
+        &second,
+        &radius_rs::io::Audio {
+            samples: vec![-0.5; 9_600],
+            sample_rate: 48_000,
+            channels: 2,
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let mux = Command::new(radius_rs::io::ffmpeg_program())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&first)
+        .arg("-i")
+        .arg(&second)
+        .args(["-map", "0:a:0", "-map", "1:a:0", "-c:a", "pcm_f32le"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        mux.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mux.stderr)
+    );
+    let run = Command::new(bin())
+        .arg(&input)
+        .arg(&output)
+        .arg("--no-progress")
+        .env("RADIUS_FFMPEG_IO", "1")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(radius_rs::io::read(&output).unwrap(), audio);
+    for p in [first, second, input, output] {
+        std::fs::remove_file(p).unwrap();
+    }
+}
+
+#[test]
+fn cli_ffmpeg_handles_named_and_height_channel_layouts() {
+    if !radius_rs::io::ffmpeg_available() {
+        return;
+    }
+    for channels in [4, 12] {
+        let input = tmp(&format!("layout_{channels}.wav"));
+        let output = tmp(&format!("layout_{channels}_output.wav"));
+        let audio = radius_rs::io::Audio {
+            samples: vec![0.25; 100 * channels],
+            sample_rate: 44_100,
+            channels,
+        };
+        radius_rs::io::write(&input, &audio, Default::default()).unwrap();
+        let run = Command::new(bin())
+            .arg(&input)
+            .arg(&output)
+            .arg("--no-progress")
+            .env("RADIUS_FFMPEG_IO", "1")
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{channels}ch: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(radius_rs::io::read(&output).unwrap(), audio);
+        for p in [input, output] {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+}

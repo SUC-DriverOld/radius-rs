@@ -30,7 +30,7 @@ So Audition's −36 … +36 变调 range is real, with two caveats worth knowing
 
 | argument | meaning |
 |---|---|
-| `INPUT` | Input audio file. Any container the pure-Rust decoders take: wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack — or anything at all the `ffmpeg` binary can decode when `RADIUS_FFMPEG_IO` is set (see [Environment variables](#environment-variables)). Its **sample rate and channel count are used as-is** and written unchanged to the output. There is deliberately no rate option, so input and output always agree. Channel counts are carried through the layouts the codecs model: 1, 2, 4, 6, 8 or 12; anything else fails with an error that says so. |
+| `INPUT` | Input audio file. Any container the pure-Rust decoders take: wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff — or anything at all the `ffmpeg` binary can decode when `RADIUS_FFMPEG_IO` is set (see [Environment variables](#environment-variables)). Its **sample rate and channel count are used as-is** and written unchanged to the output. There is deliberately no rate option, so input and output always agree. Channel counts are retained directly, including 3/5/7-channel input. WAV preserves those counts; FLAC supports 1–8 channels, and the MP3/Vorbis writers support mono/stereo. |
 | `OUTPUT` | **Optional.** Output audio file; the extension selects the container unless `--format` overrides it. An unknown extension without `--format` is an error rather than a guess. Omit it entirely and a name is derived from the input, in the input's own format where that format can be written. |
 
 ## Environment variables
@@ -40,7 +40,7 @@ So Audition's −36 … +36 变调 range is real, with two caveats worth knowing
 | `RADIUS_FFMPEG_IO` | **Backend switch.** Unset (or any value other than `1`/`true`/`yes`/`on`, case-insensitive) reads and writes through the pure-Rust codecs compiled into the binary — the default, no external program needed. A truthy value routes all reading, writing and probing through the `ffmpeg` binary instead: input decodes to raw `f32le` on a pipe, output encodes from one, every container and codec the ffmpeg build supports. The CLI option set is identical in both modes; only the machinery underneath changes, and the banner says which one ran (`io=ffmpeg` vs `io=rust`). |
 | `RADIUS_FFMPEG` | Where the ffmpeg binary lives when it is not on `PATH`, e.g. `RADIUS_FFMPEG=/opt/ffmpeg/bin/ffmpeg` or `RADIUS_FFMPEG=C:\Program Files\ffmpeg\bin\ffmpeg.exe`. Only consulted in ffmpeg mode; a set `RADIUS_FFMPEG` alone does **not** enable the mode — `RADIUS_FFMPEG_IO` is the switch. |
 
-Why keep both: the pure-Rust stack needs no installation and its output sizes now match ffmpeg's, but it models a fixed set of containers, channel layouts and bit depths. The ffmpeg path trades that self-containment for ffmpeg's full format coverage — same options, same behaviour, one environment variable apart. One measured difference in ffmpeg mode: its libvorbis accepts `-b:a` only in a 45–500 kbit/s window for stereo 44.1 kHz, so `--ogg-bitrate` requests are clamped into it (the default 500 is exactly the top).
+The pure-Rust stack runs without external programs. The ffmpeg backend adds formats such as AU, WavPack and Musepack that the default decoder does not support. Both backends select the first audio track consistently for probing and decoding. In ffmpeg mode, libvorbis's managed bitrate window depends on sample rate and channel count: stereo 44.1 kHz accepts about 45–500 kbit/s, mono about 32–240, and lower-rate inputs have lower limits. Requests are clamped to the applicable window. Generic sample-rate profiles without managed bitrate support (such as 96 kHz stereo) use VBR quality chosen from the nominal bitrate curve.
 
 ## Omitting the output name
 
@@ -195,7 +195,7 @@ Two reference parameters are deliberately absent from the CLI because they canno
 | option | default | meaning | notes |
 |---|---|---|---|
 | `-f, --format <wav\|flac\|ogg\|mp3>` | from the extension | Force the output container, for when the extension is ambiguous or must stay as-is. | An unknown extension **without** `--format` is an error |
-| `-b, --bit-depth <16\|24\|32\|32f>` | `32f` | Sample depth for wav and flac. `32f` is IEEE float, which is what both engines natively produce; `16`, `24` and `32` are integer PCM. FLAC stores `32` and `32f` as 24 bit, the deepest subframe the format has. | wav: `16`, `24`, `32`, `32f`; flac: `16`, `24` |
+| `-b, --bit-depth <16\|24\|32\|32f>` | `32f` | Sample depth for wav and flac. `32f` is IEEE float, which is what both engines natively produce; `16`, `24` and `32` are integer PCM. FLAC stores `32` and `32f` as 24 bit, the deepest depth this writer supports. | wav: `16`, `24`, `32`, `32f`; flac: `16`, `24` |
 | `--ogg-bitrate <KBPS>` | `500` | Target average bitrate for Ogg/Vorbis: the encoder quality whose *measured* bitrate is closest to the request. Vorbis here is VBR with **no bitrate management** — the pure-Rust encoder exposes no CBR mode, its `bitrate` field is a header hint only — so this knob is the only Ogg control. The calibration lands within ~10% on the reference material and ±25% or more across different material, exactly as libvorbis's `-b` does: VBR spends bits on entropy, not on the knob. Useful range about 30–500 kbit/s stereo (half that mono); requests outside clamp to the ends, and on very short files the fixed lead/pad overhead (~230 ms of encoded audio) pushes the achieved rate up. | higher is bigger and better |
 | `--mp3-bitrate <KBPS>` | `320` | MP3 constant bitrate, snapped to the nearest value the MPEG tables carry (64, 96, 128, 160, 192, 256, 320, …). | higher is bigger and better |
 
@@ -259,19 +259,21 @@ Overshoot is normal for these algorithms rather than a bug: overlapping granules
 
 ## Codecs
 
-All audio I/O is in-process and pure Rust — the day-one crate doc's promise, finally true:
+The default audio backend runs in-process with the following pure-Rust libraries:
 
 | direction | format | engine |
 |---|---|---|
-| read | wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff, au, wavpack, musepack | `oxiaudio` (symphonia underneath) |
-| write | wav (16/24/32-bit integer, 32-bit float) | `oxiaudio` (hound) |
-| write | flac (16/24-bit integer) | `oxiaudio` (flacenc) |
+| read | wav, flac, ogg/vorbis, mp3, aac/adts, m4a, aiff | `symphonia` |
+| write | wav (16/24/32-bit integer, 32-bit float) | `hound` |
+| write | flac (16/24-bit integer) | `flacenc` |
 | write | ogg/vorbis (mono/stereo) | `rusty_vorbis`, framed by the `ogg` crate |
 | write | mp3 (mono/stereo, CBR, gapless LAME tag) | `rusty_mp3` |
 
-Two stories worth knowing:
+The crate calls these libraries directly. The former `oxiaudio` facade also brought in its own DSP, FFT, resampling and encoder layers, even though Radius already provides its own DSP engines. Removing that facade and unused FLAC serde/log features removes 36 locked packages without removing any format that the old default `decode_file` path actually decoded. AIFF is now explicitly enabled in Symphonia. A small generated AAC fixture replaces the test-only AAC encoder dependency.
 
-* **Why not oxiaudio's Vorbis encoder?** It was tried first and is unusable: on real material it writes a stream that both symphonia and ffmpeg decode to garbage (max |diff| ~1e7, SNR below −130 dB), truncates to a block boundary, and its quality knob changes nothing — the same file at q0.2 and q0.9, byte for byte. `rusty_vorbis` (same family as `rusty_mp3`) behaves like a real encoder and took the job.
+Codec details:
+
+* **Dedicated Vorbis writer.** `rusty_vorbis` produces the codec packets and `ogg` muxes them into pages. Symphonia is a decoder, so it cannot replace either writer. The muxer records the requested nominal bitrate in the identification header; the encoder's default header otherwise always reports 128 kbit/s.
 * **Ogg length exactness.** The Vorbis encoder hops in 1024-sample blocks and its raw packets make every decoder skip the first hop and never render the last one's overlap. The mux layer compensates: one silent *lead* hop as the overlap partner of the first real hop (its content never survives decoding — copy, reversed copy and zeros all decode identically, so it is zeros), a tail pad so the last real hop gets its partner, a final page granule of `hop + input_frames`, and the first audio packet alone on its page the way libvorbis lays out a stream. Read back through this crate the length equals the input length exactly, sample-aligned at lag zero — pinned by the io and acceptance tests. One honest caveat: a decoder that ignores granule trimming altogether (ffmpeg's vorbis path does) plays about two extra hops of silence around the programme instead; rusty_vorbis cannot produce libvorbis's priming-free first block, so that is the floor for a pure-Rust Vorbis today.
 
 MP3 writing carries a gapless LAME tag (encoder delay and end padding recorded, `rusty_mp3`'s own doing), so tag-aware players decode exactly the rendered length. MP3 itself only carries nine sample rates (8/11.025/12/16/22.05/24/32/44.1/48 kHz); a render at any other rate refuses the mp3 target with the list rather than silently resampling — which is also what ffmpeg did.

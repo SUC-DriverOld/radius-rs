@@ -6,7 +6,7 @@ Why the crate is put together the way it is, in particular the properties that a
 
 `radius.exe` and `radius_rs.dll` carry their own constant tables, compiled in as Rust source under `src/vocoder/table_data/`. There is no data directory, no asset file and no build script, so you can copy either one anywhere and it still runs.
 
-Audio I/O is compiled in, not spawned: the decoders and encoders are pure Rust (`oxiaudio`, `rusty_vorbis`, `rusty_mp3`), so the same copy-anywhere property now holds for format support too. There is no `ffmpeg` to find, no `PATH` to depend on, and no way for a different machine's codec build to change what a render sounds like.
+The default audio I/O runs in-process through Symphonia for decoding and hound, flacenc, rusty_vorbis and rusty_mp3 for encoding; ogg handles Vorbis pages. These are called directly, without a codec facade or a second DSP stack. `RADIUS_FFMPEG_IO=1` optionally selects an installed ffmpeg instead.
 
 ```
 $ copy radius.exe C:\somewhere\else\        # no data files, no external programs
@@ -16,9 +16,9 @@ $ C:\somewhere\else\radius.exe in.wav out.wav -m vc -s 3
 ## What is deliberately not in here
 
 * **No build script.** `build.rs` does not exist. The constant tables were parsed out of the reference C headers once and converted to source by `tools/gen_table_source.py`, which can still verify the conversion byte for byte. [TABLE_PROVENANCE.md](TABLE_PROVENANCE.md) records the layout, provenance and element counts.
-* **No bespoke audio codec.** The format layer is three published, independently versioned crates (`oxiaudio`, `rusty_vorbis`, `rusty_mp3`) rather than an in-tree encoder to keep correct — the same outsourcing decision the ffmpeg path made, minus the subprocess and the external dependency.
+* **No bespoke audio codec.** Published codec crates implement decoding and encoding. Each has a distinct role; the crate integrates PCM conversion, gapless packet bookkeeping and output verification.
 * **No dependence on the reference projects.** The port was derived from a `libradius` C engine and a `pyradius` Python port, but neither is part of this crate or needed to build it: they are named in `package.exclude`, and their directories need not be present. `cargo build` and `cargo test` are green on a checkout that contains only this crate.
-* **Few dependencies.** The engines, the C ABI and the tables build with nothing but `std`. The crate adds `clap` for the CLI's argument parsing, `anyhow` for its error reporting, the three codec crates for `io`, and `rustfft` for the opt-in fast backend; both FFT backends are always compiled.
+* **Focused dependencies.** `clap` parses CLI arguments, `anyhow` reports CLI errors, and `rustfft` provides the alternative FFT backend. The I/O layer uses the format libraries above. Symphonia enables only the required containers and codecs; flacenc keeps parallel encoding and tuned LPC estimation while disabling unused serde/log features. The former oxiaudio facade and its DSP/resampling dependencies are removed.
 * **Nothing dead in `src/`.** Every constant table under `src/vocoder/table_data/` is read by a code path. The research corpus' per-granule schedule, which the engine does not read because it computes the schedule from a closed form, is archived under [reference/](reference/) rather than compiled in.
 
 ## Float discipline

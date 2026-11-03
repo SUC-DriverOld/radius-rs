@@ -16,7 +16,7 @@ Radius supports two pitch-shifting engines, selectable at run time:
 ## Requirements
 
 * **Rust** 1.85 or newer, edition 2021.
-* Nothing else by default: audio I/O goes through pure-Rust codecs ([oxiaudio](https://crates.io/crates/oxiaudio), [flacenc](https://crates.io/crates/flacenc), [rusty_vorbis](https://crates.io/crates/rusty_vorbis), [rusty_mp3](https://crates.io/crates/rusty_mp3)) compiled into the binary — no ffmpeg, no subprocesses. If you do have ffmpeg, `RADIUS_FFMPEG_IO=1` (plus `RADIUS_FFMPEG` when it is not on `PATH`) switches reading and writing to it, with ffmpeg's full format coverage; see [docs/CLI.md](docs/CLI.md#environment-variables).
+* Nothing else by default: audio I/O goes through pure-Rust codecs ([Symphonia](https://crates.io/crates/symphonia), [hound](https://crates.io/crates/hound), [flacenc](https://crates.io/crates/flacenc), [rusty_vorbis](https://crates.io/crates/rusty_vorbis), [rusty_mp3](https://crates.io/crates/rusty_mp3)) compiled into the binary — no ffmpeg, no subprocesses. If you do have ffmpeg, `RADIUS_FFMPEG_IO=1` (plus `RADIUS_FFMPEG` when it is not on `PATH`) switches reading and writing to it, with ffmpeg's full format coverage; see [docs/CLI.md](docs/CLI.md#environment-variables).
 * A CPU with **AVX and FMA** on x86-64, i.e. Intel Haswell (2013) or AMD Excavator (2015) and newer. [`.cargo/config.toml`](.cargo/config.toml) turns the feature on because the engine mirrors the reference's `a*b + c` as one correctly-rounded operation, and without it every fused multiply-add becomes a software call — worth about 2x on the vocoder. It changes no output bits. See [docs/DESIGN.md](docs/DESIGN.md); build with `RUSTFLAGS=-C target-feature=-fma` to drop the requirement.
 
 ## Quick start

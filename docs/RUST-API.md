@@ -76,7 +76,7 @@ audio::write(
 
 ## Feature flags
 
-There are no optional Cargo features. Both FFT backends are always compiled and selected at run time with [`radius_rs::fft::set_backend`] or the `--fft` flag, and codec support comes from the compiled-in pure-Rust codec crates (`oxiaudio`, `rusty_vorbis`, `rusty_mp3`).
+There are no optional Cargo features. Both FFT backends are always compiled and selected at run time with [`radius_rs::fft::set_backend`] or the `--fft` flag, and codec support comes from the compiled-in pure-Rust codec crates (`symphonia`, `hound`, `flacenc`, `rusty_vorbis`, `ogg`, `rusty_mp3`).
 
 ## Two rules worth knowing
 
@@ -87,7 +87,7 @@ Both are inherited from the reference engines rather than chosen here:
 
 ## Errors
 
-Every fallible entry point returns a `String` error rather than panicking, and the I/O ones name the program and the environment variable to set when ffmpeg is missing. Use `.map_err(anyhow::Error::msg)?` to lift them into `anyhow`, as the CLI does.
+I/O entry points return `String` errors with the file path and codec diagnostic. Invalid sample rates or incomplete interleaved frames are rejected before creating output. In ffmpeg mode, a missing executable error names the program and the environment variable used to locate it. Use `.map_err(anyhow::Error::msg)?` to lift them into `anyhow`, as the CLI does.
 
 ## See also
 
