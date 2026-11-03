@@ -955,38 +955,15 @@ fn write_wav(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> 
     encode().map_err(|e| format!("{}: wav: {e}", path.display()))
 }
 
-/// Write FLAC through flacenc directly, with the configuration this crate
-/// measured against libFLAC.
+/// Write lossless FLAC with power-of-two PCM quantisation. Explicit 16-bit
+/// output stays 16-bit; other depths use 24-bit integers. Samples already on
+/// the 16-bit grid can be stored at 16 bits without changing their values.
 ///
-/// Two things here were decided by measurement, not by defaults:
-///
-/// * **The float→int conversion scales by 2^(bits−1) and rounds
-///   half-to-even** (then clamps into the signed range). oxiaudio's
-///   `floor(s · (2^23−1))` truncation has two measured defects: the scale is
-///   not a power of two, so material already on an integer grid (16-bit
-///   sources) lands on ±8-unit jitter at 24-bit — incompressible noise that
-///   made a FLAC *larger* than the same PCM as WAV — and truncation biases
-///   every sample toward zero by up to a full step. With a power-of-two scale
-///   grid-aligned material stays on the grid (so 16-bit sources compress like
-///   16-bit even at 24-bit depth), and rounding halves the worst-case error.
-/// * **The encoder config** is block 8192, qlpc order 24 with direct-MSE
-///   estimation and one MAE refinement step (`flacenc`'s `experimental`
-///   feature). On the dense-mix reference that beats the crate default by
-///   ~10% at 24-bit and lands within a few percent of libFLAC −8 on ordinary
-///   material — and *smaller* than libFLAC at 16-bit and on quiet material;
-///   flacenc only loses (by ~30%) on broadband noise near −34 dBFS, a floor
-///   set by its Rice parameter cap of 14 (the spec allows 30 plus an escape
-///   code), which no config can lift. `OrderSel::BitCount` also looks better
-///   on paper but emits pathological frames at some block sizes (a
-///   reproducible 303 MB file from 8 s of audio), so it is not used.
-/// * **Grid detection** stands in for libFLAC's wasted-bits flag, which
-///   flacenc does not implement: when every sample of a 24-bit render already
-///   sits on the 16-bit grid (a 16-bit source), the file is written as 16-bit
-///   — decoding is bit-identical, and it is exactly what ffmpeg produces for
-///   16-bit input.
-///
-/// 16 stays 16; 24/32/32f all become 24-bit integer, the deepest sample
-/// depth supported by this output path.
+/// flacenc's fixed predictor can accept an estimated saving even when its
+/// actual Rice-coded residual is much larger than verbatim PCM. Disable that
+/// path: constant, LPC and verbatim coding still compete, and LPC is selected
+/// only when its actual bit count is smaller than verbatim. Incompressible
+/// material therefore costs at most raw PCM plus FLAC framing overhead.
 fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String> {
     use flacenc::bitsink::ByteSink;
     use flacenc::component::BitRepr;
@@ -996,23 +973,14 @@ fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String>
 
     const BLOCK: usize = 8192;
     let mut bits: u32 = if depth == BitDepth::I16 { 16 } else { 24 };
-    let scale = (1u64 << (bits - 1)) as f32;
-    let max = ((1u64 << (bits - 1)) - 1) as i32;
-    let min = -((1u64 << (bits - 1)) as i32);
     let mut pcm: Vec<i32> = audio
         .samples
         .iter()
-        .map(|&s| (s * scale).round_ties_even() as i32)
-        .map(|v| v.clamp(min, max))
+        .map(|&s| quantise_pcm(s, bits))
         .collect();
 
-    // Grid detection, standing in for libFLAC's wasted-bits flag (flacenc has
-    // none): when every sample already sits on the 16-bit grid, a 16-bit
-    // stream decodes to exactly the same floats — and ffmpeg writes exactly
-    // that for a 16-bit source. Without this, the eight constant zero LSBs are
-    // coded into every residual, which flacenc's Rice cap (k ≤ 14) turns into
-    // *expansion*: a 16-bit WAV re-encoded as 24-bit FLAC came out larger than
-    // the WAV itself.
+    // flacenc does not implement wasted-bit signalling. Removing eight zero
+    // LSBs globally preserves the samples and avoids coding those unused bits.
     if bits == 24 && pcm.iter().all(|v| v & 0xFF == 0) {
         bits = 16;
         for v in &mut pcm {
@@ -1028,6 +996,12 @@ fn write_flac(path: &Path, audio: &Audio, depth: BitDepth) -> Result<(), String>
     );
     let mut cfg = config::Encoder::default();
     cfg.block_size = BLOCK;
+    // flacenc 0.5.1 accepts the fixed predictor using an entropy estimate,
+    // without checking its actual Rice-coded size against verbatim. At
+    // 24 bits this can expand PCM by orders of magnitude. Its BitCount
+    // selector also has overflowing cost estimates, so use the LPC path,
+    // which compares the actual bit count and falls back to verbatim.
+    cfg.subframe_coding.use_fixed = false;
     cfg.subframe_coding.qlpc.lpc_order = 24;
     cfg.subframe_coding.qlpc.use_direct_mse = true;
     cfg.subframe_coding.qlpc.mae_optimization_steps = 1;
@@ -1581,6 +1555,56 @@ mod tests {
         let raw24 = 4_410 * 2 * 3;
         assert!(size < raw24 as u64 / 2, "{size} vs raw24 {raw24}");
         let _ = std::fs::remove_file(&flac);
+    }
+
+    /// High-entropy 24-bit samples must fall back to verbatim coding when
+    /// prediction costs more than raw PCM. Include a partial final block.
+    #[test]
+    fn flac_noisy_material_has_bounded_size_and_is_lossless() {
+        let frames = 8192 + 137;
+        for channels in [1, 2] {
+            for shift in [1, 4, 6] {
+                let mut state = 0x5eed_1234u32;
+                let samples: Vec<f32> = (0..frames * channels)
+                    .map(|_| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let pcm = ((state >> 8) as i32 - (1 << 23)) >> shift;
+                        pcm as f32 / 8_388_608.0
+                    })
+                    .collect();
+                let audio = Audio {
+                    samples,
+                    sample_rate: 44_100,
+                    channels,
+                };
+                let p = dir().join(format!("noise_{channels}ch_{shift}.flac"));
+                write(
+                    &p,
+                    &audio,
+                    WriteOptions {
+                        depth: BitDepth::I24,
+                        ..WriteOptions::default()
+                    },
+                )
+                .unwrap();
+                let size = std::fs::metadata(&p).unwrap().len() as usize;
+                let raw_size = audio.samples.len() * 3;
+                // STREAMINFO, frame headers, channel headers, CRC and padding
+                // fit comfortably in 128 bytes for each of these two blocks.
+                assert!(
+                    size <= raw_size + 256,
+                    "{channels}ch shift {shift}: FLAC {size} bytes vs PCM {raw_size}"
+                );
+                let back = read(&p).unwrap();
+                assert_eq!(back.sample_rate, audio.sample_rate);
+                assert_eq!(back.channels, channels);
+                assert_eq!(
+                    back.samples, audio.samples,
+                    "FLAC must preserve all 24 bits"
+                );
+                let _ = std::fs::remove_file(&p);
+            }
+        }
     }
 
     #[test]
