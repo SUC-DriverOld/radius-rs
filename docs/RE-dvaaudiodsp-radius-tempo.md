@@ -384,3 +384,126 @@ pyradius 位级语料随表退役，vc_acceptance 的参照测试改为感知阈
 1.000000）；仅 FIR 差 2–3 ulp → corr 每 5s 0.98→0.76 衰减（逐粒相位反馈
 放大任意 f32 扰动）。长渲染逐位一致需逐指令克隆 DLL 浮点运算序，非定律
 问题。详见 `docs/TABLE_PROVENANCE.md`。
+
+## 13. vocoder 瞬态子系统完整反编译（2026-11-03）
+
+> 背景：AU 的 vocoder 打击乐/鼓瞬态保真依赖一整套 pyradius 未移植（我们
+> 也没有）的子系统。本轮从本 IDB（与 §6–§8 同构建）完整解码其架构。
+> pyradius 移植了"==2 门控分支"但从未移植驱动它的状态机与检测器——
+> 其 `transient_state_2488 = 0` 是硬编码，我们的引擎因此永远处于稳态。
+
+### 13.1 三大部件
+
+1. **输入侧检测器** `sub_180153EA0`（process_block `sub_18014D7A0` 每块调
+   `detector(state+696, 输入, 块长, ...)`）：混音输入进 DataTail（4 chunk
+   前瞻缓冲），按 stride 分 chunk（stride=[q+52]，推断 1024），对每 chunk：
+   - 双分辨率加窗 FFT（窗/FFT 尺寸在 [q+280]/[q+496]/[q+500]，两套频谱
+     [q+100]/[q+116] 与 [q+236]/[q+252]）；
+   - 功率谱→24 频段求和（段边界表 [q+916]，24 个 int）；频段能量前向+
+     反向一阶 IIR 零相位平滑（系数表 [q+1016]）；
+   - 三次开方 = x^(1/8) 压缩（v61 长度 [q+256]、v74 长度 [q+260]、24 段
+     SIMD 三连 sqrt）；
+   - 9 槽循环历史（[q+592]/[q+536]/[q+696]/[q+800] 各持有 float* 环），
+     谱通量 `F = Σ_band [B(t+1)+B(t+2)+B(t+3)+B(t+4) − B(t−1)−B(t−2)
+     −B(t−3)−B(t−4)]`，正项全加、负项按 −0.1 计（不对称惩罚）；
+   - 除以频段数得 chunk 分数，写入分数数组（[q+0] 起的 vector）。
+   后处理：`sub_1801525E0`（0xab3，逐 9-chunk 组精化）、`sub_180153190`
+   （非极大值抑制：邻域 [score×a6×0.7 若 a9] 更高者清零，半窗
+   round(a5×a8/stride+0.5)）、`sub_180153570`（增益曲线：阈值 a7 以上的
+   chunk 在 ±round(a5×a8/stride) 窗内取加权包络）。
+2. **分数队列**（renderer+112 = state+696，即 §3 的"transient 增益事件输
+   出"）：`{base=[q+48], stride=[q+52], head=[q+264], scores=[q+0..8]}`。
+   chunk i 的名义位置 = base + i×stride（i 为未压缩索引）；分数存
+   scores[i−head]。查询原语：
+   - `sub_180153BD0(q, pos, start, thr, mode, cap)`：v14=(pos+stride/2−
+     base)/stride；mode 1 向后找（idx−head 递增，score>1/thr 命中返回
+     base+stride×idx），mode 2 向前找，mode 0 双向；start 通常 1。
+   - `sub_180153CD0(q, pos, range)`：[pos, pos+range] 内**分数最大**的
+     chunk 位置（无则 −1）。
+   - `sub_180153A70(q, pos, range)`：[pos±range] chunk 分数的
+     RMS = sqrt(mean(score²))。
+   输出侧事件流（process_block LABEL_10）：新 chunk 若 score>0，向宿主发
+   `{位置=base+idx×stride, 增益=clamp(score×0.1, 0, 1)}`（16 字节记录）。
+3. **调度状态机**（在颗粒链 `sub_180158D20` 内，0x56A1 大函数，含 ACS/
+   APC/RPT/合成全链）。字段（renderer 相对）：
+
+   | 偏移 | 含义 |
+   |------|------|
+   | 2448 | 状态 state ∈ {0 稳态, 1 接近, 2 保持/瞬态处理, 3 瞬态回放} |
+   | 2452 | 瞬态窗口上限 max_w |
+   | 2456/2460 | 保持计数目标/当前 |
+   | 2464/2468 | 接近计数目标/当前 |
+   | 2472/2476 | 接近段 in-hop / out-step |
+   | 2480 | 接近段 hop 增量（置 0） |
+   | 2484 | 保持段结束后的 hop 增量 |
+   | 2488 | 瞬态回放保持数（≥1） |
+   | 2492/2496/2500/2504 | 瞬态段 in-hop / 计数 / out-step / 末粒 hop 补余 |
+   | 1360 | 上次接受的瞬态位置（防重） |
+   | 1344 | 输入读位置（*v8，每粒 += hop） |
+   | 1352 | 输出环形游标 curpos |
+   | 1368/1372 | 稳态 in-hop/out-step（调度表在外部步进） |
+   | 96 | 采样率（窗口都是 sr×0.05/0.1 等秒量） |
+   | 1336 | quality（≥10 走高质量；2794 块仅 <10） |
+
+### 13.2 状态机转移（舍入一律 (int)(x±0.5) 远离零）
+
+- **0→1**（拉伸侧，slope>1）：`ev = QueryFwd(inpos)`；接受条件
+  `ev>sr×0.01 && ev≠last && ev−inpos < round(sr×0.05)`；
+  next/prev 事件距离 d±=|ev−ev_next/prev|/sr → 斜坡 ramp(d)=
+  0/1/(d−0.02)/0.13（d∈[0.02,0.15] 线性）；
+  `hold_next=clamp(round((ramp(d+)×0.9+0.1)×max_w),1,max_w)`，hold_prev
+  同理；**2456 = round((hold_prev+hold_next)/2)**；
+  `mid_out = (ev−in_base)×slope+out_base − hop1368×hold_prev×0.5`；
+  `N=2464 = max(1, round((mid_out−curpos)/step1372))`；
+  `2476 = round((mid_out−curpos)/N)`；`2472 = round((ev−0.5×hop×hold_prev
+  −inpos)/N)`；2480=0；**2488 = N**；2500=2476；
+  `tail = round((hop×2456 + 2N×2472 + …)/slope)`→ `2492 = 2472 +
+  (残差整除 N)`，`2504 = 残差 mod N`；DataTail(renderer+2248) 清零。
+- **0→2**（压缩侧，slope≤1）：`best = QueryMax(inpos, round((hop×0.5×
+  max_w + step)/slope))`；接受 `best≠−1 && best≠last && best>sr×0.01`：
+  2456 = max(1, int((best−inpos)×2×slope/hop))；本粒 hop/out-step 直接
+  改为对齐值；**2484 = round(回稳态校正值)**；DataTail 清零。
+- **1**：hop=2472；2468→2464 后 →2（2460=0，hop+=2480）。
+- **2**：hop=1368（稳态）；2460 到 2456 的一半时 renderer+3568 清零；
+  到达 2456 后：若 `slope>1 && 2488` →**3**（2496=0）；同时在到达点用
+  `round(sr×0.1)` 窗口重新 QueryFwd——若命中新事件则重算全部计划并 →1
+  （覆盖为接近段，见 0x1801592e8 块：pre-roll N=min((ev−inpos)×0.9,
+  dist_prev×0.8)/hop×min(slope,1)）。
+- **3**：hop=2492（末粒 +=2504）、out-step=2500；2496→2488 后 →0。
+- **任意(1/2)→0**：斜率变更标志（renderer+88，prestep `sub_180158A60`
+  处理 ramp 链表更新时间图后置位）触发时，inpos 按新时间图重映射，
+  状态清 0。
+- 每粒出口：`inpos += hop`；`renderer+1376=hop`；`+1380=Δ`；
+  `+3568 += hop`；`2448 = state`。稳态时 hop=1368、out-step=1372 由外
+  层调度表步进（= 我们已移植的 vc_calc_sched 同源）。
+
+### 13.3 state==2 的六处链路门控
+
+| 位置 | 级 | 稳态值 | state2 值 |
+|------|----|--------|-----------|
+| 0x18015a25c | ACS 包络 IIR τ | 0.1 s | **0.05 s** |
+| 0x18015af55 | APC v15（=我们 phase.rs 的 0.5 因子） | 1.0 | **0.5** |
+| 0x18015c2e9 | RPT 分支选择：state≠2 走 B3（队列分数 RMS 三元组 `RMS(inpos±hop)`，`cur>两侧 && cur>1.2` 判瞬态）；state==2 走 B2 | B3 | **B2** |
+| 0x18015c8f0 / 0x18015d289 | 噪声路径包络 IIR τ ×2 | 0.01 s | **0.005 s** |
+| 0x18015b69a | 峰区增强抑制（state≠2 才允许 ×10 增强） | 允许 | 抑制 |
+
+τ 都经 `TimeToIirA(τ, sr/hop)` 折算。注意 pyradius 把"==2"误系到偏移
+2488（本构建 2488 是回放保持计数）；正确字段是 2448。
+
+### 13.4 与我们端口的对位
+
+- 我们的 `transient_state_2488` 管线（ACS τ 选择、APC v15、RPT B1/B2/B3）
+  = 本构建的 state==2 门控——**接线已在，驱动缺失**；
+- 我们的 `ev_rpt` 传 `avg_m1/avg_0/avg_p1 = 0` 与 `use_p568=false`：
+  真值是队列分数 RMS 三元组（`sub_180153A70`），pyradius 没找到来源；
+- 需要新增：检测器（分数数组）、队列查询、§13.2 状态机（hop/out-step
+  逐粒覆盖我们调度表的默认值）、DataTail 输出清零的对位（输出环 recent
+  段清 0）；
+- 纯变调（tempo=100、pitch>0）在 AU 中 slope>1 同样触发本子系统——这解
+  释了我们/ pyradius 与 AU 采样级 corr 只有 0.03–0.05 的部分成因；
+  pyradius 位级等价测试必须用配置开关与本子系统隔离。
+- 待动态抓取：stride 确值（推断 1024）、检测器窗/频段边界/IIR 系数表
+  （构造函数未定位，候选簇 0x180153190/0x180153570 是后处理非构造）。
+
+本节所有地址基于当前 IDB（RE 文档 §6–§8 同一构建）；pyradius 注释里的
+`@0x16D354` 等地址属于另一构建，不可混用。
