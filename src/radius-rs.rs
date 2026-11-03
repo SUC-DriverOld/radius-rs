@@ -303,6 +303,10 @@ fn render_vc(
     if cli.no_preserve_voice {
         st.set_preserve_voice(false);
     }
+    // Transient preservation (RE doc §13) is on by default — same call as the
+    // library default; kept explicit here as documentation of the CLI's
+    // intent: renders target AU parity, not pyradius parity.
+    st.set_transient_sched(true);
     println!(
         "in: {}Hz {}ch {} frames  N={}",
         input.sample_rate,
@@ -322,6 +326,13 @@ fn render_vc(
     let out = st.render_to(&input.samples, target);
     let dt = t0.elapsed().as_secs_f64();
 
+    if cli.verbose {
+        let (events, state2) = st.transient_stats();
+        eprintln!(
+            "vc/transients: {} event chunks, {} state-2 granules",
+            events, state2
+        );
+    }
     let frames = if nch == 0 { 0 } else { out.len() / nch };
     println!(
         "render: out={} frames ({:.3}s)  [{:.0} ms, {:.1}x RT]",

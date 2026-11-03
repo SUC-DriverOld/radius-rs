@@ -243,6 +243,16 @@ pub struct VocoderConfig {
     pub ring_out_len: usize,
     /// `stretch * pitchRatio` — the engine's `this[0x20]` (`set_ratio`).
     pub total_ratio: f64,
+    /// Enable the transient-preservation subsystem (input-side onset scoring,
+    /// the granule hop scheduler, and the `state == 2` chain gates) recovered
+    /// from the AU DLL — see `docs/RE-dvaaudiodsp-radius-tempo.md` §13.
+    ///
+    /// **Defaults to `true`**: AU's engine runs this machinery at any tempo ≥
+    /// 100, so parity with AU requires it. Renders therefore diverge from
+    /// pyradius (which never had it) by design; pyradius/libradius are now a
+    /// code reference only. The bit-exact pyradius regression tests opt out
+    /// explicitly via [`VocoderState::set_transient_sched`]`(false)`.
+    pub transient_sched: bool,
 }
 
 impl VocoderConfig {
@@ -311,6 +321,7 @@ impl VocoderConfig {
             step_base: 222.0,
             ring_out_len: sr as usize + 65536,
             total_ratio: 1.0,
+            transient_sched: true,
         }
     }
 }
@@ -426,6 +437,38 @@ pub struct VocoderState {
     sync_sens_3496: f32,
     pitch_freq_169: f32,
     pitch_metric_168: f32,
+    /// Transient subsystem (`transient.rs`): score queue, input-side detector
+    /// and the hop scheduler. Only touched when
+    /// `cfg.transient_sched` is set; the machine reports the DLL's `state`
+    /// (`renderer+2448`) whose `== 2` value feeds the existing
+    /// `transient_state_2488` gates.
+    tqueue: crate::vocoder::transient::TransientQueue,
+    tdetector: crate::vocoder::transient::TransientDetector,
+    tsched: crate::vocoder::transient::TransientSched,
+    /// The active machine window's plan and its in/out base positions (the
+    /// targets the sub-granules chase).
+    ts_plan: Option<crate::vocoder::transient::SchedOut>,
+    ts_in_base: i64,
+    ts_out_base: i64,
+    /// Per-granule cache of the scheduler's output step override (DLL `v853`).
+    ts_out_step: i32,
+    /// Diagnostic: when true (and `transient_sched` true), the scheduler also
+    /// overrides the per-granule input hop / output step (re-timing granules
+    /// onto detected attacks, as the DLL does). The state-2 chain gates run
+    /// either way.
+    ///
+    /// Default **false**: measured against the AU reference corpus
+    /// (`tests/au_transient_ab.rs`), the gates alone keep the contour
+    /// correlation at the off-baseline (0.64 vs 0.65) while the re-timed
+    /// variant collapses it (0.52 @ the 3592 table hop, 0.11 @ the machine's
+    /// own ~704-frame hop) — our schedule table's granule lattice differs
+    /// from the DLL's execution layer enough that hop substitution smears the
+    /// output. Revisit once the renderer+1384/+1448 anchors are captured
+    /// dynamically (RE doc §13.4).
+    pub ts_hop_override: bool,
+    /// Transient-subsystem diagnostics (tests/logging).
+    ts_events: u64,
+    ts_state2_granules: u64,
     win1: Vec<f32>,
     win2: Vec<f32>,
     out_ring: Vec<f32>, // [nch][ring_out_len]
@@ -709,6 +752,16 @@ impl VocoderState {
             sync_sens_3496: f32::from_bits(0x3F40_0000),
             pitch_freq_169: 0.0,
             pitch_metric_168: 0.0,
+            tqueue: crate::vocoder::transient::TransientQueue::new(128, 0),
+            tdetector: crate::vocoder::transient::TransientDetector::new(cfg.sr),
+            tsched: crate::vocoder::transient::TransientSched::new(),
+            ts_plan: None,
+            ts_in_base: 0,
+            ts_out_base: 0,
+            ts_out_step: 0,
+            ts_hop_override: false,
+            ts_events: 0,
+            ts_state2_granules: 0,
             win1: vec![0.0; cfg.n_fft],
             win2: vec![0.0; cfg.n_fft],
             out_ring: vec![0.0; n_ch * cfg.ring_out_len],
@@ -756,9 +809,44 @@ impl VocoderState {
         // is exactly `ratio`, so the pitch-only path is unchanged.
         self.slope = self.ratio * self.stretch;
         self.comp_1432 = self.slope * self.hop_1420 as f64;
+        // The transient scheduler's geometry (`renderer+2452` etc.) from
+        // sub_180157BC0 — the machine's own ~15 ms granule, not the schedule
+        // hop.
+        self.tsched.set_geometry(self.cfg.n_write as i64, self.slope, true);
         // Keep the formant operator in step: its ratio is the pitch ratio offset by
         // the formant shift, and it must follow the pitch as well.
         self.sync_formant_ratio();
+    }
+
+    /// Enable or disable the transient-preservation subsystem
+    /// ([`VocoderConfig::transient_sched`]). Must be called before feeding;
+    /// returns `self` for chaining.
+    pub fn set_transient_sched(&mut self, on: bool) -> &mut Self {
+        self.cfg.transient_sched = on;
+        self
+    }
+
+    /// Whether the transient-preservation subsystem is enabled.
+    pub fn transient_sched(&self) -> bool {
+        self.cfg.transient_sched
+    }
+
+    /// Transient-subsystem diagnostics: (detected event chunks, granules in
+    /// the `state == 2` processing mode). Zero when disabled.
+    pub fn transient_stats(&self) -> (u64, u64) {
+        (self.ts_events, self.ts_state2_granules)
+    }
+
+    /// Enable per-granule scheduler tracing (diagnostics/tests); see
+    /// [`Self::transient_trace`].
+    pub fn set_transient_trace(&mut self, on: bool) {
+        self.tsched.trace_enabled = on;
+    }
+
+    /// The scheduler trace: `(inpos, state, query_result)` per granule while
+    /// tracing was enabled.
+    pub fn transient_trace(&self) -> &[[i64; 3]] {
+        &self.tsched.trace
     }
 
     #[inline]
@@ -802,6 +890,23 @@ impl VocoderState {
         for v in self.noise_gain.iter_mut() {
             *v = 0.0;
         }
+        // Transient subsystem: fresh detector/queue/scheduler per stream (the
+        // DLL re-runs its state machine per streaming session).
+        if self.cfg.transient_sched {
+            let trace = self.tsched.trace_enabled;
+            self.tsched = crate::vocoder::transient::TransientSched::new();
+            self.tsched.trace_enabled = trace;
+            self.tsched
+                .set_geometry(self.cfg.n_write as i64, self.slope, true);
+            self.tqueue = crate::vocoder::transient::TransientQueue::new(128, 0);
+            self.tdetector = crate::vocoder::transient::TransientDetector::new(self.cfg.sr);
+        }
+        self.ts_plan = None;
+        self.ts_in_base = 0;
+        self.ts_out_base = 0;
+        self.ts_out_step = 0;
+        self.ts_events = 0;
+        self.ts_state2_granules = 0;
     }
 
     // -----------------------------------------------------------------
@@ -919,6 +1024,20 @@ impl VocoderState {
             cart_to_polar_into(&self.cart, &mut c.mag, &mut c.mask);
             for k in 0..nb {
                 c.mag[k] = c.mag[k].max(floor);
+            }
+        }
+        // The fast per-bin envelope the DLL keeps at `renderer+0x710` (our
+        // `b_710`, RPT's B2 noise-floor reference): spectrum #2 smoothed by a
+        // one-pole IIR with τ = 0.01 s, switching to 0.005 s in the `state ==
+        // 2` transient mode (`sub_180158D20` @ 0x18015c8f0/0x18015d289,
+        // `TimeToIirA(τ, sr/hop)`). pyradius left this buffer at zero, which
+        // is why its B2 branch never did anything even when entered.
+        if self.cfg.transient_sched {
+            let tau = if self.transient_state_2488 == 2 { 0.005 } else { 0.01 };
+            let a = time_to_iir_a(tau, self.cfg.sr as f32 / self.hop_1420 as f32);
+            let mag = &self.ch[ch].mag;
+            for k in 0..nb {
+                self.b_710[k] = fma(mag[k] - self.b_710[k], a, self.b_710[k]);
             }
         }
         self.ev_find_peaks(ch);
@@ -1219,6 +1338,20 @@ impl VocoderState {
     /// `_ev_rpt` — `ResetPhasesForTransients`.
     fn ev_rpt(&mut self, b: usize) {
         let nb = self.cfg.nb_bins;
+        // The B3 average trio: the DLL takes the transient queue's score RMS
+        // at `inpos−hop / inpos / inpos+hop` (`sub_180153A70`); pyradius had
+        // no queue and passed zeros, killing the branch's local-peak test.
+        let (avg_m1, avg_0, avg_p1) = if self.cfg.transient_sched {
+            let h = self.hop_1420 as i64;
+            let p = self.cursor_1376;
+            (
+                self.tqueue.rms_around(p - h, h),
+                self.tqueue.rms_around(p, h),
+                self.tqueue.rms_around(p + h, h),
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         let mut phase = std::mem::take(&mut self.ch[b].phase);
         let mut mask_table = std::mem::take(&mut self.mask_table_8f8);
         reset_phases_for_transients(
@@ -1233,9 +1366,9 @@ impl VocoderState {
             self.hop_1420 as i64,
             self.cfg.n_fft as i64,
             nb as i64,
-            0.0,
-            0.0,
-            0.0,
+            avg_m1,
+            avg_0,
+            avg_p1,
             false,
             &self.ch[b].mag,
             &self.b_710,
@@ -1316,6 +1449,11 @@ impl VocoderState {
         let mut a3 = (sched_next.0 - sched_now.0) as i32;
         if a3 <= 0 {
             a3 = self.step_1412;
+        }
+        // The transient scheduler's per-granule output step override (DLL
+        // `v853`): replaces the table delta while the machine is engaged.
+        if self.ts_out_step > 0 {
+            a3 = self.ts_out_step;
         }
         let f1412 = self.step_1412.max(0) as i64;
         let p = self.cfg.precision;
@@ -1450,6 +1588,66 @@ impl VocoderState {
             self.step_1412 = se_curr.3 as i32;
         }
         self.out_step_1404 = (se_next.0 - se_curr.0) as i32;
+        // Transient hop scheduler (`sub_180158D20`'s state machine). The DLL
+        // machine runs on its OWN ~15 ms granule (`renderer+1368` ≈ 705 frames
+        // at 48 kHz), i.e. roughly every 3 of our 222-frame sub-granules —
+        // drive it from the cursor, not from a fixed sub-granule count: a new
+        // plan starts whenever the previous one's input span is consumed, and
+        // each sub-granule chases the plan's in/out targets exactly.
+        if self.cfg.transient_sched && self.g_index >= 8 {
+            let sched = &mut self.tsched;
+            let mut plan = self.ts_plan;
+            let (mut cursor, mut pos) = (self.cursor_1376, self.pos_1384);
+            if let Some(p) = plan {
+                if cursor >= self.ts_in_base + p.in_hop {
+                    plan = None; // plan fully consumed — machine re-steps below
+                }
+            }
+            if plan.is_none() {
+                let out = sched.step(
+                    &self.tqueue,
+                    cursor,
+                    pos,
+                    self.slope,
+                    self.cfg.sr as i64,
+                    sched.steady_hop,
+                    sched.steady_step,
+                );
+                if out.state2 {
+                    self.ts_state2_granules += 1;
+                }
+                self.ts_in_base = cursor;
+                self.ts_out_base = pos;
+                plan = Some(out);
+            }
+            if let Some(p) = plan {
+                if self.ts_hop_override {
+                    // Target-chasing shares: consume the remaining input span
+                    // over the sub-granules it takes at ~`step_base` each, and
+                    // land the output span the same way. Exact by
+                    // construction: the last sub-granule takes the remainder.
+                    let sub = self.cfg.step_base.max(1.0) as i64;
+                    let remain_in = (self.ts_in_base + p.in_hop - cursor).max(0);
+                    let n_in = ((remain_in + sub - 1) / sub).max(1);
+                    let share_in = remain_in / n_in;
+                    let remain_out = self.ts_out_base + p.out_step - pos;
+                    let n_out = ((remain_out.abs() + sub - 1) / sub).max(1);
+                    let share_out = remain_out / n_out;
+                    self.granule_1400 = share_in.max(0) as i32;
+                    let delta = share_out - self.out_step_1404 as i64;
+                    self.pos_1384 += delta;
+                    self.writepos_1224 += delta;
+                    self.ts_out_step = share_out as i32;
+                    pos = self.pos_1384;
+                }
+                self.transient_state_2488 = u32::from(p.state2);
+            }
+            self.ts_plan = plan;
+            let _ = (cursor, pos);
+        } else {
+            self.ts_out_step = 0;
+            self.transient_state_2488 = 0;
+        }
         let ph = self.g_index & 3;
         let nch = self.cfg.nch;
         let ch1 = 1 % nch;
@@ -1607,7 +1805,33 @@ impl VocoderState {
         self.xovers = xovers;
 
         self.fed_total += nin as i64;
-        while self.cursor_1376 + (self.hop_1420 as i64) < self.fed_total {
+        // Input-side transient scoring: mono mixdown in, finalised chunk scores
+        // into the queue (the DLL runs the detector on the block level in
+        // `sub_18014D7A0` before any granule work).
+        if self.cfg.transient_sched {
+            let nch_f = nch as f32;
+            let mono: Vec<f32> = (0..nin)
+                .map(|i| {
+                    let mut s = 0.0f32;
+                    for c in 0..nch {
+                        s += x[i * nch + c];
+                    }
+                    s / nch_f
+                })
+                .collect();
+            for (t, s) in self.tdetector.push(&mono) {
+                if s > 1.0 {
+                    self.ts_events += 1;
+                }
+                self.tqueue.push_at(t, s);
+            }
+        }
+        // The detector finalises a chunk's score only 7 chunks (5 comb
+        // look-ahead + 2 NMS window) after its audio was fed, so hold the
+        // granule pump that far back — the scheduler's event queries
+        // (≤ round(sr*0.1) ahead) then always see finalised scores.
+        let margin = if self.cfg.transient_sched { 7 * 128 } else { 0 };
+        while self.cursor_1376 + (self.hop_1420 as i64) + margin < self.fed_total {
             self.process_granule();
         }
         let made = self.out_total - self.out_reported;

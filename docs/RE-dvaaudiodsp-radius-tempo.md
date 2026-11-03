@@ -140,17 +140,36 @@ flush 时 next_out = min(next_out, flush_target)
 即调度层只按 pitch 比率做 varispeed 记账（out = in / 2^(P/12)），
 **stretch 全部由 renderer 斜率（S×2^(P/12)）在颗粒合成内部改变 hop 实现**。
 
-## 7. 斜率重算 sub_180157BC0（= hop 几何选择）
+## 7. 斜率重算 sub_180157BC0（= hop 几何选择）——动态验证版
+
+2026-11-03 晚用 x64dbg 对运行中的 AU 预览（q=2、slope=2.3784、48 kHz）实测：
+
+| 字段 | live 值 | 推导 |
+|---|---|---|
+| [1336] quality | 2 | 预览低质量（离线 High ⇒ ≥10） |
+| [1368] hop | 132 | round(round(7184×0.7/(4<<2))/2.3784) = round(314/2.3784) ✓ |
+| [1372] step | 314 | round(132×2.3784) = round(313.95) ✓ |
+| [1384] | **7184 = n_write** | 锚点确认 |
+| [1448] | **16384 = n_fft** | 锚点确认 |
+| [1452] | **8193 = nb_bins** | 锚点确认 |
+| [1392] span | 38 | round(7184×0.7/132) ✓ |
+| [1396] | 8193 | q<10 ⇒ 直接取 [1452] |
+| [2452] max_w | 27 | round(38×0.7×max(√1.0,1))，f=0.7（q<10）——按**更早 slope≈1** 的快照，说明 max_w 不随每次 slope 变更即重算 |
+| [2448] 机器状态 | 2（处理中） | appr/settle 参数活跃 |
+
+最终 hop 律（分支按 quality，斜率作用在除法上）：
 
 ```
-slope = a2 (传入 = ramp 求值的当前目标)
-quality = renderer[1336]
-if quality >= 10:  hop = round(sr[1448] × 14000 / sr_hw[96])  (clamp by [1452])
-else if slope < 1.0: hop = round(sr[1384] × 0.7 / (4 << quality))
-else:               hop = round(sr[1384] × 0.7 / {1,3,6}[min(quality,2)])  (quality<10 分档)
+base = round(n_write[1384] × 0.7 / D)      # D = 4<<q (q<10)；{3,3,6}[min(q−10,2)] (q≥10)
+hop  = round(base / slope)                 # [1368]
+step = round(hop × slope)                  # [1372]
+span = round(n_write × 0.7 / hop)          # [1392]
+max_w = round(span × f × max(√slope,1))    # [2452]，f = 1.4 (q≥10) / 0.7 (q<10)
 ```
-（pyradius 的 `set_ratio(semis, quality)` 的 quality→hop 表与此对应；
-具体表值待进一步核对。）
+
+48 k、High（q≥10）时 D=6：base=838，hop=round(838/slope)（slope 1.19 ⇒ 704，
+约 14.7 ms 机器粒）。**机器粒 ≠ 调度表 hop（3592）**：调度表驱动外部读入/输出，
+机器粒只进 transient 状态机的查询/保持计数。
 
 ## 8. 颗粒发射 sub_1801515C0（部分）
 
@@ -459,10 +478,16 @@ pyradius 位级语料随表退役，vc_acceptance 的参照测试改为感知阈
   −inpos)/N)`；2480=0；**2488 = N**；2500=2476；
   `tail = round((hop×2456 + 2N×2472 + …)/slope)`→ `2492 = 2472 +
   (残差整除 N)`，`2504 = 残差 mod N`；DataTail(renderer+2248) 清零。
-- **0→2**（压缩侧，slope≤1）：`best = QueryMax(inpos, round((hop×0.5×
-  max_w + step)/slope))`；接受 `best≠−1 && best≠last && best>sr×0.01`：
-  2456 = max(1, int((best−inpos)×2×slope/hop))；本粒 hop/out-step 直接
-  改为对齐值；**2484 = round(回稳态校正值)**；DataTail 清零。
+- **0→2**（压缩侧，slope≤1，**两段式**，0x180159bf3–0x180159e9e）：
+  1. `cand = QueryMax(inpos, round((hop×0.5×max_w+step)/slope))`；
+  2. `near = Query(cand, start=1, thr, mode=0)`（**双向**找最近事件），
+     d=|cand−near|/sr → ramp → **2456 = clamp(round((ramp×0.9+0.1)×max_w),1)，
+     此写发生在接受判定之前，接受失败也保留**（影响下一粒第二段范围）；
+  3. `best = QueryMax(inpos, round((hop×0.5×2456+step/slope)))`；接受
+     `best≠−1 && best≠last && best>sr×0.01`：2456 重写为
+     `max(1,int((best−inpos)×2×slope/hop))`；本粒 hop/out-step 直接改为
+     对齐值（v30=round((best−hop×2456×0.5)−inpos)，v853 同构）；
+     **2484 = round(回稳态校正值)**；DataTail 清零（LABEL_164）。
 - **1**：hop=2472；2468→2464 后 →2（2460=0，hop+=2480）。
 - **2**：hop=1368（稳态）；2460 到 2456 的一半时 renderer+3568 清零；
   到达 2456 后：若 `slope>1 && 2488` →**3**（2496=0）；同时在到达点用
@@ -490,20 +515,46 @@ pyradius 位级语料随表退役，vc_acceptance 的参照测试改为感知阈
 τ 都经 `TimeToIirA(τ, sr/hop)` 折算。注意 pyradius 把"==2"误系到偏移
 2488（本构建 2488 是回放保持计数）；正确字段是 2448。
 
-### 13.4 与我们端口的对位
+### 13.4 与我们端口的对位（已实现，2026-11-03晚）
 
-- 我们的 `transient_state_2488` 管线（ACS τ 选择、APC v15、RPT B1/B2/B3）
-  = 本构建的 state==2 门控——**接线已在，驱动缺失**；
-- 我们的 `ev_rpt` 传 `avg_m1/avg_0/avg_p1 = 0` 与 `use_p568=false`：
-  真值是队列分数 RMS 三元组（`sub_180153A70`），pyradius 没找到来源；
-- 需要新增：检测器（分数数组）、队列查询、§13.2 状态机（hop/out-step
-  逐粒覆盖我们调度表的默认值）、DataTail 输出清零的对位（输出环 recent
-  段清 0）；
+实现落在 `src/vocoder/transient.rs`（`TransientQueue`/`TransientDetector`/
+`TransientSched`），经 `VocoderConfig::transient_sched` 门控，**默认开启**
+（AU 一致性优先；pyradius/libradius 仅作代码参考，不再是输出基准）。
+pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
+
+- 队列：`TransientQueue` 精确移植 BD0/CD0/A70 三查询 + base/stride/head
+  紧凑化；检测器分数按绝对 chunk 索引入队（`push_at`，检测器首个可评分
+  chunk 是 4）。**stride = 128 帧**（x64dbg live：renderer+112+52 的
+  stride 字段，2026-11-03），即 2.7 ms chunk、±4 梳 span ±10.7 ms。
+- 检测器：结构移植：128 帧 chunk、512 点加窗 FFT（窗跨 4 chunk）、24 个
+  对数频段（40 Hz–Nyquist）、x^(1/8) 三次开方、9 槽环、±4 非对称梳
+  （负项 ×−0.1）、÷24 归一、±2 chunk NMS（0.7 因子）。自归一化设计使
+  阈值 >1.0 保持 DLL 量纲（实测鼓点击穿，峰值比爆发 chunk 提前 ≤1 chunk）。
+  DLL 的精确窗/频段/IIR 表仍未抓到（构造函数未定位）。
+- 状态机：§13.2 全转移精确移植（含两段式压缩侧）。机器粒 = §7 的
+  hop1368（48 k High ⇒ 704 帧 ≈ 我们 3.2 个子粒）：机器按**游标追踪**
+  步进（上一计划输入跨度耗尽即重新决策），计划期 in/out 目标按
+  share=(目标−已到)/剩余子粒 精确分摊；state==2 门控持续整个计划窗。
+- hop/out-step 重定时（`ts_hop_override` 诊断开关，**默认关**）：x64dbg
+  live 证实 AU 每块（~1024 帧）内 out 速率在 1.0→4.2× 间摆动即此机制；
+  但我们端口开了它后轮廓 corr 反而崩（0.65→0.52/0.11，两版几何皆试），
+  说明我们子粒格点与 DLL 执行层还有错位——保留为实验路径。
+- max_w = round(round(n_write×0.7/hop)×f×max(√slope,1))，f=1.4（q≥10，
+  我们 quality=37）/0.7（q<10），live q=2/slope1 快照 = 27 = round(38×0.7) ✓；
+- b_710（RPT B2 的噪底参考，pyradius 恒 0）：改为谱#2 的快速包络——
+  τ=0.01（稳态）/0.005（state2）一阶 IIR（`TimeToIirA(τ, sr/hop)`），
+  逐通道在 ev_acs 内更新。这是 DLL 0x18015c8f0/0x18015d289 两处 IIR 的
+  对位（第二处 1452 谱长遍历）；
+- RPT B3 三元组 = `rms_around(inpos−hop/inpos/inpos+hop, hop)`；
+- 未移植（记录在案）：DataTail(renderer+2248) 接受事件时清零（我们无对
+  应缓冲，接受事件时输出不额外清段）；0x18015b69a 峰区 ×10 增强抑制
+  （我们的 find_peaks/AFC 链无该增强路径）；检测器精确窗/频段/IIR 表。
 - 纯变调（tempo=100、pitch>0）在 AU 中 slope>1 同样触发本子系统——这解
-  释了我们/ pyradius 与 AU 采样级 corr 只有 0.03–0.05 的部分成因；
-  pyradius 位级等价测试必须用配置开关与本子系统隔离。
-- 待动态抓取：stride 确值（推断 1024）、检测器窗/频段边界/IIR 系数表
-  （构造函数未定位，候选簇 0x180153190/0x180153570 是后处理非构造）。
+  释了我们/ pyradius 与 AU 采样级 corr 只有 0.03–0.05 的部分成因。
+- 实测（AU 参考语料 29 s，`tests/au_transient_ab.rs`，10 ms 包络、
+  ±30 bin 最优滞后）：off 轮廓 corr 0.6494/attack 窗 0.4903；仅门控
+  （默认）0.6435/0.5024（无害且略优）；门控+重定时 0.5154/0.4191
+  （attack 上升比 1.069 达标但轮廓受损）——故默认仅门控。
 
 本节所有地址基于当前 IDB（RE 文档 §6–§8 同一构建）；pyradius 注释里的
 `@0x16D354` 等地址属于另一构建，不可混用。
