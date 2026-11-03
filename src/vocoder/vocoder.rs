@@ -1597,7 +1597,7 @@ impl VocoderState {
         if self.cfg.transient_sched && self.g_index >= 8 {
             let sched = &mut self.tsched;
             let mut plan = self.ts_plan;
-            let (mut cursor, mut pos) = (self.cursor_1376, self.pos_1384);
+            let (cursor, pos) = (self.cursor_1376, self.pos_1384);
             if let Some(p) = plan {
                 if cursor >= self.ts_in_base + p.in_hop {
                     plan = None; // plan fully consumed — machine re-steps below
@@ -1622,23 +1622,26 @@ impl VocoderState {
             }
             if let Some(p) = plan {
                 if self.ts_hop_override {
-                    // Target-chasing shares: consume the remaining input span
-                    // over the sub-granules it takes at ~`step_base` each, and
-                    // land the output span the same way. Exact by
-                    // construction: the last sub-granule takes the remainder.
-                    let sub = self.cfg.step_base.max(1.0) as i64;
-                    let remain_in = (self.ts_in_base + p.in_hop - cursor).max(0);
-                    let n_in = ((remain_in + sub - 1) / sub).max(1);
-                    let share_in = remain_in / n_in;
-                    let remain_out = self.ts_out_base + p.out_step - pos;
-                    let n_out = ((remain_out.abs() + sub - 1) / sub).max(1);
-                    let share_out = remain_out / n_out;
-                    self.granule_1400 = share_in.max(0) as i32;
-                    let delta = share_out - self.out_step_1404 as i64;
-                    self.pos_1384 += delta;
-                    self.writepos_1224 += delta;
-                    self.ts_out_step = share_out as i32;
-                    pos = self.pos_1384;
+                    // Per-granule RATIO modulation, per RE §13.5: the DLL's
+                    // emit loop keeps the input lattice fixed (ring_off =
+                    // pos mod hop) and changes only the granule's effective
+                    // ratio per event-queue breakpoint (n_out = Δin/ratio).
+                    // Here: leave granule_1400 and the schedule table alone
+                    // (their desync is what collapsed earlier attempts) and
+                    // scale only the output advance by plan_ratio/slope.
+                    let plan_ratio = if p.in_hop > 0 {
+                        p.out_step as f64 / p.in_hop as f64
+                    } else {
+                        self.slope
+                    };
+                    let m = (plan_ratio / self.slope).clamp(0.25, 4.0);
+                    let eff = (self.out_step_1404 as f64 * m).round() as i64;
+                    let delta = eff - self.out_step_1404 as i64;
+                    if delta != 0 {
+                        self.pos_1384 += delta;
+                        self.writepos_1224 += delta;
+                    }
+                    self.ts_out_step = eff as i32;
                 }
                 self.transient_state_2488 = u32::from(p.state2);
             }

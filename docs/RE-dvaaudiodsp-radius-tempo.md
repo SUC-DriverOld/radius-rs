@@ -580,6 +580,13 @@ pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
   不动 pos），影响谱峰定位/相位推进/OAC 窗伸缩的 per-granule ratio 钩子。
   现有 `ts_hop_override` 的 pos 扭曲方案已被此发现证伪（corr 崩 0.10 的
   根因）。
+- **ratio 调制版已实现并测量**（2026-11-03 深夜）：`ts_hop_override` 语义
+  更正为"输出步长 × plan_ratio/slope"（输入格子/表格完全不动）。A/B：
+  100% corr 0.097→**0.526**、200% 0.078→**0.448**（相对 pos 扭曲版 5×
+  改善）——机制证实，但仍低于 off（0.65/0.64），残余劣化推断为 OAC
+  COLA 失配：发射窗长固定而出步长不均。DLL 每次发射还同步改
+  hop=[592]+[600]（半边未移植），补上它（writepos 间隔与窗长同步按
+  ratio_j 缩放）是下一步。仍默认关。
 - x64dbg 脚本：`.tmp/x64dbg/`（call.py、dump_renderer.py、trace_emitter.py、
   trace_granules.py）；IDA 侧 `.tmp/ida/decomp_to_file.py`（xrefs_to 用
   `addrs=[...]`，decompile 用 `addr=...`）。
