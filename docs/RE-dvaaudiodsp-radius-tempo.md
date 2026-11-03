@@ -587,6 +587,14 @@ pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
   COLA 失配：发射窗长固定而出步长不均。DLL 每次发射还同步改
   hop=[592]+[600]（半边未移植），补上它（writepos 间隔与窗长同步按
   ratio_j 缩放）是下一步。仍默认关。
+- **持久偏移实验（已回退）**：把输出偏移做成跨子粒累计（对位 DLL 输入
+  累计器 [a2+792] += n_out×ratio）更糟——100%/200%/50% = 0.36/0.23/
+  0.00，200% 全局滞后 −290 ms。结论：DLL 的累计器是**双侧**的（输入
+  位置与输出位置都由事件队列推进，appr/settle/replay 计划对着绝对
+  in/out 位置自校正），我们只推输出侧必然无界漂移。正确的完整移植
+  要让 cursor 也脱离调度表由机器驱动（"16 子粒=1 DLL 粒"的经验映射
+  届时消解）——架构级改造，留待下一轮。当前最优仍是局部 ratio 调制
+  （0.526/0.448，默认关）。
 - x64dbg 脚本：`.tmp/x64dbg/`（call.py、dump_renderer.py、trace_emitter.py、
   trace_granules.py）；IDA 侧 `.tmp/ida/decomp_to_file.py`（xrefs_to 用
   `addrs=[...]`，decompile 用 `addr=...`）。
