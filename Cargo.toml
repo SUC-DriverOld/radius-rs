@@ -28,6 +28,9 @@ hound = "3.5.1"
 symphonia = { version = "0.6", default-features = false, features = ["aac", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 flacenc = { version = "0.5.1", default-features = false, features = ["experimental", "par"] }
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
