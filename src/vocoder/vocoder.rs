@@ -253,6 +253,11 @@ pub struct VocoderConfig {
     /// code reference only. The bit-exact pyradius regression tests opt out
     /// explicitly via [`VocoderState::set_transient_sched`]`(false)`.
     pub transient_sched: bool,
+    /// Experimental: let RPT take the DLL's B2 noise-floor branch while the
+    /// transient machine is in state 2. Our `b_710` reference is a structural
+    /// approximation and B2 measurably degrades all three AU references —
+    /// default off (B3 trio everywhere). See RE doc §13.4 audit round.
+    pub ts_rpt_b2: bool,
 }
 
 impl VocoderConfig {
@@ -322,6 +327,7 @@ impl VocoderConfig {
             ring_out_len: sr as usize + 65536,
             total_ratio: 1.0,
             transient_sched: true,
+            ts_rpt_b2: false,
         }
     }
 }
@@ -989,7 +995,14 @@ impl VocoderState {
         } else {
             f32::from_bits(APC_TAU_STEADY_BITS)
         };
-        let hopf = if self.step_1412 > 0 {
+        // 2026-11-04 audit D50: the DLL folds τ with TimeToIirA(τ, sr/hop)
+        // where hop = renderer+1376 = the MACHINE hop (≈704 @48k), not our
+        // sub-granule step nor the schedule hop.
+        let hopf = if self.tsched.steady_hop > 0 {
+            self.tsched.steady_hop as f32
+        } else if self.step_1412 > 0 {
+            // machine inactive (transient_sched off): keep the historical
+            // rate basis so the pyradius golden path is unchanged
             self.step_1412 as f32
         } else {
             288.0
@@ -1034,7 +1047,14 @@ impl VocoderState {
         // is why its B2 branch never did anything even when entered.
         if self.cfg.transient_sched {
             let tau = if self.transient_state_2488 == 2 { 0.005 } else { 0.01 };
-            let a = time_to_iir_a(tau, self.cfg.sr as f32 / self.hop_1420 as f32);
+            // Audit D50: same rate-basis fix — sr/machine-hop, which turns
+            // a≈0.999 (no smoothing, B2 fed noise) into a≈0.77 like the DLL.
+            let hopf = if self.tsched.steady_hop > 0 {
+                self.tsched.steady_hop as f32
+            } else {
+                self.hop_1420 as f32
+            };
+            let a = time_to_iir_a(tau, self.cfg.sr as f32 / hopf);
             let mag = &self.ch[ch].mag;
             for k in 0..nb {
                 self.b_710[k] = fma(mag[k] - self.b_710[k], a, self.b_710[k]);
@@ -1342,7 +1362,14 @@ impl VocoderState {
         // at `inpos−hop / inpos / inpos+hop` (`sub_180153A70`); pyradius had
         // no queue and passed zeros, killing the branch's local-peak test.
         let (avg_m1, avg_0, avg_p1) = if self.cfg.transient_sched {
-            let h = self.hop_1420 as i64;
+            // Audit D59: the DLL's trio windows are ±machine-hop (≈704),
+            // not the 3592-frame schedule hop — a 28-chunk window washed
+            // out the local-peak test.
+            let h: i64 = if self.tsched.steady_hop > 0 {
+                self.tsched.steady_hop
+            } else {
+                self.hop_1420 as i64
+            };
             let p = self.cursor_1376;
             (
                 self.tqueue.rms_around(p - h, h),
@@ -1354,9 +1381,19 @@ impl VocoderState {
         };
         let mut phase = std::mem::take(&mut self.ch[b].phase);
         let mut mask_table = std::mem::take(&mut self.mask_table_8f8);
+        // Measured decision (2026-11-04 A/B): the DLL switches RPT to the B2
+        // noise-floor branch in state 2, but our b_710 is a structural
+        // approximation of its reference and B2 measurably degrades all three
+        // AU references (0.48/0.41/0.30 vs 0.64 with B3). Default to the B3
+        // trio everywhere; opt into B2 for experiments.
+        let rpt_state = if self.cfg.ts_rpt_b2 {
+            self.transient_state_2488 as i32
+        } else {
+            0
+        };
         reset_phases_for_transients(
             self.transient_flag_1208 as i32,
-            self.transient_state_2488 as i32,
+            rpt_state,
             self.ratio,
             nb as i64,
             0,
@@ -1643,7 +1680,11 @@ impl VocoderState {
                     }
                     self.ts_out_step = eff as i32;
                 }
-                self.transient_state_2488 = u32::from(p.state2);
+                // Consumers compare `== 2` (phase.rs:279/446, the τ picks
+                // below), so this must carry the machine's RAW state
+                // (0..3), not the state2 bool — the bool silently killed
+                // all six gates (found in the 2026-11-04 audit).
+                self.transient_state_2488 = p.state as u32;
             }
             self.ts_plan = plan;
             let _ = (cursor, pos);

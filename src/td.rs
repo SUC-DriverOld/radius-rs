@@ -1087,7 +1087,10 @@ impl TdState {
                 let dd0 = head as f64 - wp_acc;
                 let w9 = if dd0 > 0.0 { dd0 as i64 } else { 0 };
                 if w9 != 0 {
-                    let count = (w9 as f64 / self.pitch_ratio) as i64;
+                    // 2026-11-04 audit T12: round, not truncate — the DLL law
+                    // (n_out = round((ring−100−rem)/r), five live samples) and
+                    // the vocoder side (vocoder.rs drain) both round.
+                    let count = (w9 as f64 / self.pitch_ratio + 0.5) as i64;
                     if count > 0 {
                         let mut ph = wp_acc % out_len as f64;
                         if ph < 0.0 {

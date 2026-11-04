@@ -188,6 +188,13 @@ impl TransientQueue {
                 best = i;
             }
         }
+        // 2026-11-04 audit D34: a zero score is NOT a valid maximum — the
+        // DLL returns "no event" (−1) when the window holds only
+        // unsettled/zero-scored chunks; accepting zeros fed the compress
+        // side a stream of phantom events on steady passages.
+        if best_v <= 0.0 {
+            return -1;
+        }
         self.base + self.stride * best
     }
 
@@ -351,15 +358,15 @@ impl TransientDetector {
                     let done = self.pending_base + i as i64;
                     let s = self.pending[i];
                     let mut alive = s;
-                    if s > 1.0 {
-                        for d in [-2i64, -1, 1, 2] {
-                            let j = i as i64 + d;
-                            if j >= 0 && (j as usize) < self.pending.len() {
-                                let nb = self.pending[j as usize];
-                                if nb * 0.7 > s {
-                                    alive = 0.0;
-                                    break;
-                                }
+                    // 2026-11-04 audit D30: the DLL applies suppression to
+                    // every score, not only those above 1.0.
+                    for d in [-2i64, -1, 1, 2] {
+                        let j = i as i64 + d;
+                        if j >= 0 && (j as usize) < self.pending.len() {
+                            let nb = self.pending[j as usize];
+                            if nb * 0.7 > s {
+                                alive = 0.0;
+                                break;
                             }
                         }
                     }
