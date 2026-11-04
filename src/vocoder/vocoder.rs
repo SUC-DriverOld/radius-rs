@@ -1754,27 +1754,32 @@ impl VocoderState {
                 } else {
                     self.hop_1420 as i64
                 };
-                let mut m = std::mem::take(&mut self.ts_gate_scratch);
-                m.resize(nb, 0.0);
-                m.copy_from_slice(&self.ch[r].mag[..nb]);
+                // Score/target split (2026-11-05 live decode): the DLL
+                // scores the RAW analysis copy (1664 ← 1768, LABEL_768 —
+                // 1768 is the same buffer the 0xab3 peak search reads,
+                // i.e. pre-coherence/pre-AFC) and multiplies the gains
+                // into the synthesis spectrum (spec[k] *= work[k]). Our
+                // pre-AFC snapshot is mag_copy, taken above before ev_afc.
+                let mut score = std::mem::take(&mut self.ts_gate_scratch);
+                score.resize(nb, 0.0);
+                score.copy_from_slice(&self.ch[r].mag_copy[..nb]);
                 let st2 = self.transient_state_2488 == 2;
                 let pratio = self.ratio as f32;
-                self.ts_gate.apply(
+                let mut target = std::mem::take(&mut self.ch[r].mag);
+                self.ts_gate.apply_split(
                     r,
-                    &mut m,
+                    &score,
+                    &mut target,
                     self.cfg.sr,
                     self.cfg.n_fft,
                     hop,
                     st2,
                     pratio,
                 );
-                self.ts_gate_scratch = m;
+                self.ch[r].mag = target;
+                self.ts_gate_scratch = score;
             }
-            let mag_src: &[f32] = if gate_now {
-                &self.ts_gate_scratch[..nb]
-            } else {
-                &self.ch[r].mag[..nb]
-            };
+            let mag_src: &[f32] = &self.ch[r].mag[..nb];
             {
                 let phase = &self.ch[r].phase;
                 let cart = &mut self.cart;

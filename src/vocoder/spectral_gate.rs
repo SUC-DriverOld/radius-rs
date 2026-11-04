@@ -217,12 +217,34 @@ impl SpectralGate {
         state2: bool,
         pitch_ratio: f32,
     ) {
-        let nb = mag.len();
+        // Score and target on the same buffer (the historical single-slice
+        // semantics; unit tests use this form).
+        let score = mag.to_vec();
+        self.apply_split(ch, &score, mag, sr, n_fft, machine_hop, state2, pitch_ratio);
+    }
+
+    /// The DLL's actual consumer topology (2026-11-05 live decode): the
+    /// eleven-step law SCORES the raw analysis copy (1664, refreshed from
+    /// 1768 at LABEL_768) and step 11 MULTIPLIES the gains into the
+    /// synthesis spectrum (`spec[k] *= work[k]` at 0x18015d3a2). Scoring
+    /// input and application target are therefore distinct buffers.
+    pub fn apply_split(
+        &mut self,
+        ch: usize,
+        score: &[f32],
+        target: &mut [f32],
+        sr: u32,
+        n_fft: usize,
+        machine_hop: i64,
+        state2: bool,
+        pitch_ratio: f32,
+    ) {
+        let nb = score.len().min(target.len());
         let n_half = n_fft / 2;
         // --- steps 1-3: dB, forward FFT (zero-padded to n_fft), cepstral
         //     power, IIR into 7768 (τ 0.005 in state 2 else 0.01, rate
         //     sr/machine-hop) ---
-        let db = amp2db(&mag[..nb]);
+        let db = amp2db(&score[..nb]);
         self.pad[..nb].copy_from_slice(&db);
         for v in self.pad[nb..].iter_mut() {
             *v = 0.0;
@@ -289,7 +311,7 @@ impl SpectralGate {
         let mut gains = gain_field(&self.db_work[..nb], pitch_ratio);
 
         // --- step 9: energy normalization (byte 7554) ---
-        energy_normalize(&mut gains, &mag[..nb]);
+        energy_normalize(&mut gains, &score[..nb]);
 
         // --- step 10: attractor work[k] += (g[k]−work[k])·a (buffer 7864) ---
         let a10 = time_to_iir_a(tau, sr as f32 / machine_hop.max(1) as f32);
@@ -306,7 +328,7 @@ impl SpectralGate {
             .min(nb as i64 - 1)
             .max(0) as usize;
         for k in start..nb {
-            mag[k] *= work[k];
+            target[k] *= work[k];
         }
     }
 }
@@ -442,5 +464,45 @@ mod tests {
         let mut one = vec![0.0f32; 1];
         iir_smooth(&mut one, &[1.0], 0.1);
         assert!((one[0] - 0.1).abs() < 1e-7);
+    }
+
+    #[test]
+    fn split_scores_raw_and_gates_target() {
+        // The DLL topology: gains derive from the RAW analysis copy, then
+        // multiply the SYNTHESIS spectrum. A flat score must yield ~unity
+        // gains (target survives), while scoring a steeply decaying
+        // spectrum under pitch > 1 produces sub-unity gains — so gating the
+        // same target with different scores must give different targets.
+        let mut gate = SpectralGate::new(1024, 2);
+        let flat = vec![1.0f32; 513];
+        let decay: Vec<f32> = (0..513).map(|k| 10.0 * (-(k as f32) * 0.08).exp()).collect();
+        let pr = 2.0f32.powf(3.0 / 12.0);
+        // warm each channel's attractor in its own regime (per-channel work)
+        for _ in 0..200 {
+            let mut t1 = flat.clone();
+            gate.apply_split(0, &flat, &mut t1, 48_000, 1024, 16, false, pr);
+            let mut t2 = flat.clone();
+            let d2 = decay.clone();
+            gate.apply_split(1, &d2, &mut t2, 48_000, 1024, 16, false, pr);
+        }
+        // final pass on identical targets, different scores/channels
+        let mut t1 = flat.clone();
+        let mut t2 = flat.clone();
+        gate.apply_split(0, &flat, &mut t1, 48_000, 1024, 16, false, pr);
+        gate.apply_split(1, &decay, &mut t2, 48_000, 1024, 16, false, pr);
+        // flat score → target roughly preserved (unity-ish gains)
+        assert!(t1.iter().all(|v| v.is_finite() && *v > 0.0));
+        assert!(
+            (t1[200] - 1.0).abs() < 0.2,
+            "flat score should keep unity-ish gains, got {}",
+            t1[200]
+        );
+        // decaying score → stronger attenuation than flat score somewhere
+        let min1 = t1[100..513].iter().cloned().fold(f32::INFINITY, f32::min);
+        let min2 = t2[100..513].iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            min2 < min1 * 0.999,
+            "decaying score must attenuate more (min2={min2} vs min1={min1})"
+        );
     }
 }
