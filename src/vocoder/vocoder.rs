@@ -259,6 +259,19 @@ pub struct VocoderConfig {
     /// approximation and B2 measurably degrades all three AU references —
     /// default off (B3 trio everywhere). See RE doc §13.4 audit round.
     pub ts_rpt_b2: bool,
+    /// Experimental: run the DLL's noise-synthesis excitation loop
+    /// (`sub_180158D20` L2050-2660/L3232-3268, RE §13.9) once per machine
+    /// granule per channel — loop A (peak-anchored output spectrum), loop B
+    /// (excitation evolution + keystream double buffer + the ×10 peak-region
+    /// enhancement), loop D (score-weighted band smoothing) and the init-pass
+    /// snapshot. The evolved `noise_gain` rows and the §13.9 output spectrum
+    /// are then live state; the +3568 tail reset reads the loop's own source
+    /// mirror instead of the sub-granule `mag_copy`. Default off — the loop's
+    /// output consumer (buffer 2176's reader) sits outside `sub_180158D20`
+    /// and several object scalars (base weight envelope, randomize-ring
+    /// history fill, `v173`/`v894`) remain undecoded, so the audio effect of
+    /// enabling it must be A/B-measured first.
+    pub ts_noise_loop: bool,
 }
 
 impl VocoderConfig {
@@ -299,7 +312,10 @@ impl VocoderConfig {
                 } else {
                     16384usize >> (-shift)
                 };
-                let n_write = ((7184.0 * f64::from(sr) / 48000.0).round()) as usize;
+                // Exact DLL law (sub_180157BC0 inputs, live-verified at both
+                // anchors): n_write = 3*sr/20 - 16 (48k -> 7184, 44.1k ->
+                // 6599; the earlier 7184*sr/48 fit was off by one at 44.1k).
+                let n_write = (3.0 * f64::from(sr) / 20.0 - 16.0).round() as usize;
                 let hop = (n_write / 2) as i32;
                 (
                     n_fft,
@@ -329,6 +345,7 @@ impl VocoderConfig {
             total_ratio: 1.0,
             transient_sched: true,
             ts_rpt_b2: false,
+            ts_noise_loop: false,
         }
     }
 }
@@ -454,6 +471,10 @@ pub struct VocoderState {
     /// Synthesis-copy scratch for the §13.8 gate (the DLL gates buffer
     /// 1664, a copy of the analysis 1768 — never the analysis itself).
     ts_gate_scratch: Vec<f32>,
+    /// The §13.9 noise-synthesis excitation loop (per-channel excitation/
+    /// keystream state; runs once per machine granule while `ts_noise_loop`
+    /// is on). `None` until first used.
+    ts_noise: Option<noise_loop::NoiseLoop>,
     /// Generation counters: `ts_plan_gen` bumps per new machine plan,
     /// `ts_gate_gen` records the last gated generation — together they
     /// give the DLL's once-per-machine-granule gate rate.
@@ -782,6 +803,7 @@ impl VocoderState {
             b_710: vec![0.0; nb],
             ts_gate: SpectralGate::new(cfg.n_fft, cfg.nch),
             ts_gate_scratch: Vec::new(),
+            ts_noise: None,
             ts_plan_gen: 0,
             ts_gate_gen: 0,
             mask_table_8f8: vec![0.0; nb],
@@ -1570,19 +1592,24 @@ impl VocoderState {
             // buffer's tail from its per-bin analysis reference
             // (`renderer+2080[ch][start..] := renderer+1872[ch][start..]`,
             // `0x18015c755`) and clears the frame counter (`0x18015c783`).
-            // Our noise path's counterpart of the working buffer is
-            // `noise_gain` ([nch][nb_bins]); the reference side (the DLL's
-            // +1872, filled by its noise-synthesis loop) has no live engine
-            // counterpart yet — the pre-AFC magnitude snapshot `mag_copy` is
-            // the closest analysis reference.
-            // TODO(+3568): repoint at the true reference once the DLL's
-            // noise-synthesis loop (158D20 L2238+) is ported.
+            // With the §13.9 loop running, the excitation state lives in the
+            // loop's own 2080 mirror (evolved per machine granule and copied
+            // into `noise_gain`); the reset then writes through the loop so
+            // the loop's keystream/flags stay coherent with its excitation.
+            // The source side: 1872 = the mag_copy refresh of 1976 (ch.mag),
+            // pinned this round — `mag_copy` IS the true reference.
             let base = b * nb;
-            let (dst, src) = (
-                &mut self.noise_gain[base..base + nb],
-                &self.ch[b].mag_copy,
-            );
-            dst[start as usize..nb].copy_from_slice(&src[start as usize..nb]);
+            if let Some(nl) = self.ts_noise.as_mut() {
+                let (dst, src) = (nl.exc_mut(b), &self.ch[b].mag_copy);
+                dst[start as usize..nb].copy_from_slice(&src[start as usize..nb]);
+                self.noise_gain[base..base + nb].copy_from_slice(&nl.exc(b)[..nb]);
+            } else {
+                let (dst, src) = (
+                    &mut self.noise_gain[base..base + nb],
+                    &self.ch[b].mag_copy,
+                );
+                dst[start as usize..nb].copy_from_slice(&src[start as usize..nb]);
+            }
             self.ts_frames_since_transient = 0;
         }
         self.ch[b].phase = phase;
@@ -1881,6 +1908,68 @@ impl VocoderState {
                 self.ts_out_base = pos;
                 plan = Some(out);
                 self.ts_plan_gen += 1;
+                // The §13.9 noise-synthesis loop runs once per MACHINE
+                // granule per channel (the DLL's own rate, after the state
+                // machine inside the same channel iteration). Bands = the
+                // current peak regions; the score is the covering chunk's
+                // refined score, broadcast per bin (the DLL's 3248 buffer is
+                // per-bin; ours is per-time-chunk).
+                if self.cfg.transient_sched && self.cfg.ts_noise_loop {
+                    let nb = self.cfg.nb_bins;
+                    let stride = self.tqueue.stride().max(1);
+                    let chunk = cursor / stride;
+                    let score = self.tqueue.score_at(chunk);
+                    let cnt = self.peak_count.min(self.reg_start.len());
+                    let bands: Vec<noise_loop::NoiseBand> = (0..cnt)
+                        .map(|k| {
+                            let s = (self.reg_start[k].max(0) as usize).min(nb);
+                            let e = (self.reg_end[k].max(0) as usize).min(nb);
+                            noise_loop::NoiseBand { start: s, end: e.max(s), ref_bin: s }
+                        })
+                        .collect();
+                    if self.ts_noise.is_none() {
+                        self.ts_noise = Some(noise_loop::NoiseLoop::new(
+                            self.cfg.nch,
+                            nb,
+                        ));
+                    }
+                    let state = out.state;
+                    let (hop_m, step_m) = (out.in_hop, out.out_step);
+                    let n_fft = self.cfg.n_fft as i32;
+                    let sr = self.cfg.sr;
+                    let stretch = self.stretch;
+                    let mut snap_mag: Vec<Vec<f32>> = Vec::new();
+                    let mut snap_copy: Vec<Vec<f32>> = Vec::new();
+                    for r in 0..self.cfg.nch {
+                        snap_mag.push(self.ch[r].mag[..nb].to_vec());
+                        snap_copy.push(self.ch[r].mag_copy[..nb].to_vec());
+                    }
+                    let nl = self.ts_noise.as_mut().unwrap();
+                    for r in 0..self.cfg.nch {
+                        let c = noise_loop::NoiseLoopCtx {
+                            src: &snap_copy[r],
+                            mag: &snap_mag[r],
+                            score,
+                            flatness: 0.5,
+                            bands: &bands,
+                            hop: hop_m as i32,
+                            out_step: step_m as i32,
+                            n_fft,
+                            sr,
+                            state,
+                            time_base: 1.0,
+                            sigma: 1.0,
+                            stretch,
+                        };
+                        nl.apply(r, &c);
+                        // Mirror the evolved excitation into the engine's
+                        // noise_gain rows (the DLL's 2080 is the same object
+                        // the +3568 reset and the noise operators touch).
+                        let base = r * nb;
+                        self.noise_gain[base..base + nb]
+                            .copy_from_slice(&nl.exc(r)[..nb]);
+                    }
+                }
             }
             if let Some(p) = plan {
                 if self.ts_hop_override {

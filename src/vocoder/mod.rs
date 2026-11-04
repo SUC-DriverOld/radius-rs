@@ -63,6 +63,7 @@ pub const EPS1E6_F: f32 = 1e-6;
 pub mod acs;
 pub mod formant;
 pub mod noise;
+pub mod noise_loop;
 pub mod phase;
 pub mod rate_gen;
 pub mod spectral_gate;

@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{acceptance_audio_or_skip, audition_reference_named, mono, read_wav, root};
+use common::{acceptance_audio_or_skip, audition_reference_named, mono, read_wav, Wav};
 use radius_rs::vocoder::VocoderState;
 
 /// 10 ms peak envelope (mono).
@@ -153,10 +153,34 @@ fn au_transient_ab() {
     };
     let input = read_wav(&input_path);
     for name in ["au-vc+3.wav", "au-vc+3_200.wav", "au-vc+3_50.wav"] {
-        let Some(path) = audition_reference_named(name) else {
-            eprintln!("SKIP au_transient_ab: no {name}");
-            continue;
-        };
+        ab_one(&input, name, "");
+    }
+    // The 44.1 kHz corpus (2026-11-05): raw input + the same three-speed
+    // reference set, opt-in because it doubles the suite time
+    // (`AU_AB_441=1 ...`). Geometry note: the DLL's live 44.1k preview ran
+    // n_write=6599/n_fft=8192/q=2 — if the offline renders used the same
+    // object family, our 16384/q=37 render is structurally off here.
+    if std::env::var("AU_AB_441").is_ok() {
+        if let Some(raw441) = audition_reference_named("au-vc_441_raw.wav") {
+            let input441 = read_wav(&raw441);
+            for name in [
+                "au-vc_441_+3.wav",
+                "au-vc_441_+3_200.wav",
+                "au-vc_441_+3_50.wav",
+            ] {
+                ab_one(&input441, name, "441 ");
+            }
+        } else {
+            eprintln!("SKIP 44.1k: no au-vc_441_raw.wav");
+        }
+    }
+}
+
+fn ab_one(input: &Wav, name: &str, tag: &str) {
+    let Some(path) = audition_reference_named(name) else {
+        eprintln!("SKIP au_transient_ab: no {name}");
+        return;
+    };
         let want = read_wav(&path).samples;
         let semis = 3.0;
         let tempo = if name.ends_with("_200.wav") {
@@ -172,7 +196,7 @@ fn au_transient_ab() {
         off.set_ratio(semis, tempo);
         off.set_transient_sched(false);
         report(
-            &format!("{name} sched=off"),
+            &format!("{tag}{name} sched=off"),
             &off.render_to(&input.samples, target),
             &want,
             input.rate,
@@ -184,7 +208,7 @@ fn au_transient_ab() {
         on.set_ratio(semis, tempo);
         let got_on = on.render_to(&input.samples, target);
         let (ev, s2) = on.transient_stats();
-        report(&format!("{name} sched=on "), &got_on, &want, input.rate);
+        report(&format!("{tag}{name} sched=on "), &got_on, &want, input.rate);
         println!("  stats: {ev} event chunks, {s2} state-2 granules");
 
         // Experimental: hop re-timing on top of the gates. Opt-in — the
@@ -195,7 +219,7 @@ fn au_transient_ab() {
             hopt.set_ratio(semis, tempo);
             hopt.ts_hop_override = true;
             report(
-                &format!("{name} sched=hop"),
+                &format!("{tag}{name} sched=hop"),
                 &hopt.render_to(&input.samples, target),
                 &want,
                 input.rate,
@@ -211,12 +235,28 @@ fn au_transient_ab() {
             b2.set_ratio(semis, tempo);
             b2.cfg.ts_rpt_b2 = true;
             report(
-                &format!("{name} sched=b2 "),
+                &format!("{tag}{name} sched=b2 "),
                 &b2.render_to(&input.samples, target),
                 &want,
                 input.rate,
             );
         }
-    }
-    let _ = root();
+
+        // Experimental: the 13.9 noise-synthesis loop (`AU_AB_NOISE=1 ...`).
+        // Makes noise_gain a live excitation (init from magnitude, rings
+        // A/B/D per machine granule) and routes the +3568 tail reset through
+        // it. Structural note (doc 13.9): at integer-slope geometries the
+        // excitation may not move at all — tempo 200/50 are the informative
+        // references.
+        if std::env::var("AU_AB_NOISE").is_ok() {
+            let mut nz = VocoderState::new(input.rate, input.channels);
+            nz.set_ratio(semis, tempo);
+            nz.cfg.ts_noise_loop = true;
+            report(
+                &format!("{tag}{name} sched=nz "),
+                &nz.render_to(&input.samples, target),
+                &want,
+                input.rate,
+            );
+        }
 }
