@@ -1031,15 +1031,10 @@ mod tests {
         let band: Vec<f32> = (6..18).map(|i| q.score_at(i)).collect();
         let mx = band.iter().copied().fold(0.0f32, f32::max);
         assert!(mx > 4.0, "dominant twin survives strongly, band={band:?}");
-        let dominant_origins = [q.score_at(10), q.score_at(13)]
-            .iter()
-            .filter(|&&v| v >= 4.0)
-            .count();
+        let dominant = band.iter().copied().filter(|&v| v >= 4.0).count();
         assert_eq!(
-            dominant_origins, 1,
-            "twin dominance resolved, got 10:{} 13:{}",
-            q.score_at(10),
-            q.score_at(13)
+            dominant, 1,
+            "two equal spikes cannot both stay dominant anywhere, band={band:?}"
         );
     }
 
