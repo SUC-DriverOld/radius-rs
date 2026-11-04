@@ -451,6 +451,14 @@ pub struct VocoderState {
     /// The §13.8 cepstral spectral gate (per-renderer instance; per-channel
     /// attractor state inside).
     ts_gate: SpectralGate,
+    /// Synthesis-copy scratch for the §13.8 gate (the DLL gates buffer
+    /// 1664, a copy of the analysis 1768 — never the analysis itself).
+    ts_gate_scratch: Vec<f32>,
+    /// Generation counters: `ts_plan_gen` bumps per new machine plan,
+    /// `ts_gate_gen` records the last gated generation — together they
+    /// give the DLL's once-per-machine-granule gate rate.
+    ts_plan_gen: u64,
+    ts_gate_gen: u64,
     mask_table_8f8: Vec<f32>,
     sync_weight_buf: Vec<f32>,
     /// Reused scratch for `ev_apc`, so the per-granule work does not reallocate
@@ -773,6 +781,9 @@ impl VocoderState {
             scratch_8a8: vec![0.0; nb],
             b_710: vec![0.0; nb],
             ts_gate: SpectralGate::new(cfg.n_fft, cfg.nch),
+            ts_gate_scratch: Vec::new(),
+            ts_plan_gen: 0,
+            ts_gate_gen: 0,
             mask_table_8f8: vec![0.0; nb],
             sync_weight_buf: vec![0.0; nb],
             apc_dir_cur: Vec::with_capacity(nb),
@@ -1190,29 +1201,11 @@ impl VocoderState {
                 self.b_710[k] = fma(mag[k] - self.b_710[k], a, self.b_710[k]);
             }
         }
-        // The TRUE "B2 reference" subsystem (RE §13.8): a cepstral noise-floor
-        // gate applied to the analysis magnitudes before resynthesis
-        // (spec[k] *= work[k] above bin(0.8·f0)). Gated by `ts_rpt_b2`
-        // (default false — pending AU-corpus A/B); runs after b_710's
-        // envelope update, before peaks/AFC/assembly consume the mag.
-        if self.cfg.transient_sched && self.cfg.ts_rpt_b2 {
-            let hop = if self.tsched.steady_hop > 0 {
-                self.tsched.steady_hop
-            } else {
-                self.hop_1420 as i64
-            };
-            let mut mag = std::mem::take(&mut self.ch[ch].mag);
-            self.ts_gate.apply(
-                ch,
-                &mut mag,
-                self.cfg.sr,
-                self.cfg.n_fft,
-                hop,
-                self.transient_state_2488 == 2,
-                self.ratio as f32,
-            );
-            self.ch[ch].mag = mag;
-        }
+        // (The §13.8 gate is no longer applied here: the DLL scores and
+        // smooths on the UNgated analysis spectrum (a1+1768) and gates only
+        // the synthesis copy (a1+1664) at the polar->cart boundary — see
+        // `ev_assembly`. Gating the persistent `mag` here contaminated every
+        // analysis consumer, which is what the first A/B measured.)
         self.ev_find_peaks(ch);
         if let Some(t0) = t0 { profile_add(|p| &mut p.acs, t0); }
     }
@@ -1716,21 +1709,63 @@ impl VocoderState {
             let t_phase = profile_enabled().then(Instant::now);
             self.ev_afc(r);
             let n = nb;
+            // The §13.8 cepstral gate, at the DLL's consumer point
+            // (0x18015d3a2: spec[k] *= work[k] just before PolarToCart/IFFT).
+            // Faithfulness constraints from the L3256-3268 decode:
+            //  - gates the SYNTHESIS COPY only (1664 ← 1768): the persistent
+            //    analysis mag stays ungated for scoring/b_710/AFC;
+            //  - once per MACHINE granule per channel (158D20's own rate),
+            //    not per sub-granule — the attractor's τ law assumes it;
+            //  - only when a pitch shift is active ([7556] = 2^(P/12) ≠ 1.0).
+            let gate_now = self.cfg.transient_sched
+                && self.cfg.ts_rpt_b2
+                && self.ratio != 1.0
+                && self.ts_plan_gen != self.ts_gate_gen;
+            if gate_now {
+                let hop = if self.tsched.steady_hop > 0 {
+                    self.tsched.steady_hop
+                } else {
+                    self.hop_1420 as i64
+                };
+                let mut m = std::mem::take(&mut self.ts_gate_scratch);
+                m.resize(nb, 0.0);
+                m.copy_from_slice(&self.ch[r].mag[..nb]);
+                let st2 = self.transient_state_2488 == 2;
+                let pratio = self.ratio as f32;
+                self.ts_gate.apply(
+                    r,
+                    &mut m,
+                    self.cfg.sr,
+                    self.cfg.n_fft,
+                    hop,
+                    st2,
+                    pratio,
+                );
+                self.ts_gate_scratch = m;
+            }
+            let mag_src: &[f32] = if gate_now {
+                &self.ts_gate_scratch[..nb]
+            } else {
+                &self.ch[r].mag[..nb]
+            };
             {
-                let (mag, phase) = (&self.ch[r].mag, &self.ch[r].phase);
+                let phase = &self.ch[r].phase;
                 let cart = &mut self.cart;
                 for k in 0..n {
                     let ph = phase[k];
                     if fast_math_enabled() {
                         let (s, c) = ph.sin_cos();
-                        cart[2 * k] = mag[k] * c;
-                        cart[2 * k + 1] = mag[k] * s;
+                        cart[2 * k] = mag_src[k] * c;
+                        cart[2 * k + 1] = mag_src[k] * s;
                     } else {
                         let (s, c) = (ph as f64).sin_cos();
-                        cart[2 * k] = mag[k] * (c as f32);
-                        cart[2 * k + 1] = mag[k] * (s as f32);
+                        cart[2 * k] = mag_src[k] * (c as f32);
+                        cart[2 * k + 1] = mag_src[k] * (s as f32);
                     }
                 }
+            }
+            if gate_now {
+                self.ts_gate_gen = self.ts_plan_gen;
             }
             if let Some(t_phase) = t_phase { profile_add(|p| &mut p.phase_cart, t_phase); }
             let t_inv = profile_enabled().then(Instant::now);
@@ -1845,6 +1880,7 @@ impl VocoderState {
                 self.ts_win_out0 = self.ts_cum_out;
                 self.ts_out_base = pos;
                 plan = Some(out);
+                self.ts_plan_gen += 1;
             }
             if let Some(p) = plan {
                 if self.ts_hop_override {
