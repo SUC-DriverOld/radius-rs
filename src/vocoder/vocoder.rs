@@ -1835,6 +1835,11 @@ impl VocoderState {
                 // (`0x18015e31a`): the counter tracks input frames since the
                 // last accepted transient.
                 self.ts_frames_since_transient += out.in_hop;
+                // §13.2 second clear site: state-2 half-hold resets the same
+                // counter (one-shot pulse from the machine).
+                if out.mid_hold_clear {
+                    self.ts_frames_since_transient = 0;
+                }
                 self.ts_in_base = cursor;
                 self.ts_win_in0 = cursor;
                 self.ts_win_out0 = self.ts_cum_out;

@@ -640,6 +640,10 @@ pub struct SchedOut {
     pub state2: bool,
     /// Current machine state (0..3), for diagnostics.
     pub state: i32,
+    /// One-shot: this granule is where the state-2 hold counter crossed
+    /// HALF the hold target — the DLL clears `renderer+3568` here (§13.2,
+    /// the second clear site alongside the B3-accept one).
+    pub mid_hold_clear: bool,
 }
 
 /// The hop scheduler state machine of `sub_180158D20` (fields
@@ -653,6 +657,12 @@ pub struct TransientSched {
     pub steady_step: i64,
     pub hold_target: i32,  // 2456
     pub hold_cnt: i32,     // 2460
+    /// One-shot latch for the state-2 half-hold `+3568` clear (§13.2):
+    /// `mid_cleared` arms at state-2 entry, fires once when the counter
+    /// crosses half the target, `mid_cleared_this_step` carries the pulse
+    /// to the next `SchedOut`.
+    mid_cleared: bool,
+    mid_cleared_this_step: bool,
     pub appr_target: i32,  // 2464
     pub appr_cnt: i32,     // 2468
     pub appr_in_hop: i32,  // 2472
@@ -690,6 +700,8 @@ impl TransientSched {
             steady_step: 838,
             hold_target: 1,
             hold_cnt: 0,
+            mid_cleared: false,
+            mid_cleared_this_step: false,
             appr_target: 1,
             appr_cnt: 0,
             appr_in_hop: 1,
@@ -760,6 +772,7 @@ impl TransientSched {
                 } else {
                     self.state = 2;
                     self.hold_cnt = 0;
+                    self.mid_cleared = false;
                     v30 = self.appr_in_hop as i64 + self.appr_hop_inc as i64;
                 }
                 v31 = self.appr_out_step as i64;
@@ -770,6 +783,13 @@ impl TransientSched {
             2 => {
                 // ---- case 2: settle / transient processing ----
                 self.hold_cnt += 1;
+                // §13.2 (L527): when 2460 reaches half of 2456, renderer+3568
+                // clears — a second clear site alongside the B3-accept one,
+                // active during the state-2 plateau. One-shot per entry.
+                if !self.mid_cleared && self.hold_cnt * 2 >= self.hold_target {
+                    self.mid_cleared = true;
+                    self.mid_cleared_this_step = true;
+                }
                 let reached = self.hold_cnt >= self.hold_target;
                 if !reached {
                     // stay in 2
@@ -966,11 +986,14 @@ impl TransientSched {
             };
             self.trace.push([inpos, self.state as i64, ev]);
         }
+        let mid_hold_clear = self.mid_cleared_this_step;
+        self.mid_cleared_this_step = false;
         SchedOut {
             in_hop: v30,
             out_step: v31,
             state2: self.state == 2,
             state: self.state,
+            mid_hold_clear,
         }
     }
 }
@@ -1165,6 +1188,35 @@ mod tests {
         assert!(states.contains(&3), "must reach transient replay: {states:?}");
         assert_eq!(*states.last().unwrap(), 0, "returns to steady: {states:?}");
         assert!(s.engaged_granules > 0);
+    }
+
+    #[test]
+    fn sched_mid_hold_clear_fires_once_at_half() {
+        // The 13.2 second +3568 clear site: exactly one granule in the
+        // state-2 plateau pulses mid_hold_clear, when hold_cnt crosses half
+        // the hold target — and never on B3-accept granules (that clear is
+        // a separate site in vocoder.rs).
+        let mut q = q_with(1024, 0, &[0.0, 0.0, 2.5]);
+        let mut s = TransientSched::new();
+        s.set_geometry(7184, 1.5, 37);
+        let mut inpos = 0i64;
+        let mut curpos = 0i64;
+        let mut pulses = Vec::new();
+        for _ in 0..24 {
+            let out = s.step(&q, inpos, curpos, 1.5, 48000, 3592, 5388);
+            if out.mid_hold_clear {
+                pulses.push((out.state, s.hold_cnt, s.hold_target));
+            }
+            inpos += out.in_hop;
+            curpos += out.out_step;
+        }
+        assert_eq!(pulses.len(), 1, "exactly one pulse: {pulses:?}");
+        assert_eq!(pulses[0].0, 2, "pulse lands inside state 2");
+        let (_, cnt, target) = pulses[0];
+        assert!(
+            cnt * 2 >= target && (cnt - 1) * 2 < target,
+            "at the half-crossing: cnt={cnt} target={target}"
+        );
     }
 
     #[test]
