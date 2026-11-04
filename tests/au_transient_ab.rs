@@ -201,6 +201,22 @@ fn au_transient_ab() {
                 input.rate,
             );
         }
+
+        // Experimental: the 13.8 cepstral gate (ts_rpt_b2) on top of the
+        // default dual-queue path (`AU_AB_B2=1 ...`). The live probe saw the
+        // DLL's own enable byte set during preview, so this measures the
+        // gate's real contribution.
+        if std::env::var("AU_AB_B2").is_ok() {
+            let mut b2 = VocoderState::new(input.rate, input.channels);
+            b2.set_ratio(semis, tempo);
+            b2.cfg.ts_rpt_b2 = true;
+            report(
+                &format!("{name} sched=b2 "),
+                &b2.render_to(&input.samples, target),
+                &want,
+                input.rate,
+            );
+        }
     }
     let _ = root();
 }

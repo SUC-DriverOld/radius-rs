@@ -30,13 +30,18 @@
 //!     a phase-reset branch; pyradius's `b_710`-vs-phase "B2" was
 //!     semantically unrelated machinery.
 //!
-//! Port status: steps 1-4's core (dB, cepstral power, IIR, quefrency
-//! argmax-score) are fully determined and implemented below. Steps 5-11
-//! depend on object scalars (`a1+7556/7560/7564/7568/7572/7608`, the blend
-//! bounds) whose init values are not decoded — the gain field and the final
-//! multiply are deliberately NOT wired into the live chain
-//! (TODO(§13.8): decompile the constructor / probe live). `ts_rpt_b2`
-//! remains reserved as the switch for this subsystem.
+//! Port status: steps 1-11 complete (2026-11-05). Object scalars from the
+//! live probe: 7552(enable)=1, 7554(energy-norm)=1, 7555(det-fallback
+//! byte 7553)=1, 7556=pitch ratio, 7560=1.0, 7564=1.0, 7568=40.0,
+//! 7572=800.0, 7608(L)=4096; from the decompile: taper v591=0.75
+//! (L3096/3230/3399 → v848, L979), blend bound v861=4.0 Hz (L977),
+//! ε=1e-12 (L963), steady τ v613=0.01 (L957→v866, L3300), f0 clamp
+//! [150, 832] (L3415-3423: 0x43160000=150, 0x44500000=832). The gate
+//! runs on the per-channel analysis magnitudes before resynthesis;
+//! `ts_rpt_b2` (default false) is the switch.
+
+use crate::fft::with_plan;
+use super::acs::time_to_iir_a;
 
 /// dB spectrum of a magnitude spectrum (`Amp2DB`, 20·log10).
 pub fn amp2db(mag: &[f32]) -> Vec<f32> {
@@ -104,9 +109,293 @@ pub fn quefrency_argmax(cep: &[f32], band: (usize, usize)) -> usize {
     best_q
 }
 
+/// `DB2Amp` — inverse of [`amp2db`].
+pub fn db2amp(db: f32) -> f32 {
+    10.0f32.powf(db / 20.0)
+}
+
+fn rint(x: f32) -> i64 {
+    (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64
+}
+
+/// Step 5: taper the two quefrency bins below float index `t` (×0.75/×0.25)
+/// and zero the cepstrum cart from `t` upward.
+pub fn taper_and_zero(cart: &mut [f32], t: usize) {
+    if t >= 4 && t < cart.len() {
+        for (off, w) in [(4usize, 0.75f32), (3, 0.75), (2, 0.25), (1, 0.25)] {
+            cart[t - off] *= w;
+        }
+        for v in cart[t..].iter_mut() {
+            *v = 0.0;
+        }
+    }
+}
+
+/// Step 7 core: one forward + one backward one-pole pass over `db`.
+pub fn bidir_smooth_pass(db: &mut [f32], a: f32) {
+    for i in 1..db.len() {
+        db[i] += (db[i - 1] - db[i]) * a;
+    }
+    for i in (0..db.len() - 1).rev() {
+        db[i] += (db[i + 1] - db[i]) * a;
+    }
+}
+
+/// Steps 8-9 core: the gain field with below-band carry and the [−40, +20]
+/// dB clamp (scale 7564 = 1.0).
+pub fn gain_field(db: &[f32], pitch_ratio: f32) -> Vec<f32> {
+    let nb = db.len();
+    let mut last_delta = 0.0f32;
+    let mut g = vec![1.0f32; nb];
+    for (k, v) in g.iter_mut().enumerate() {
+        let t = rint(k as f32 * pitch_ratio) as i64;
+        if t >= 0 && (t as usize) < nb {
+            last_delta = (db[t as usize] - db[k]).clamp(-40.0, 20.0);
+        }
+        *v = db2amp(last_delta);
+    }
+    g
+}
+
+/// Step 9: energy normalization `g *= sqrt(Σs²/(Σ(gs)²+ε))`.
+pub fn energy_normalize(gains: &mut [f32], mag: &[f32]) {
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for k in 0..mag.len() {
+        s1 += mag[k] * mag[k];
+        s2 += gains[k] * gains[k] * mag[k] * mag[k];
+    }
+    let scale = (s1 / (s2 + 1e-12)).sqrt();
+    for g in gains.iter_mut() {
+        *g *= scale;
+    }
+}
+
+/// The full cepstral gate, one instance per renderer (the DLL's cepstral
+/// power buffer 7768 and gain buffer 7816 are renderer-level/shared; only
+/// the attractor work spectra 7864 are per channel).
+pub struct SpectralGate {
+    /// Smoothed cepstral power (buffer 7768), shared across channels.
+    cep: Vec<f32>,
+    /// Per-channel attractor state (buffer 7864, `+8*ch` pointer array).
+    work: Vec<Vec<f32>>,
+    /// Scratch: the working dB spectrum (7672) across the 8 smoothing
+    /// passes and the harmonic-removed blend.
+    db_work: Vec<f32>,
+    /// Scratch: zero-padded real dB input for the forward FFT (n_fft).
+    pad: Vec<f32>,
+    /// Scratch: packed cepstrum cart (n_fft+2 — our FFT's half-spectrum
+    /// format; the DLL's full 2N-interleaved buffer with the mirror bins
+    /// zeroed is equivalent for the real envelope, since its inverse
+    /// discards the imaginary part).
+    cart: Vec<f32>,
+    /// Scratch: inverse-FFT harmonic-removed envelope (7624).
+    env: Vec<f32>,
+}
+
+impl SpectralGate {
+    pub fn new(n_fft: usize, channels: usize) -> Self {
+        Self {
+            cep: vec![0.0; n_fft / 2],
+            work: vec![vec![0.0; n_fft / 2 + 1]; channels],
+            db_work: vec![0.0; n_fft / 2 + 1],
+            pad: vec![0.0; n_fft],
+            cart: vec![0.0; n_fft + 2],
+            env: vec![0.0; n_fft],
+        }
+    }
+
+    /// Steps 1-11 on one channel's analysis magnitudes. `machine_hop` is the
+    /// transient machine's granule (renderer+1376 ≈ 704 @48k), `pitch_ratio`
+    /// the current 2^(P/12), `state2` the machine state.
+    pub fn apply(
+        &mut self,
+        ch: usize,
+        mag: &mut [f32],
+        sr: u32,
+        n_fft: usize,
+        machine_hop: i64,
+        state2: bool,
+        pitch_ratio: f32,
+    ) {
+        let nb = mag.len();
+        let n_half = n_fft / 2;
+        // --- steps 1-3: dB, forward FFT (zero-padded to n_fft), cepstral
+        //     power, IIR into 7768 (τ 0.005 in state 2 else 0.01, rate
+        //     sr/machine-hop) ---
+        let db = amp2db(&mag[..nb]);
+        self.pad[..nb].copy_from_slice(&db);
+        for v in self.pad[nb..].iter_mut() {
+            *v = 0.0;
+        }
+        let fresh_cep = with_plan(n_fft, |p| {
+            p.fwd_into(&self.pad, &mut self.cart);
+            (0..n_half)
+                .map(|q| {
+                    let re = self.cart[2 * q];
+                    let im = self.cart[2 * q + 1];
+                    re * re + im * im
+                })
+                .collect::<Vec<f32>>()
+        });
+        let tau = if state2 { 0.005 } else { 0.01 };
+        let a_cep = time_to_iir_a(tau, sr as f32 / machine_hop.max(1) as f32);
+        iir_smooth(&mut self.cep[..n_half], &fresh_cep, a_cep);
+
+        // --- step 4: f0 = v624/q over the search band, clamp [150, 832];
+        //     fallback 500 Hz (byte 7553) ---
+        let v624 = 4096.0f32 * sr as f32 / n_fft as f32; // L(7608)·sr/n_fft
+        let q_bin = quefrency_argmax(&self.cep[..n_half], {
+            // band [v624/7572, v624/7568] = [v624/800, v624/40]
+            let lo = rint(v624 / 800.0).max(2) as usize;
+            let hi = rint(v624 / 40.0) as usize;
+            (lo, hi)
+        });
+        let f0_raw = if q_bin > 0 { v624 / q_bin as f32 } else { 500.0 };
+        let f0 = f0_raw.clamp(150.0, 832.0);
+        let q_eff = if q_bin > 0 { q_bin as i64 } else { rint(v624 / 500.0) };
+
+        // --- step 5: taper (0.75, 0.25) at quefrency v651 then zero the
+        //     cepstrum cart above it (harmonic comb removal) ---
+        let v651 = rint((q_eff - 2) as f32 * pitch_ratio).max(2);
+        taper_and_zero(&mut self.cart, (2 * v651) as usize);
+
+        // --- step 6: inverse FFT → harmonic-removed dB envelope (7624) ---
+        let env_full = with_plan(n_fft, |p| p.inv(&self.cart));
+        self.env.copy_from_slice(&env_full[..n_fft]);
+        let env = &self.env[..nb.min(n_fft)];
+
+        // --- step 7: 8 bidirectional passes of pitch-synchronous smoothing
+        //     on the raw dB (7672), then blend in the envelope ---
+        let a7 = time_to_iir_a(0.12 * f0 * 1.0, n_fft as f32 / sr as f32);
+        self.db_work[..nb].copy_from_slice(&db);
+        for _ in 0..8 {
+            bidir_smooth_pass(&mut self.db_work[..nb], a7);
+        }
+        let blend_lo = rint(n_fft as f32 * 4.0 / sr as f32).min(4096 - 1).max(0) as usize; // v861 = 4 Hz
+        let blend_hi = rint(n_fft as f32 * 9.0 / sr as f32).max(4096) as usize; // v674 = max(bin(9 Hz), L)
+        for k in 0..blend_lo.min(nb) {
+            self.db_work[k] = env[k];
+        }
+        if blend_hi > blend_lo && blend_lo < nb {
+            let span = (blend_hi - blend_lo) as f32;
+            for k in blend_lo..blend_hi.min(nb) {
+                let w = (blend_hi - k) as f32 / span;
+                self.db_work[k] += (env[k] - self.db_work[k]) * w;
+            }
+        }
+
+        // --- step 8: gains g[k] = DB2Amp(clamp(db[t]−db[k], −40, +20)),
+        //     t = rint(k·pitch_ratio), below-band carries the last delta ---
+        let mut gains = gain_field(&self.db_work[..nb], pitch_ratio);
+
+        // --- step 9: energy normalization (byte 7554) ---
+        energy_normalize(&mut gains, &mag[..nb]);
+
+        // --- step 10: attractor work[k] += (g[k]−work[k])·a (buffer 7864) ---
+        let a10 = time_to_iir_a(tau, sr as f32 / machine_hop.max(1) as f32);
+        let work = &mut self.work[ch];
+        if work.len() < nb {
+            work.resize(nb, 0.0);
+        }
+        for k in 0..nb {
+            work[k] += (gains[k] - work[k]) * a10;
+        }
+
+        // --- step 11: spec[k] *= work[k] for k ≥ bin(0.8·f0) ---
+        let start = rint(f0 * 0.8 * n_fft as f32 / sr as f32)
+            .min(nb as i64 - 1)
+            .max(0) as usize;
+        for k in start..nb {
+            mag[k] *= work[k];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taper_and_zero_straddles_and_clears_above() {
+        let mut cart = vec![1.0f32; 16];
+        taper_and_zero(&mut cart, 6);
+        // untouched: 0..1
+        assert!((cart[0] - 1.0).abs() < 1e-7 && (cart[1] - 1.0).abs() < 1e-7);
+        // ×0.75 floats t-4,t-3; ×0.25 floats t-2,t-1
+        assert!((cart[2] - 0.75).abs() < 1e-7 && (cart[3] - 0.75).abs() < 1e-7);
+        assert!((cart[4] - 0.25).abs() < 1e-7 && (cart[5] - 0.25).abs() < 1e-7);
+        // zeroed from t up
+        assert!(cart[6..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn bidir_smooth_preserves_constant_and_softens_edges() {
+        let a = 0.3;
+        let mut c = vec![5.0f32; 32];
+        bidir_smooth_pass(&mut c, a);
+        assert!(c.iter().all(|&v| (v - 5.0).abs() < 1e-6));
+        let mut edge = vec![0.0f32; 32];
+        edge[20..].fill(10.0);
+        for _ in 0..8 {
+            bidir_smooth_pass(&mut edge, a);
+        }
+        // monotone non-decreasing after smoothing (no overshoot ringing)
+        for w in edge.windows(2) {
+            assert!(w[0] <= w[1] + 1e-6);
+        }
+        assert!(edge[0] > 0.0 && edge[31] < 10.0 + 1e-6);
+    }
+
+    #[test]
+    fn gain_field_clamps_carries_and_scales() {
+        // pitch 1: delta = 0 everywhere → unity gains
+        let db = (0..64).map(|k| -(k as f32) * 0.1).collect::<Vec<_>>();
+        let g = gain_field(&db, 1.0);
+        assert!(g.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        // pitch 2, db[k] = −0.1k: delta = db[2k]−db[k] = −0.1k
+        // → −0.1·62 = −6.2 dB at the last in-band k (31) — no clamp hit yet
+        let g2 = gain_field(&db, 2.0);
+        assert!((20.0 * g2[10].log10() + 1.0).abs() < 1e-3);
+        // below-band (k ≥ 32): t ≥ 64 out of range → carries the last delta
+        let last = 20.0 * g2[31].log10();
+        assert!(g2[40..].iter().all(|&v| (20.0 * v.log10() - last).abs() < 1e-5));
+        // clamp: a −100 dB slope saturates at −40 dB = 0.01
+        let steep = (0..64).map(|k| -(k as f32) * 3.0).collect::<Vec<_>>();
+        let gs = gain_field(&steep, 2.0);
+        assert!(gs.iter().skip(14).all(|&v| (v - db2amp(-40.0)).abs() < 1e-6));
+    }
+
+    #[test]
+    fn energy_normalize_compenstates_constant_gain() {
+        let mag = [0.5f32; 8];
+        let mut g = [2.0f32; 8];
+        energy_normalize(&mut g, &mag);
+        assert!(g.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn gate_converges_and_preserves_energy_per_channel() {
+        // End-to-end: after the attractor converges the gated spectrum keeps
+        // the DLL's per-channel state separate and the energy-norm identity
+        // holds bin-for-bin on the gated band.
+        let mut gate = SpectralGate::new(1024, 2);
+        let mut a = vec![0.0f32; 513];
+        let mut b = vec![0.0f32; 513];
+        for granule in 0..60 {
+            for k in 0..513 {
+                let f = k as f32 / 1024.0;
+                a[k] = (1.0 + 0.4 * (2.0 * std::f32::consts::PI * 17.0 * f).sin()) * 0.5
+                    + 0.05 * ((granule * 7 + k * 3) % 11) as f32 / 11.0;
+                b[k] = (0.6 + 0.2 * (2.0 * std::f32::consts::PI * 31.0 * f).cos()) * 0.4;
+            }
+            gate.apply(0, &mut a, 48_000, 1024, 16, false, 1.0);
+            gate.apply(1, &mut b, 48_000, 1024, 16, false, 1.0);
+        }
+        assert!(a.iter().chain(b.iter()).all(|v| v.is_finite() && *v >= 0.0));
+        // the two channels must NOT be identical (per-channel work state)
+        let diff = a.iter().zip(b.iter()).filter(|(x, y)| (**x - **y).abs() > 1e-6).count();
+        assert!(diff > 100, "per-channel attractor state diverged ({diff} bins)");
+    }
 
     #[test]
     fn amp2db_scales_as_20log10() {

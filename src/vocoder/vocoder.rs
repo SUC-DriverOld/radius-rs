@@ -16,6 +16,7 @@ use crate::fft::with_plan;
 use crate::interp::{interp_nsamples, InterpTable};
 use crate::simple_rand::{noise_template_fill, SimpleRand};
 use crate::vocoder::*;
+use crate::vocoder::spectral_gate::SpectralGate;
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -429,6 +430,9 @@ pub struct VocoderState {
     reg_offset: Vec<f32>,
     scratch_8a8: Vec<f32>,
     b_710: Vec<f32>,
+    /// The §13.8 cepstral spectral gate (per-renderer instance; per-channel
+    /// attractor state inside).
+    ts_gate: SpectralGate,
     mask_table_8f8: Vec<f32>,
     sync_weight_buf: Vec<f32>,
     /// Reused scratch for `ev_apc`, so the per-granule work does not reallocate
@@ -746,6 +750,7 @@ impl VocoderState {
             reg_offset: vec![0.0; nb],
             scratch_8a8: vec![0.0; nb],
             b_710: vec![0.0; nb],
+            ts_gate: SpectralGate::new(cfg.n_fft, cfg.nch),
             mask_table_8f8: vec![0.0; nb],
             sync_weight_buf: vec![0.0; nb],
             apc_dir_cur: Vec::with_capacity(nb),
@@ -1081,6 +1086,29 @@ impl VocoderState {
             for k in 0..nb {
                 self.b_710[k] = fma(mag[k] - self.b_710[k], a, self.b_710[k]);
             }
+        }
+        // The TRUE "B2 reference" subsystem (RE §13.8): a cepstral noise-floor
+        // gate applied to the analysis magnitudes before resynthesis
+        // (spec[k] *= work[k] above bin(0.8·f0)). Gated by `ts_rpt_b2`
+        // (default false — pending AU-corpus A/B); runs after b_710's
+        // envelope update, before peaks/AFC/assembly consume the mag.
+        if self.cfg.transient_sched && self.cfg.ts_rpt_b2 {
+            let hop = if self.tsched.steady_hop > 0 {
+                self.tsched.steady_hop
+            } else {
+                self.hop_1420 as i64
+            };
+            let mut mag = std::mem::take(&mut self.ch[ch].mag);
+            self.ts_gate.apply(
+                ch,
+                &mut mag,
+                self.cfg.sr,
+                self.cfg.n_fft,
+                hop,
+                self.transient_state_2488 == 2,
+                self.ratio as f32,
+            );
+            self.ch[ch].mag = mag;
         }
         self.ev_find_peaks(ch);
         if let Some(t0) = t0 { profile_add(|p| &mut p.acs, t0); }
