@@ -598,3 +598,63 @@ pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
 - x64dbg 脚本：`.tmp/x64dbg/`（call.py、dump_renderer.py、trace_emitter.py、
   trace_granules.py）；IDA 侧 `.tmp/ida/decomp_to_file.py`（xrefs_to 用
   `addrs=[...]`，decompile 用 `addr=...`）。
+
+### 13.6 发射驱动 sub_18014DF50——双队列架构完全解码（2026-11-04 深夜）
+
+**live 实锤**：当前会话的活跃发射路径是 14DF50 的调用点 0x18014E33A
+（149F80 的双通道循环一次都没走——那是另一模式）。0x4d5 字节全解码
+（`.tmp/ida/emit3.c`）：
+
+**摄入队列**（engine+328/336，0x38 字节节点）：
+```
+while (队列非空 && node[+32] ≤ 可用帧) {
+    新out_base = (node[+32] − in_base) × rate + out_base
+    in_base = node[+32]; out_base = 新out_base        // 基准对重锚
+    if (node[+40] == 0) rate = node[+48]              // 标志位0→换速率
+    回收节点
+}
+```
+节点 `[+32]`=输入位置、`[+40]`=换率标志、`[+48]`=新速率（double）。
+
+**发射循环**（engine+656/664，0x30 字节节点）：
+```
+hop = [424]+[432]                                     // 发射 hop 对（engine 布局）
+target = rint((node[+32] − in_acc)/rate + out_pos)    // 节点输入断点经当前 rate 映射
+n = target − out_pos
+emit(a1+8, [352], ch, hop, in_acc mod hop, out, off, n, rate, rate_d, 1)
+in_acc += n × rate          // 输入累计器（[9360] double）——双侧!
+out_pos = target            // [552]
+rate = 下一节点[+40]        // [272] int 位型 ↔ double 双存
+```
+
+**要点**：
+1. **双侧自洽**：输入位置按 `n×rate` 前进、输出位置按节点的输入断点经
+   当前 rate 重锚——绝对位置钉死，无漂移。我失败的持久偏移版缺的正是
+   这个节点级重锚。
+2. 换率只发生在节点边界，粒内 rate 恒定（发射 n 帧、耗 n×rate 输入）。
+3. 发射 hop 对在 engine 布局是 +424/+432（≠ renderer 的 592/600——
+   两套对象，跳过之前"写入点找不到"的疑问）。
+4. 我们的移植路径定案：维护 (in_acc, out_pos, rate) 三元组，机器计划
+   窗边界即节点：rate_j = plan.out_step/plan.in_hop，n_j =
+   rint((node_in − in_acc)/rate_j + out_pos) − out_pos，重锚两侧。
+   稳态节点即 slope（平滑包络 3928/3936 见 §13.5 尾）。
+
+### 13.7 队列生产端（静态解码进行中）
+
+- 158D20 全函数反编译 `.tmp/ida/machine_pretty.c`（4323 行）。接受律与
+  端口逐位复核吻合：L1446-1450 =
+  `hold_target = max(1, int((best−inpos)×2×slope/hop))` ✓、L1468-1473 =
+  settle_hop_inc rint 中点律 ✓。
+- 节点只有一个分配点：L1491 `Allocate(0x30)`（零初始化）——稳态与瞬态
+  共用填充路径；速率历史环 [3928..3936]（float，尾槽写当前速率 v173，
+  τ 律 `expf(sr/hop1376×v858)` IIR 平滑 3920）；`sub_180160610`（327
+  行）= 速率/调度数学；节点 [+32]/[+40]/[+48] 实际填充在 L1598 之后
+  （下一目标）。
+- 动态分析经验（2026-11-04）：
+  1. **离线渲染在子进程**——主进程 DSP 全冷；
+  2. 中途附加会破坏音频线程（DSP 永不执行 + UI 异常循环于固定地址）；
+     必须在效果实例化前附加；
+  3. MCP 禁 `script.execute`（erun 不可用）；周期性异常会饿死断点轮询；
+     条件 0 断点吞不掉异常事件；健康会话下要**轮询等待**（running 时
+     sleep 0.2s），不能连发 debug_run；
+  4. 模块基址随效果会话重建漂移，脚本每次 `mod.base()` 重解析。
