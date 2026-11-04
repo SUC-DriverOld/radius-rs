@@ -14,7 +14,9 @@
 
 use crate::consts::NEG_TWO_PI_F64;
 
-#[derive(Debug)]
+/// `Clone` is for the shared plan-template cache in `crate::fft`: a plan is
+/// deterministic table data, so a clone runs the bit-identical transform.
+#[derive(Clone, Debug)]
 pub struct Fft {
     n: usize,
     /// Bit-reversal permutation.

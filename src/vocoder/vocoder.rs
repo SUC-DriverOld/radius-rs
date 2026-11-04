@@ -371,6 +371,112 @@ impl Channel {
     }
 }
 
+/// Immutable inputs of the assembly tail (P2C → IFFT → fold → OAC), shared
+/// with the persistent worker via `Arc`. Everything here is written only by
+/// the `VocoderState` constructor; the per-granule scalars (`g_index`,
+/// `ratio`, `slope`, `ts_out_step`, `step_1412`, `pos_1384`, `hop_1420`)
+/// travel with each job instead.
+struct AssemblyCtx {
+    synth_a: Vec<f32>,
+    synth_b: Vec<f32>,
+    edge_gain: [f32; 4],
+    step_base: f64,
+    precision: i32,
+    nb_bins: usize,
+    n_fft: usize,
+    n_write: usize,
+    ring_out_len: usize,
+    v8_len_a: usize,
+    v9_len_b: usize,
+}
+
+/// One assembly-tail job for the worker: channel `r`'s magnitude and phase
+/// buffers (moved, so no copy) plus a copy of its output-ring plane (the OAC
+/// accumulates in place, so the plane content matters on the way in too).
+struct AssemblyJob {
+    mag: Vec<f32>,
+    phase: Vec<f32>,
+    out_plane: Vec<f32>,
+    g_index: i64,
+    ratio: f64,
+    slope: f64,
+    ts_out_step: i32,
+    step_1412: i32,
+    pos_1384: i64,
+    hop_1420: i32,
+    ctx: std::sync::Arc<AssemblyCtx>,
+}
+
+/// The persistent assembly-tail worker. Created lazily on the first parallel
+/// `ev_assembly`; dies when the sender drops (i.e. with the `VocoderState`).
+struct AssemblyWorker {
+    tx: Option<std::sync::mpsc::Sender<AssemblyJob>>,
+    rx: std::sync::mpsc::Receiver<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AssemblyWorker {
+    fn spawn() -> Self {
+        let (tx, job_rx) = std::sync::mpsc::channel::<AssemblyJob>();
+        let (reply_tx, rx) = std::sync::mpsc::channel::<(Vec<f32>, Vec<f32>, Vec<f32>)>();
+        let handle = std::thread::Builder::new()
+            .name("vc-assembly".into())
+            .spawn(move || {
+                // Warm per-worker scratch; sized on the first job and kept.
+                let mut cart = Vec::new();
+                let mut frame = Vec::new();
+                let mut acc = Vec::new();
+                let mut win1 = Vec::new();
+                let mut win2 = Vec::new();
+                for job in job_rx {
+                    let ctx = &job.ctx;
+                    if cart.len() != ctx.n_fft + 2 {
+                        cart = vec![0.0; ctx.n_fft + 2];
+                        frame = vec![0.0; ctx.n_fft];
+                        acc = vec![0.0; ctx.n_fft];
+                        win1 = vec![0.0; ctx.n_fft];
+                        win2 = vec![0.0; ctx.n_fft];
+                    }
+                    let mut out_plane = job.out_plane;
+                    VocoderState::assembly_tail_compute(
+                        ctx,
+                        job.g_index,
+                        job.ratio,
+                        job.slope,
+                        job.ts_out_step,
+                        job.step_1412,
+                        job.pos_1384,
+                        job.hop_1420,
+                        &job.mag,
+                        &job.phase,
+                        &mut out_plane,
+                        &mut cart,
+                        &mut frame,
+                        &mut acc,
+                        &mut win1,
+                        &mut win2,
+                    );
+                    if reply_tx.send((job.mag, job.phase, out_plane)).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn vc-assembly worker");
+        Self { tx: Some(tx), rx, handle: Some(handle) }
+    }
+}
+
+impl Drop for AssemblyWorker {
+    fn drop(&mut self) {
+        // Dropping the sender closes the job channel; the worker's `for job
+        // in job_rx` loop ends and the thread exits, then we join it.
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// `VocoderState` — mirrors `rx_vc_state`.
 pub struct VocoderState {
     pub cfg: VocoderConfig,
@@ -439,8 +545,10 @@ pub struct VocoderState {
     // ---- containers ----
     ring: Vec<f32>, // [nch][nbands][ring_cap] — one band ring per channel
     ch: Vec<Channel>,
+    /// Analysis-side scratch (`ev_fill_granule`/`ev_acs`): windowed frame in
+    /// `acc`, cartesian spectrum in `cart`. The synthesis side moved to the
+    /// per-channel `syn_*` buffers (see `ev_assembly`).
     cart: Vec<f32>,
-    frame: Vec<f32>,
     acc: Vec<f32>,
     acs_env: Vec<f32>,     // [nch][nb_bins]
     region_gain: Vec<f32>, // [nch][nb_bins]
@@ -538,8 +646,28 @@ pub struct VocoderState {
     /// Transient-subsystem diagnostics (tests/logging).
     ts_events: u64,
     ts_state2_granules: u64,
-    win1: Vec<f32>,
-    win2: Vec<f32>,
+    /// Per-channel synthesis scratch for `ev_assembly`'s tail (polar→cart,
+    /// IFFT frame, fold accumulator, fold windows). Channel `r` always uses
+    /// index `r`, serial or threaded, so the tail is exact by isolation; the
+    /// single-buffer `cart`/`acc` above stay on the analysis side
+    /// (`ev_fill_granule`/`ev_acs`), which the granule pump runs one channel
+    /// per granule.
+    syn_cart: Vec<Vec<f32>>,
+    syn_frame: Vec<Vec<f32>>,
+    syn_acc: Vec<Vec<f32>>,
+    syn_win1: Vec<Vec<f32>>,
+    syn_win2: Vec<Vec<f32>>,
+    /// Lazily-built immutable context for the assembly tail (the `synth_*`
+    /// window tables, `edge_gain` and the geometry constants are written only
+    /// by the constructor — verified by grep — so one `Arc` serves the whole
+    /// stream; the per-granule scalars ride each job instead).
+    assembly_ctx: Option<std::sync::Arc<AssemblyCtx>>,
+    /// Persistent worker thread for channel 1's assembly tail. A scoped
+    /// thread per granule measured ~1.2 s of pure spawn/join overhead across
+    /// a 30 s render (plus the FFT plan rebuilds fixed separately), so the
+    /// tail hands off to one long-lived worker via an ownership-transfer
+    /// protocol (moved `Vec`s, no large memcpys except the output plane).
+    assembly_worker: Option<AssemblyWorker>,
     out_ring: Vec<f32>, // [nch][ring_out_len]
     edge_gain: [f32; 4],
     rng: SimpleRand,
@@ -782,7 +910,6 @@ impl VocoderState {
             ring: vec![0.0; n_ch * cfg.nbands * ring_cap],
             ch: (0..n_ch).map(|_| Channel::new(nb)).collect(),
             cart: vec![0.0; cfg.n_fft + 2],
-            frame: vec![0.0; cfg.n_fft],
             acc: vec![0.0; cfg.n_fft],
             acs_env: vec![0.0; n_ch * nb],
             region_gain: vec![0.0; n_ch * nb],
@@ -844,8 +971,13 @@ impl VocoderState {
             ts_hop_override: true,
             ts_events: 0,
             ts_state2_granules: 0,
-            win1: vec![0.0; cfg.n_fft],
-            win2: vec![0.0; cfg.n_fft],
+            syn_cart: (0..n_ch).map(|_| vec![0.0; cfg.n_fft + 2]).collect(),
+            syn_frame: (0..n_ch).map(|_| vec![0.0; cfg.n_fft]).collect(),
+            syn_acc: (0..n_ch).map(|_| vec![0.0; cfg.n_fft]).collect(),
+            syn_win1: (0..n_ch).map(|_| vec![0.0; cfg.n_fft]).collect(),
+            syn_win2: (0..n_ch).map(|_| vec![0.0; cfg.n_fft]).collect(),
+            assembly_ctx: None,
+            assembly_worker: None,
             out_ring: vec![0.0; n_ch * cfg.ring_out_len],
             edge_gain: [1.15, 1.30, 1.05, 1.10],
             rng: SimpleRand::new(1),
@@ -1632,110 +1764,148 @@ impl VocoderState {
     }
 
     /// `_ev_fold_iir_sub` — fftshift + forward/backward IIR + subtract.
-    fn ev_fold_iir_sub(&mut self) {
+    ///
+    /// Buffers are explicit so the assembly tail can run per channel on its
+    /// own scratch (see `ev_assembly`); the math is a pure function of `acc`.
+    fn fold_iir_sub(acc: &[f32], win1: &mut [f32], win2: &mut [f32], n: usize, hop: usize) {
         let t0 = profile_enabled().then(Instant::now);
-        let n = self.cfg.n_fft;
-        let hop = self.hop_1420 as usize;
         let half = n >> 1;
         let c = 1.0f32 - FOLD_ALPHA;
         {
-            let src = &self.acc;
-            let (w1, w2) = (&mut self.win1, &mut self.win2);
-            w1[..half].copy_from_slice(&src[half..]);
-            w1[half..].copy_from_slice(&src[..half]);
-            w2[..half].copy_from_slice(&src[half..]);
-            w2[half..].copy_from_slice(&src[..half]);
+            win1[..half].copy_from_slice(&acc[half..]);
+            win1[half..].copy_from_slice(&acc[..half]);
+            win2[..half].copy_from_slice(&acc[half..]);
+            win2[half..].copy_from_slice(&acc[..half]);
         }
         // forward recurrence (scipy lfilter with zi = [c*w1[0]])
-        let (w1, w2) = (&mut self.win1, &mut self.win2);
-        let mut prev = FOLD_ALPHA * w1[0] + c * w1[0];
-        w1[0] = prev;
+        let mut prev = FOLD_ALPHA * win1[0] + c * win1[0];
+        win1[0] = prev;
         for i in 1..n {
-            prev = FOLD_ALPHA * w1[i] + c * prev;
-            w1[i] = prev;
+            prev = FOLD_ALPHA * win1[i] + c * prev;
+            win1[i] = prev;
         }
         // backward recurrence from N-2 down to half-hop
         let stop = half - hop;
         let mut prev = {
-            let xn = w1[n - 1];
+            let xn = win1[n - 1];
             FOLD_ALPHA * xn + c * xn
         };
-        w1[n - 1] = prev;
+        win1[n - 1] = prev;
         for i in (stop..n - 1).rev() {
-            prev = FOLD_ALPHA * w1[i] + c * prev;
-            w1[i] = prev;
+            prev = FOLD_ALPHA * win1[i] + c * prev;
+            win1[i] = prev;
         }
-        for (dst, src) in w2[stop..stop + 2 * hop]
+        for (dst, src) in win2[stop..stop + 2 * hop]
             .iter_mut()
-            .zip(w1[stop..stop + 2 * hop].iter())
+            .zip(win1[stop..stop + 2 * hop].iter())
         {
             *dst -= *src;
         }
         if let Some(t0) = t0 { profile_add(|p| &mut p.fold_ola, t0); }
     }
 
-    /// `_ev_oac` — `OverlapAddChannel`.
-    fn ev_oac(&mut self, ch: usize) {
-        let sched_now = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base);
-        let sched_next = vc_calc_sched(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
+    /// `_ev_oac` — `OverlapAddChannel`, on explicit buffers so the assembly
+    /// tail can run per channel. Everything it reads is either per-channel or
+    /// an immutable scheduling input with the same value for both channels of
+    /// one granule (the serial loop observed `g_index` unchanged).
+    #[allow(clippy::too_many_arguments)]
+    fn oac_channel(
+        win1: &mut [f32],
+        win2: &mut [f32],
+        out_slice: &mut [f32],
+        synth_a: &[f32],
+        synth_b: &[f32],
+        edge_gain: &[f32; 4],
+        g_index: i64,
+        ratio: f64,
+        slope: f64,
+        step_base: f64,
+        ts_out_step: i32,
+        step_1412: i32,
+        pos_1384: i64,
+        hop_1420: i32,
+        precision: i32,
+        n_fft: usize,
+        n_write: usize,
+        ring_out_len: usize,
+        v8_len_a: usize,
+        v9_len_b: usize,
+    ) {
+        let sched_now = vc_calc_sched(g_index, ratio, slope, step_base);
+        let sched_next = vc_calc_sched(g_index + 1, ratio, slope, step_base);
         let mut a3 = (sched_next.0 - sched_now.0) as i32;
         if a3 <= 0 {
-            a3 = self.step_1412;
+            a3 = step_1412;
         }
         // The transient scheduler's per-granule output step override (DLL
         // `v853`): replaces the table delta while the machine is engaged.
-        if self.ts_out_step > 0 {
-            a3 = self.ts_out_step;
+        if ts_out_step > 0 {
+            a3 = ts_out_step;
         }
-        let f1412 = self.step_1412.max(0) as i64;
-        let p = self.cfg.precision;
+        let f1412 = step_1412.max(0) as i64;
         // `a_const` = the band-1 window length (round(n_write/2); the anchors
         // are 3300 at 44.1 kHz and 3592 at 48 kHz).
-        let a_const = (self.cfg.n_write as i64 + 1) / 2;
-        let ring_len = self.cfg.ring_out_len as i64;
-        let f1224 = self.pos_1384 - a3 as i64 + self.hop_1420 as i64;
-        let nb = self.cfg.ring_out_len;
-        let base = ch * nb;
-        let out_slice = &mut self.out_ring[base..base + nb];
+        let a_const = (n_write as i64 + 1) / 2;
+        let ring_len = ring_out_len as i64;
+        let f1224 = pos_1384 - a3 as i64 + hop_1420 as i64;
         overlap_add_channel_in_place(
-            &mut self.win1,
-            &mut self.win2,
-            &self.synth_a,
-            &self.synth_b,
+            win1,
+            win2,
+            synth_a,
+            synth_b,
             out_slice,
-            &self.edge_gain,
-            ch,
+            edge_gain,
+            0,
             a3,
             0,
             0,
-            self.cfg.n_fft as i64,
-            p,
+            n_fft as i64,
+            precision,
             a_const,
-            self.v8_len_a as i64,
-            self.v9_len_b as i64,
+            v8_len_a as i64,
+            v9_len_b as i64,
             f1412,
-            self.pos_1384,
-            self.hop_1420 as i64,
+            pos_1384,
+            hop_1420 as i64,
             ring_len,
             f1224,
-            self.cfg.n_write as i64,
+            n_write as i64,
         );
     }
 
     /// `_ev_assembly` — RPT → Copy1 → Copy2 → AFC → P2C → FFTInv → fold → OAC.
+    ///
+    /// # Parallel split (exact by construction)
+    ///
+    /// The per-channel work splits into a serial **prefix** — RPT (its
+    /// `ts_frames_since_transient` reset and the shared `mask_table_8f8`
+    /// order channels strictly), the analysis copies, AFC (the formant
+    /// scratch carries a documented cross-call residue), and the §13.8 gate
+    /// (a single `SpectralGate`; the gen-counter law also orders channels) —
+    /// and a heavy **tail**: P2C → inverse FFT → acc → fold-IIR → OAC. The
+    /// tail's shared state is scratch only (cart/frame/acc/win1/win2 are
+    /// fully rewritten before use) plus each channel's own `Channel` and
+    /// `out_ring` plane, so channel `r` on its own `syn_*` scratch computes
+    /// exactly the operations it would alone, in the same order — the same
+    /// argument as the `feed` crossover split. `RADIUS_THREADS=1` (or mono)
+    /// runs the same tail function serially.
+    ///
+    /// Profiling note: the stage timers are thread-local, so in the parallel
+    /// path the reported phase_cart/inverse_fft/fold_ola are channel 0's;
+    /// the `assembly` timer wraps the whole (joined) region on the main
+    /// thread either way.
     fn ev_assembly(&mut self) {
         let t0 = profile_enabled().then(Instant::now);
+        let nb = self.cfg.nb_bins;
+        // ---- serial prefix, in channel order exactly as the old loop ----
         for r in 0..self.cfg.nch {
             self.ev_rpt(r);
-            let nb = self.cfg.nb_bins;
             {
                 let c = &mut self.ch[r];
                 c.mask_copy[..nb].copy_from_slice(&c.mask[..nb]);
                 c.mag_copy[..nb].copy_from_slice(&c.mag[..nb]);
             }
-            let t_phase = profile_enabled().then(Instant::now);
             self.ev_afc(r);
-            let n = nb;
             // The §13.8 cepstral gate, at the DLL's consumer point
             // (0x18015d3a2: spec[k] *= work[k] just before PolarToCart/IFFT).
             // Faithfulness constraints from the L3256-3268 decode:
@@ -1778,38 +1948,198 @@ impl VocoderState {
                 );
                 self.ch[r].mag = target;
                 self.ts_gate_scratch = score;
-            }
-            let mag_src: &[f32] = &self.ch[r].mag[..nb];
-            {
-                let phase = &self.ch[r].phase;
-                let cart = &mut self.cart;
-                for k in 0..n {
-                    let ph = phase[k];
-                    if fast_math_enabled() {
-                        let (s, c) = ph.sin_cos();
-                        cart[2 * k] = mag_src[k] * c;
-                        cart[2 * k + 1] = mag_src[k] * s;
-                    } else {
-                        let (s, c) = (ph as f64).sin_cos();
-                        cart[2 * k] = mag_src[k] * (c as f32);
-                        cart[2 * k + 1] = mag_src[k] * (s as f32);
-                    }
-                }
-            }
-            if gate_now {
+                // The old loop updated the gen after channel r's P2C but
+                // always before channel r+1's gate_now evaluation; the P2C
+                // never reads it, so updating right after the gate pass
+                // preserves the observable order.
                 self.ts_gate_gen = self.ts_plan_gen;
             }
-            if let Some(t_phase) = t_phase { profile_add(|p| &mut p.phase_cart, t_phase); }
-            let t_inv = profile_enabled().then(Instant::now);
-            Self::fft_inv_into(self.cfg.n_fft, &self.cart, &mut self.frame);
-            if let Some(t_inv) = t_inv { profile_add(|p| &mut p.inverse_fft, t_inv); }
-            // `acc` is the inverse transform the fold/OLA stages consume; the
-            // engine keeps it in a separate frame buffer (`+0x5E0`) as well.
-            self.acc.copy_from_slice(&self.frame);
-            self.ev_fold_iir_sub();
-            self.ev_oac(r);
+        }
+        // ---- heavy tail: P2C → FFTInv → acc → fold → OAC, per channel ----
+        // Shared implementation (also used by the worker): the same
+        // operations in the same order as the old serial loop.
+        let ctx = self
+            .assembly_ctx
+            .get_or_insert_with(|| {
+                std::sync::Arc::new(AssemblyCtx {
+                    synth_a: self.synth_a.clone(),
+                    synth_b: self.synth_b.clone(),
+                    edge_gain: self.edge_gain,
+                    step_base: self.cfg.step_base,
+                    precision: self.cfg.precision,
+                    nb_bins: self.cfg.nb_bins,
+                    n_fft: self.cfg.n_fft,
+                    n_write: self.cfg.n_write,
+                    ring_out_len: self.cfg.ring_out_len,
+                    v8_len_a: self.v8_len_a,
+                    v9_len_b: self.v9_len_b,
+                })
+            })
+            .clone();
+        // Immutable scheduling inputs shared by both channels; the serial
+        // loop observed these unchanged across the r-loop.
+        let g_index = self.g_index;
+        let ratio = self.ratio;
+        let slope = self.slope;
+        let ts_out_step = self.ts_out_step;
+        let step_1412 = self.step_1412;
+        let pos_1384 = self.pos_1384;
+        let hop_1420 = self.hop_1420;
+        let ring_out_len = self.cfg.ring_out_len;
+        let nch = self.cfg.nch;
+
+        if parallel_enabled() && nch > 1 {
+            // Hand channel 1's tail to the persistent worker: mag/phase are
+            // MOVED (no copy; restored on reply), the output plane rides a
+            // copy because the flat `out_ring` cannot split ownership.
+            let worker = self
+                .assembly_worker
+                .get_or_insert_with(AssemblyWorker::spawn);
+            let base1 = ring_out_len;
+            let mag1 = std::mem::take(&mut self.ch[1].mag);
+            let phase1 = std::mem::take(&mut self.ch[1].phase);
+            let plane1 = self.out_ring[base1..2 * base1].to_vec();
+            worker
+                .tx
+                .as_ref()
+                .expect("assembly worker sender")
+                .send(AssemblyJob {
+                    mag: mag1,
+                    phase: phase1,
+                    out_plane: plane1,
+                    g_index,
+                    ratio,
+                    slope,
+                    ts_out_step,
+                    step_1412,
+                    pos_1384,
+                    hop_1420,
+                    ctx: ctx.clone(),
+                })
+                .expect("assembly worker alive");
+            // Channel 0 runs inline on this thread (its FFT plans are warm
+            // from the analysis chain).
+            let out0 = &mut self.out_ring[..ring_out_len];
+            Self::assembly_tail_compute(
+                &ctx,
+                g_index,
+                ratio,
+                slope,
+                ts_out_step,
+                step_1412,
+                pos_1384,
+                hop_1420,
+                &self.ch[0].mag,
+                &self.ch[0].phase,
+                out0,
+                &mut self.syn_cart[0],
+                &mut self.syn_frame[0],
+                &mut self.syn_acc[0],
+                &mut self.syn_win1[0],
+                &mut self.syn_win2[0],
+            );
+            // Reap the worker's reply and restore the moved buffers.
+            let (mag, phase, plane) = worker.rx.recv().expect("assembly worker reply");
+            self.ch[1].mag = mag;
+            self.ch[1].phase = phase;
+            self.out_ring[base1..2 * base1].copy_from_slice(&plane);
+        } else {
+            for r in 0..nch {
+                let (s, e) = (r * ring_out_len, (r + 1) * ring_out_len);
+                let out = &mut self.out_ring[s..e];
+                Self::assembly_tail_compute(
+                    &ctx,
+                    g_index,
+                    ratio,
+                    slope,
+                    ts_out_step,
+                    step_1412,
+                    pos_1384,
+                    hop_1420,
+                    &self.ch[r].mag,
+                    &self.ch[r].phase,
+                    out,
+                    &mut self.syn_cart[r],
+                    &mut self.syn_frame[r],
+                    &mut self.syn_acc[r],
+                    &mut self.syn_win1[r],
+                    &mut self.syn_win2[r],
+                );
+            }
         }
         if let Some(t0) = t0 { profile_add(|p| &mut p.assembly, t0); }
+    }
+
+    /// The assembly tail on explicit buffers: P2C → inverse FFT → acc copy →
+    /// fold-IIR → OAC. Pure with respect to its arguments, which is what
+    /// makes the worker split exact — channel `r` computes the operations it
+    /// would alone, in the same order.
+    #[allow(clippy::too_many_arguments)]
+    fn assembly_tail_compute(
+        ctx: &AssemblyCtx,
+        g_index: i64,
+        ratio: f64,
+        slope: f64,
+        ts_out_step: i32,
+        step_1412: i32,
+        pos_1384: i64,
+        hop_1420: i32,
+        mag: &[f32],
+        phase: &[f32],
+        out_plane: &mut [f32],
+        cart: &mut [f32],
+        frame: &mut [f32],
+        acc: &mut [f32],
+        win1: &mut [f32],
+        win2: &mut [f32],
+    ) {
+        let nb = ctx.nb_bins;
+        let n = nb;
+        let t_phase = profile_enabled().then(Instant::now);
+        {
+            for k in 0..n {
+                let ph = phase[k];
+                if fast_math_enabled() {
+                    let (s, c) = ph.sin_cos();
+                    cart[2 * k] = mag[k] * c;
+                    cart[2 * k + 1] = mag[k] * s;
+                } else {
+                    let (s, c) = (ph as f64).sin_cos();
+                    cart[2 * k] = mag[k] * (c as f32);
+                    cart[2 * k + 1] = mag[k] * (s as f32);
+                }
+            }
+        }
+        if let Some(t_phase) = t_phase { profile_add(|p| &mut p.phase_cart, t_phase); }
+        let t_inv = profile_enabled().then(Instant::now);
+        Self::fft_inv_into(ctx.n_fft, cart, frame);
+        if let Some(t_inv) = t_inv { profile_add(|p| &mut p.inverse_fft, t_inv); }
+        // `acc` is the inverse transform the fold/OLA stages consume; the
+        // engine keeps it in a separate frame buffer (`+0x5E0`) as well.
+        acc.copy_from_slice(frame);
+        Self::fold_iir_sub(acc, win1, win2, ctx.n_fft, hop_1420 as usize);
+        Self::oac_channel(
+            win1,
+            win2,
+            out_plane,
+            &ctx.synth_a,
+            &ctx.synth_b,
+            &ctx.edge_gain,
+            g_index,
+            ratio,
+            slope,
+            ctx.step_base,
+            ts_out_step,
+            step_1412,
+            pos_1384,
+            hop_1420,
+            ctx.precision,
+            ctx.n_fft,
+            ctx.n_write,
+            ctx.ring_out_len,
+            ctx.v8_len_a,
+            ctx.v9_len_b,
+        );
     }
 
     /// `_ev_cursor_advance` — the LABEL_144 cursor advance.

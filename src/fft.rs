@@ -104,6 +104,10 @@ pub fn backend() -> Backend {
 }
 
 /// An FFT plan for one size, wrapping whichever backend is selected.
+///
+/// `Clone` exists for the master-template cache (see [`with_plan`]): a plan
+/// is deterministic table data, so a clone runs the bit-identical transform.
+#[derive(Clone)]
 pub struct Fft {
     n: usize,
     inner: Inner,
@@ -114,6 +118,7 @@ pub struct Fft {
     work_im: Vec<f32>,
 }
 
+#[derive(Clone)]
 enum Inner {
     Radix2(fft_radix2::Fft),
     Rustfft {
@@ -312,6 +317,7 @@ fn pack_cart(n: usize, re: &[f32], im: &[f32]) -> Vec<f32> {
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 thread_local! {
     /// Plans are cached per (size, backend); the key includes the backend so a
@@ -320,6 +326,19 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Master plan templates, shared process-wide.
+///
+/// The parallel vocoder paths (`feed`'s crossover split, `ev_assembly`'s tail)
+/// spawn a fresh scoped thread per granule, and a fresh thread means an empty
+/// thread-local `PLANS` cache — rebuilding a 16384-point plan (the twiddle
+/// tables' `sin`/`cos` sweep) measured ~270 µs, which across the ~6k assembly
+/// granules of a 30 s render added ~1.6 s of pure recompute. Templates are
+/// built once per (size, backend); a cold thread **clones** the template
+/// instead. The plans are deterministic tables, so a clone performs the
+/// bit-identical transform (each `Fft` keeps its own scratch `Vec`s).
+static PLAN_TEMPLATES: LazyLock<Mutex<HashMap<(usize, Backend), Arc<Fft>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Run `f` with a cached plan for size `n` and the thread's current backend.
 pub fn with_plan<R>(n: usize, f: impl FnOnce(&mut Fft) -> R) -> R {
     let b = backend();
@@ -327,7 +346,13 @@ pub fn with_plan<R>(n: usize, f: impl FnOnce(&mut Fft) -> R) -> R {
         let rc = {
             let mut map = p.borrow_mut();
             map.entry((n, b))
-                .or_insert_with(|| Rc::new(RefCell::new(Fft::new(n))))
+                .or_insert_with(|| {
+                    let template = {
+                        let mut master = PLAN_TEMPLATES.lock().unwrap_or_else(|e| e.into_inner());
+                        Arc::clone(master.entry((n, b)).or_insert_with(|| Arc::new(Fft::new(n))))
+                    };
+                    Rc::new(RefCell::new((*template).clone()))
+                })
                 .clone()
         };
         let mut plan = rc.borrow_mut();
