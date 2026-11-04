@@ -779,11 +779,8 @@ impl TransientSched {
                 } else {
                     self.state = 0;
                 }
-                v31 = v30;
                 // 2026-11-04 audit D48: the DLL's steady out-step is
-                // renderer+1372 = round(hop*slope), NOT the input hop —
-                // v31 mirrors v30 only until we emit the machine's own
-                // step below.
+                // renderer+1372 = round(hop*slope), NOT the input hop.
                 v31 = step;
                 if reached {
                     v30 = hop + self.settle_hop_inc as i64;

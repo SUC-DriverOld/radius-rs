@@ -524,6 +524,11 @@ pub fn reset_phases_for_transients(
     avg_0: f32,
     avg_p1: f32,
     use_p568: bool,
+    // `renderer+3568`: frames since the last accepted B3 transient. The DLL
+    // gates the tail reset on `+3568 > sr*0.003` (144 frames @48k) and clears
+    // it after firing; pyradius hard-wired 0.0, which made `lim >= e08`
+    // always true and the whole tail block dead code.
+    frames_since_transient: i64,
     mag: &[f32],
     b_710: &[f32],
     mask: &[f32],
@@ -533,7 +538,7 @@ pub fn reset_phases_for_transients(
     phase: &mut [f32],
     mask_table: &mut [f32],
     _n_out: usize,
-) {
+) -> Option<i64> {
     // ---- [B1] this[0x4B8] == 1 ----
     if mode_4b8 == 1 {
         let n = len_594;
@@ -543,7 +548,7 @@ pub fn reset_phases_for_transients(
                 phase[i] = ((mask[i] as f64) * scale_20) as f32;
             }
         }
-        return;
+        return None;
     }
 
     // ---- [B2] this[0x9B8] == 2 ----
@@ -563,7 +568,7 @@ pub fn reset_phases_for_transients(
         }
         let r_count = r_start.len();
         if r_count < 1 {
-            return;
+            return None;
         }
         for r in 0..r_count {
             let s_ = r_start[r];
@@ -678,7 +683,7 @@ pub fn reset_phases_for_transients(
                 }
             }
         }
-        return;
+        return None;
     }
 
     // ---- [B3] else ----
@@ -687,20 +692,22 @@ pub fn reset_phases_for_transients(
     let a_p1 = avg_p1;
     if a_m1 >= a_0 {
         if a_0 <= 2.0 {
-            return;
+            return None;
         }
     } else {
         let w8 = (a_0 > a_p1) && (a_0 > 1.2);
         if a_0 <= 2.0 && !w8 {
-            return;
+            return None;
         }
     }
     let u70f = u_70 as f32;
     let lim = u70f * LIM_0P003_F;
-    // e08 is always np.float64(0.0) here, so float(int(e08)) == 0.0f.
-    let e08 = 0.0f64;
+    // `e08` = renderer+3568, the frames-since-last-accept counter (the DLL
+    // compares `(float)(int)+3568 > sr*0.003` to proceed; pyradius froze it
+    // at 0.0 which permanently closed this gate).
+    let e08 = frames_since_transient as f64;
     if lim >= (e08 as i64) as f32 {
-        return;
+        return None;
     }
     let v130 = ((n5d0 as f32) * 1500.0f32) / u70f;
     let half = if v130 >= 0.0 { 0.5f32 } else { -0.5f32 };
@@ -708,12 +715,17 @@ pub fn reset_phases_for_transients(
     // fcvtzu: negative saturates to 0.
     let start = if t < 0.0 { 0i64 } else { t as i64 };
     if n5d4 <= start {
-        return;
+        return None;
     }
     for i in start..n5d4 {
         let i = i as usize;
         phase[i] = mask[i];
     }
+    // The DLL additionally snaps the noise working buffer's tail from its
+    // analysis reference here (renderer+2080[ch] := renderer+1872[ch] for
+    // [start, nb_bins)) and clears the counter — both done by the caller,
+    // which owns those buffers.
+    Some(start)
 }
 
 // ===========================================================================
@@ -1414,6 +1426,7 @@ mod tests {
             0.0,
             0.0,
             false,
+            0,
             &[],
             &[],
             &mask,
@@ -1451,6 +1464,7 @@ mod tests {
             2.5,
             0.0,
             false,
+            0,
             &mag,
             &b710,
             &mask,
@@ -1488,6 +1502,7 @@ mod tests {
             1.0,
             0.0,
             true,
+            0,
             &mag,
             &b710,
             &mask,
@@ -1525,6 +1540,7 @@ mod tests {
             3.0,
             0.0,
             false,
+            0,
             &mag,
             &b710,
             &mask,
@@ -1537,6 +1553,43 @@ mod tests {
         );
         assert_bits(&phase, RPT_B3_PHASE_OUT);
         assert_bits(&table, RPT_TABLE_IN);
+    }
+
+    /// The +3568 throttle (`renderer+3568 > sr*0.003`): with the counter at 0
+    /// the gate stays closed (pyradius' permanent state); past the threshold
+    /// the B3 tail reset fires at `start = int(n_fft*1500/sr + 0.5)` and
+    /// reports the start bin so the caller can mirror the noise-buffer copy.
+    #[test]
+    fn reset_phases_b3_tail_throttled_by_frames_since_transient() {
+        let n = 600usize;
+        let mask: Vec<f32> = (0..n).map(|i| (i as f32) * 0.25).collect();
+        let base_phase: Vec<f32> = vec![-7.0; n];
+        let sr = 48000u32;
+        let start = ((16384.0f32 * 1500.0 / sr as f32) + 0.5) as i64; // 512
+
+        let call = |frames: i64, phase: &mut Vec<f32>| -> Option<i64> {
+            let mut table = vec![0.0f32; n];
+            reset_phases_for_transients(
+                0, 0, 1.0, n as i64, 0, 0, sr, 0, 4410, 16384, n as i64,
+                0.0, 3.0, 0.0, false, frames,
+                &mask, &mask, &mask, &[], &[], &[], phase, &mut table, n,
+            )
+        };
+
+        // Gate closed at/below sr*0.003 (144 @48k): counter 0 and 144.
+        let mut phase = base_phase.clone();
+        assert_eq!(call(0, &mut phase), None);
+        assert_eq!(phase, base_phase);
+        assert_eq!(call(144, &mut phase), None);
+        assert_eq!(phase, base_phase);
+
+        // Past the threshold: tail [512, 600) takes the mask, start reported.
+        let mut phase = base_phase.clone();
+        assert_eq!(call(145, &mut phase), Some(start));
+        assert!(phase[..start as usize].iter().all(|v| *v == -7.0));
+        for i in start as usize..n {
+            assert_eq!(phase[i], mask[i]);
+        }
     }
 
     // ------------------------------------------------ adjust_multiphase_diff

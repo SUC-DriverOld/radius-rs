@@ -376,6 +376,10 @@ pub struct VocoderState {
     comp_1432: f64,
     transient_state_2488: u32,
     transient_flag_1208: u8,
+    /// `renderer+3568`: input frames since the last accepted B3 transient
+    /// (advanced by the machine granule hop each scheduler step, cleared when
+    /// the throttled tail reset fires — DLL `0x18015e31a` / `0x18015c783`).
+    ts_frames_since_transient: i64,
     /// `+0x1352` — always 1 on the `ProcessBuffered` path (the C asserts it);
     /// kept so `FillGranule`'s visibility condition can mirror the engine.
     #[allow(dead_code)]
@@ -700,6 +704,7 @@ impl VocoderState {
             comp_1432: 0.0,
             transient_state_2488: 0,
             transient_flag_1208: 0,
+            ts_frames_since_transient: 0,
             buffered_1352: 1,
             g_index: 0,
             fed_total: 0,
@@ -910,6 +915,7 @@ impl VocoderState {
             self.tdetector = crate::vocoder::transient::TransientDetector::new(self.cfg.sr);
         }
         self.ts_plan = None;
+        self.ts_frames_since_transient = 0;
         self.ts_in_base = 0;
         self.ts_out_base = 0;
         self.ts_out_step = 0;
@@ -1393,7 +1399,7 @@ impl VocoderState {
         } else {
             0
         };
-        reset_phases_for_transients(
+        let reset = reset_phases_for_transients(
             self.transient_flag_1208 as i32,
             rpt_state,
             self.ratio,
@@ -1409,6 +1415,7 @@ impl VocoderState {
             avg_0,
             avg_p1,
             false,
+            self.ts_frames_since_transient,
             &self.ch[b].mag,
             &self.b_710,
             &self.ch[b].mask,
@@ -1419,6 +1426,27 @@ impl VocoderState {
             &mut mask_table,
             nb,
         );
+        if let Some(start) = reset {
+            // The B3 tail reset fired (accepted transient, ≥ sr*0.003 frames
+            // since the last one): the DLL also snaps the noise working
+            // buffer's tail from its per-bin analysis reference
+            // (`renderer+2080[ch][start..] := renderer+1872[ch][start..]`,
+            // `0x18015c755`) and clears the frame counter (`0x18015c783`).
+            // Our noise path's counterpart of the working buffer is
+            // `noise_gain` ([nch][nb_bins]); the reference side (the DLL's
+            // +1872, filled by its noise-synthesis loop) has no live engine
+            // counterpart yet — the pre-AFC magnitude snapshot `mag_copy` is
+            // the closest analysis reference.
+            // TODO(+3568): repoint at the true reference once the DLL's
+            // noise-synthesis loop (158D20 L2238+) is ported.
+            let base = b * nb;
+            let (dst, src) = (
+                &mut self.noise_gain[base..base + nb],
+                &self.ch[b].mag_copy,
+            );
+            dst[start as usize..nb].copy_from_slice(&src[start as usize..nb]);
+            self.ts_frames_since_transient = 0;
+        }
         self.ch[b].phase = phase;
         self.mask_table_8f8 = mask_table;
     }
@@ -1655,6 +1683,10 @@ impl VocoderState {
                 if out.state2 {
                     self.ts_state2_granules += 1;
                 }
+                // `renderer+3568 += hop` at the machine-granule exit
+                // (`0x18015e31a`): the counter tracks input frames since the
+                // last accepted transient.
+                self.ts_frames_since_transient += out.in_hop;
                 self.ts_in_base = cursor;
                 self.ts_out_base = pos;
                 plan = Some(out);
