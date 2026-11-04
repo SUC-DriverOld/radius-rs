@@ -582,15 +582,28 @@ pyradius 位级回归测试用 `set_transient_sched(false)` 显式退出。
 **TD 侧**（双速率定律/三坑/残余全部落地确认）顺手修一处：排空计数
 trunc → round（与文档五次实测定律及 VC 侧一致）。
 
-**遗留清单**（按影响排序，未修）：
+**第二轮（同日，遗留清理）**：
+- margin 7×128 → 覆盖最大前向查询窗（`max(sr×0.1, 8380)+896`，对齐到
+  stride）——tempo200 轮廓 0.6332→0.6408、attack 0.4134→0.4273、state-2
+  假触发 843→771；
+- ratio==1 直拷旁路（§8 D17）：tempo100+pitch0 不再全程声码化；
+- set_geometry 除数表补全（D12：q≥10 → {3,3,6}[min(q−10,2)]，q<10 →
+  4<<q；f 同步 1.4/0.7）；
+- state2 非到达粒 out_step 改机器 step=round(hop×slope)（D48，仅
+  ts_hop_override 路径生效）；
+- 0xab3（sub_1801525E0）与 B2 噪底真参考：反编译已存
+  `.tmp/ida/refine_9chunk.c`/`.tmp/ida/gain_curve.c`，移植进行中。
 - 流式参数提交链（§2 槽1/3/4 pending/commit/基点重映射）——离线单次
   set_ratio 等价，流式不可用；
-- sub_1801525E0（0xab3 逐 9-chunk 组精化）与 sub_180153570 增益曲线/
-  宿主事件流未移植；
-- renderer+3568 记账（state2 中点清零+每粒 +=hop）；
-- ratio==1 直拷贝旁路（§8）——tempo=100/0 半音仍全程声码化；
-- margin 7×128 不覆盖 state2 重查询窗（4800）与压缩侧 range（6326/
-  8380），前沿会读到未定稿分数；
+- sub_180153570 增益曲线/宿主事件流未移植（UI 侧，音频影响未证实）；
+- renderer+3568 记账（已解码 2026-11-04 二轮，未移植）：+3568 = 距上次
+  B3 接受瞬态的帧计数（每粒 +=hop，L4294；重置点清零 L1068）。B3 接受
+  （`cur>两侧 ∧ cur>1.2`，L3060）且 `+3568 > sr×0.003`（144 帧@48k）时：
+  `start = int(bin_base + n_fft×1500/sr)`（=512+base @48k/16384），把通
+  道谱尾 `[start, nb_bins)` 从缓冲 renderer+1872（+8×ch）整段拷入
+  renderer+2080（+8×ch）——**噪声激励缓冲在瞬态接受点重置**，节流 144
+  帧；随后 +3568=0（L3065-3087）。移植落点：ev_rpt B3 接受分支 +
+  noise.rs 激励缓冲，下一轮实现；
 - state2 非到达粒 out_step=输入 hop（DLL=round(hop×slope)，仅
   ts_hop_override 实验路径受影响）；
 - set_geometry 除数表分支不完整（q<10 的 4<<q 与 q∈{10,11}→3；当前

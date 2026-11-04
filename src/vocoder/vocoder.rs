@@ -818,7 +818,7 @@ impl VocoderState {
         // The transient scheduler's geometry (`renderer+2452` etc.) from
         // sub_180157BC0 — the machine's own ~15 ms granule, not the schedule
         // hop.
-        self.tsched.set_geometry(self.cfg.n_write as i64, self.slope, true);
+        self.tsched.set_geometry(self.cfg.n_write as i64, self.slope, 37);
         // Keep the formant operator in step: its ratio is the pitch ratio offset by
         // the formant shift, and it must follow the pitch as well.
         self.sync_formant_ratio();
@@ -903,8 +903,10 @@ impl VocoderState {
             self.tsched = crate::vocoder::transient::TransientSched::new();
             self.tsched.trace_enabled = trace;
             self.tsched
-                .set_geometry(self.cfg.n_write as i64, self.slope, true);
-            self.tqueue = crate::vocoder::transient::TransientQueue::new(128, 0);
+                .set_geometry(self.cfg.n_write as i64, self.slope, 37);
+            // new_with_sr enables the 0xab3 progressive refinement
+            // (sub_1801525E0) in the queue — see transient.rs refine().
+            self.tqueue = crate::vocoder::transient::TransientQueue::new_with_sr(128, 0, self.cfg.sr);
             self.tdetector = crate::vocoder::transient::TransientDetector::new(self.cfg.sr);
         }
         self.ts_plan = None;
@@ -1871,10 +1873,19 @@ impl VocoderState {
             }
         }
         // The detector finalises a chunk's score only 7 chunks (5 comb
-        // look-ahead + 2 NMS window) after its audio was fed, so hold the
-        // granule pump that far back — the scheduler's event queries
-        // (≤ round(sr*0.1) ahead) then always see finalised scores.
-        let margin = if self.cfg.transient_sched { 7 * 128 } else { 0 };
+        // look-ahead + 2 NMS window) after its audio was fed, and the
+        // scheduler's forward queries reach further than the old 7-chunk
+        // margin assumed: the state-2 re-query window is round(sr*0.1)
+        // (4800 @48k) and the compress-side range is
+        // round(hop*0.5*max_w/slope + step/slope) (measured 6326/8380 on the
+        // AU corpus) — hold the pump back far enough that both always see
+        // finalised scores (2026-11-04 audit D60).
+        let margin = if self.cfg.transient_sched {
+            let need = (((self.cfg.sr as f64) * 0.1) as i64).max(8380) + 7 * 128;
+            ((need + 127) / 128) * 128
+        } else {
+            0
+        };
         while self.cursor_1376 + (self.hop_1420 as i64) + margin < self.fed_total {
             self.process_granule();
         }
@@ -1938,6 +1949,16 @@ impl VocoderState {
         // Real input frames available; everything past this reads as silence.
         let in_frames = x.len() / nch;
         let target = target_frames;
+        // §8 law: the DLL's emitter bypasses the whole chain with a plain
+        // ring copy when the ratio is exactly 1 (`a9 == 1.0`), i.e. tempo 100
+        // + pitch 0 — our engine would otherwise still vocoder-color a
+        // no-op render (2026-11-04 audit D17).
+        if self.slope == 1.0 && self.ratio == 1.0 && target == in_frames && in_frames > 0 {
+            self.progress_total = target as i64;
+            self.progress
+                .store(target as u64, std::sync::atomic::Ordering::Relaxed);
+            return x[..target * nch].to_vec();
+        }
         let ring_len = self.cfg.ring_out_len as i64;
         // The drain resampler's `rate` **is** the pitch: reading a ring that already
         // holds the shifted signal at rate `r` scales its frequency by `r` (verified

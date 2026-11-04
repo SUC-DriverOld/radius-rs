@@ -70,11 +70,38 @@ pub struct TransientQueue {
     head: i64,
     scores: Vec<f32>,
     cap: usize,
+    // ---- `sub_1801525E0` ("0xab3") progressive refinement state ----
+    /// `*((float*)a1+44)` — sample rate; 0 disables the refinement pipeline.
+    sr: f32,
+    /// `a1[70]` — pre-refinement score snapshot (the NMS confidence weight:
+    /// every suppression pass keys on `refined * raw`, never raw alone).
+    raw: Vec<f32>,
+    /// `a1[3]`/`a1[67]` — post-sharpening snapshot (the 5-point argmax
+    /// reference of the swap pass).
+    snap: Vec<f32>,
+    /// `*((_DWORD*)a1+226)` — absolute chunk index sharpened so far.
+    refined_to: i64,
+    /// `*((float*)a1+227)` — the sharpening IIR state (persists across calls).
+    sharp_prev: f32,
+    /// Chunks sharpened since the last cascade pass; the DLL runs the
+    /// cascade once per process block (~8 chunks), not per chunk.
+    since_cascade: i64,
 }
 
 impl TransientQueue {
     pub fn new(stride: i64, base: i64) -> Self {
-        Self { stride: stride.max(1), base, head: 0, scores: Vec::new(), cap: 4096 }
+        Self { stride: stride.max(1), base, head: 0, scores: Vec::new(), cap: 4096,
+               sr: 0.0, raw: Vec::new(), snap: Vec::new(),
+               refined_to: 0, sharp_prev: 0.0, since_cascade: 0 }
+    }
+
+    /// Construct with the sample rate that enables the `0xab3` refinement
+    /// pipeline (`TransientQueue::new` leaves it at 0 = disabled, which the
+    /// unit tests rely on for the raw query semantics).
+    pub fn new_with_sr(stride: i64, base: i64, sr: u32) -> Self {
+        let mut q = Self::new(stride, base);
+        q.sr = sr as f32;
+        q
     }
 
     pub fn stride(&self) -> i64 {
@@ -103,7 +130,10 @@ impl TransientQueue {
     pub fn push(&mut self, score: f32) -> i64 {
         let i = self.head + self.scores.len() as i64;
         self.scores.push(score);
+        self.raw.push(score);
+        self.snap.push(score);
         self.compact();
+        self.refine();
         i
     }
 
@@ -112,6 +142,8 @@ impl TransientQueue {
     pub fn push_at(&mut self, i: i64, score: f32) {
         while self.head + (self.scores.len() as i64) < i {
             self.scores.push(0.0);
+            self.raw.push(0.0);
+            self.snap.push(0.0);
             self.compact();
         }
         let last = self.head + (self.scores.len() as i64) - 1;
@@ -119,18 +151,188 @@ impl TransientQueue {
             // Chunks are finalised in order; a late overwrite should not
             // happen, but a defensive write keeps the newest value.
             self.scores[(i - self.head) as usize] = score;
+            self.raw[(i - self.head) as usize] = score;
+            self.snap[(i - self.head) as usize] = score;
             return;
         }
         self.scores.push(score);
+        self.raw.push(score);
+        self.snap.push(score);
         self.compact();
+        self.refine();
     }
 
     fn compact(&mut self) {
         if self.scores.len() > self.cap {
             let drop = self.scores.len() - self.cap;
             self.scores.drain(0..drop);
+            self.raw.drain(0..drop);
+            self.snap.drain(0..drop);
             self.head += drop as i64;
         }
+    }
+
+    /// `sub_1801525E0` — the DLL's progressive score refinement ("0xab3"),
+    /// decoded 2026-11-04 from `.tmp/ida/refine_9chunk.c`. Runs in-place on
+    /// the score store whenever new chunks land (the DLL runs it once per
+    /// process block). Stages:
+    ///
+    /// **S1 sharpen** (`0x18015263b..0x1801527e0`): a persistent one-pole
+    /// over the score timeline — `x'[i] = x[i] − 0.8·(a·x[i] + (1−a)·x'[i−1])`
+    /// with `a = TimeToIirA(0.1, sr/stride)` and the state carried in
+    /// `*((float*)a1+227)` across calls. DC gain 0.2: it de-means the score
+    /// track and sharpens onset edges before anything else sees them.
+    ///
+    /// **S2 snapshot** (`0x1801527e2..`): the sharpened span is copied to a
+    /// side buffer (`a1[3]`, our `snap`) that later stages read while the
+    /// live buffer keeps being mutated.
+    ///
+    /// **S3 floor** (`0x1801528ca..`): `x ≤ 1/g → 0` over the new span, where
+    /// `g = *((float*)a1+45)` is an (unknown) calibration — we take g = 1
+    /// (sub-threshold scores never satisfy any downstream `> 1/thr` query).
+    /// // TODO(0xab3): confirm `a1[45]` dynamically.
+    ///
+    /// **S4 swap** (`0x180152aa9..0x180152bd0`): for `i` in
+    /// `[max(3, old−(rA+3)), new−3)`: if `live[i]` is above the floor, find
+    /// the argmax of `snap[i−3..=i+1]` (ties → first) and, when it is not `i`
+    /// itself, SWAP `live[argmax] ↔ live[i]` — the local peak of the frozen
+    /// snapshot migrates onto the current index in the live buffer.
+    ///
+    /// **S5 cascade** — four suppression passes, each over the age band
+    /// `[max(0, old−guard), new−guard)` (older chunks survive coarser passes),
+    /// each killing `live[i]` iff some `k ∈ [i−w, i+w]` (clamped to
+    /// `[0, new−1]`) has `live[k]·raw[k] > live[i]·factor·raw[i]`:
+    ///
+    /// | pass | window w | guard | factor |
+    /// |------|----------|-------|--------|
+    /// | A `0x1801529c5` | rA = ⌊0.01·sr/stride+0.5⌋ | rA | 1 |
+    /// | B `0x180152bfc` | rA | 2·rA+6 | 1 |
+    /// | C `0x180152cf8` | rC = ⌊0.025·sr/stride+0.5⌋ | rC+2·rA+6 | 2.7 |
+    /// | D `0x180152df6` | rD = ⌊0.05·sr/stride+0.5⌋ | rD+rC+2·rA+6 | 6 |
+    ///
+    /// `raw` is the pre-refinement score — the product key makes suppression
+    /// respect the ORIGINAL confidence, not the sharpened peak. @48k/128:
+    /// rA=4, rC=9, rD=19 chunks.
+    ///
+    /// NOT ported (recorded): the two `sub_180153570` gain-curve calls
+    /// (τ≈0.03/gain 3.0 and τ≈0.035/gain 1.0) and the final export into the
+    /// `a1[0]` host-event buffer (fully-refined, floor-applied scores for the
+    /// host event stream at lag `rD+rC+2·rA+6+4·⌊0.1·sr/stride+0.5⌋` chunks)
+    /// — // TODO(0xab3). The machine's queries read the live buffer at rA
+    /// lag, which this port preserves.
+    fn refine(&mut self) {
+        if self.sr <= 0.0 {
+            return; // refinement disabled (unit-test construction)
+        }
+        let new = self.head + self.scores.len() as i64; // a1+224
+        let old = self.refined_to;                     // a1+226
+        if old >= new {
+            return;
+        }
+        let hop = self.stride as f32; // a1+13: the recurrence advances one
+        let sr = self.sr;             // chunk per step, so rate = sr/stride
+        // S1 + S2: sharpen the new span, snapshotting post-sharpen values.
+        let a = crate::vocoder::acs::time_to_iir_a(0.1, sr / hop);
+        let mut prev = self.sharp_prev;
+        for i in old..new {
+            let j = (i - self.head) as usize;
+            let x = self.scores[j];
+            let y = x - (((x - prev) * a + prev) * 0.8);
+            self.scores[j] = y;
+            self.snap[j] = y;
+            prev = y;
+        }
+        self.sharp_prev = prev;
+        // S3: floor the new span.
+        let floor = 1.0f32; // 1/a1[45] with a1[45] = 1 (see TODO above)
+        for i in old..new {
+            let j = (i - self.head) as usize;
+            if floor >= self.scores[j] {
+                self.scores[j] = 0.0;
+            }
+        }
+        self.refined_to = new;
+        self.since_cascade += new - old;
+
+        // The DLL drives S4+S5 from its process block (~8 chunks/call at
+        // 48k); running them per chunk would re-visit each index ~8× more
+        // than the original and over-migrate the S4 swaps.
+        if self.since_cascade < 8 {
+            return;
+        }
+        self.since_cascade = 0;
+
+        let rh = |t: f32| -> i64 { ((t * sr / hop) + 0.5) as i64 }; // (int)(x+0.5)
+        let ra = rh(0.01);
+        let rc = rh(0.025);
+        let rd = rh(0.05);
+
+        // S4: 5-point argmax swap on the fresh band.
+        let head = self.head;
+        let s_start = (old - (ra + 3)).max(3).max(head);
+        let s_end = new - 3;
+        let mut i = s_start;
+        while i < s_end {
+            let ji = (i - self.head) as usize;
+            if self.scores[ji] > floor {
+                let lo = (i - 3).max(head);
+                let mut best = i;
+                let mut best_v = f32::NEG_INFINITY;
+                for k in lo..=i + 1 {
+                    let jk = (k - self.head) as usize;
+                    let v = self.snap[jk];
+                    if v > best_v {
+                        best_v = v;
+                        best = k;
+                    }
+                }
+                if best != i {
+                    let jb = (best - self.head) as usize;
+                    self.scores.swap(ji, jb);
+                }
+            }
+            i += 1;
+        }
+
+        // S5: the four-pass suppression cascade.
+        let sc = &mut self.scores;
+        let raw = &self.raw;
+        let mut pass = |window: i64, guard: i64, factor: f32| {
+            let start = (old - guard).max(0).max(head);
+            let end = new - guard;
+            if end <= start {
+                return;
+            }
+            for i in start..end {
+                let ji = (i - head) as usize;
+                let s = sc[ji];
+                if floor > s {
+                    continue;
+                }
+                let lo = (i - window).max(0);
+                let hi = (i + window).min(new - 1);
+                if lo > hi {
+                    continue;
+                }
+                let key = s * factor * raw[ji];
+                for k in lo..=hi {
+                    let jk = (k - head) as usize;
+                    let prod = if k < head || jk >= sc.len() {
+                        0.0
+                    } else {
+                        sc[jk] * raw[jk]
+                    };
+                    if prod > key {
+                        sc[ji] = 0.0;
+                        break;
+                    }
+                }
+            }
+        };
+        pass(ra, ra, 1.0);
+        pass(ra, 2 * ra + 6, 1.0);
+        pass(rc, rc + 2 * ra + 6, 2.7);
+        pass(rd, rd + rc + 2 * ra + 6, 6.0);
     }
 
     /// Chunk index whose window contains `pos` (the DLL's `v14`).
@@ -506,19 +708,28 @@ impl TransientSched {
         }
     }
 
-    /// `sub_180157BC0`'s geometry laws for the quality ≥ 10 path (our quality
-    /// is 37): the machine's steady granule is
-    /// `hop = round(round(n_write*0.7/6) / slope)` frames (~705 at 48 kHz,
-    /// slope 1.19) — a ~15 ms granule, ~3 of our sub-granules, NOT the
-    /// 3592-frame schedule hop — with `step = round(hop*slope)` and
-    /// `max_w = round(round(n_write*0.7/hop) * 1.4 * max(sqrt(slope), 1))`.
-    pub fn set_geometry(&mut self, n_write: i64, slope: f64, quality_ge10: bool) {
-        let div = if quality_ge10 { 6.0f64 } else { 4.0 };
+    /// `sub_180157BC0`'s geometry laws, full divisor table (2026-11-04 audit
+    /// D12): `base = round(n_write*0.7/D)` with `D = {3,3,6}[min(q-10,2)]`
+    /// when `q >= 10`, else `D = 4 << q`; then
+    /// `hop = round(base/slope)` (~705 at 48 kHz, slope 1.19, q=37 — a ~15 ms
+    /// granule, ~3 of our sub-granules, NOT the 3592-frame schedule hop),
+    /// `step = round(hop*slope)` and
+    /// `max_w = round(round(n_write*0.7/hop) * f * max(sqrt(slope), 1))` with
+    /// `f = 1.4` (q>=10) / `0.7`.
+    pub fn set_geometry(&mut self, n_write: i64, slope: f64, quality: i32) {
+        let (div, f) = if quality >= 10 {
+            let d = match (quality - 10).min(2) {
+                0 | 1 => 3.0f64,
+                _ => 6.0,
+            };
+            (d, 1.4f64)
+        } else {
+            ((4 << quality) as f64, 0.7f64)
+        };
         let hop = rint_away(rint_away(n_write as f64 * 0.7 / div) as f64 / slope).max(1);
         self.steady_hop = hop;
         self.steady_step = rint_away(hop as f64 * slope);
         let span = rint_away(n_write as f64 * 0.7 / hop as f64);
-        let f = if quality_ge10 { 1.4f64 } else { 0.7 };
         let g = slope.sqrt().max(1.0);
         self.max_w = rint_away(span as f64 * f * g).max(1) as i32;
     }
@@ -569,6 +780,11 @@ impl TransientSched {
                     self.state = 0;
                 }
                 v31 = v30;
+                // 2026-11-04 audit D48: the DLL's steady out-step is
+                // renderer+1372 = round(hop*slope), NOT the input hop —
+                // v31 mirrors v30 only until we emit the machine's own
+                // step below.
+                v31 = step;
                 if reached {
                     v30 = hop + self.settle_hop_inc as i64;
                     // Event re-query at the boundary (the 0x1801592e8 block):
@@ -785,6 +1001,60 @@ mod tests {
     }
 
     #[test]
+    fn refine_0xab3_floors_subthreshold_and_nms_twin_peaks() {
+        // sr = 48000, stride = 128 → rA = 4, rC = 9, rD = 19 chunk windows.
+        let mut q = TransientQueue::new_with_sr(128, 0, 48_000);
+        let mut scores = vec![0.5f32; 30]; // sub-floor bed
+        scores[10] = 5.0; // twin peaks 3 chunks apart — inside rA of each other
+        scores[13] = 5.0;
+        for (i, &s) in scores.iter().enumerate() {
+            q.push_at(i as i64, s);
+        }
+        // S3 floor: the far bed (outside the S4 migration band 6..18, where
+        // the swap pass may legitimately move a peak onto a bed chunk) must
+        // be zero.
+        for i in (0..6).chain(18..30) {
+            assert_eq!(
+                q.score_at(i),
+                0.0,
+                "sub-floor chunk {i} must floor to zero"
+            );
+        }
+        // Law-level assertions on this adversarial input: the dominant twin
+        // keeps most of its score somewhere in the migration band (S4 moves
+        // peaks toward the current index), and the two original spike
+        // positions cannot BOTH stay dominant — pass A's product key (with
+        // the sharpening having attenuated whichever spike followed the
+        // other) resolves the pair. Migrated copies pairing with bed-level
+        // raw weights (product ≈ 0.6) may legitimately survive: that is the
+        // product-key semantics, not a bug.
+        let band: Vec<f32> = (6..18).map(|i| q.score_at(i)).collect();
+        let mx = band.iter().copied().fold(0.0f32, f32::max);
+        assert!(mx > 4.0, "dominant twin survives strongly, band={band:?}");
+        let dominant_origins = [q.score_at(10), q.score_at(13)]
+            .iter()
+            .filter(|&&v| v >= 4.0)
+            .count();
+        assert_eq!(
+            dominant_origins, 1,
+            "twin dominance resolved, got 10:{} 13:{}",
+            q.score_at(10),
+            q.score_at(13)
+        );
+    }
+
+    #[test]
+    fn refine_0xab3_disabled_without_sr() {
+        // TransientQueue::new (sr = 0) keeps the raw scores: the classic
+        // query semantics the rest of the unit tests rely on.
+        let mut q = TransientQueue::new(128, 0);
+        for i in 0..30 {
+            q.push_at(i, 0.5);
+        }
+        assert_eq!(q.score_at(7), 0.5);
+    }
+
+    #[test]
     fn query_forward_finds_first_above_threshold() {
         // chunks 0..8 at stride 1024, base 0; event at chunk 4.
         let scores = [0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0];
@@ -887,7 +1157,7 @@ mod tests {
         // round(sr*0.05) = 2400 frames, so the first granule (inpos 0) sees it.
         let mut q = q_with(1024, 0, &[0.0, 0.0, 2.5]);
         let mut s = TransientSched::new();
-        s.set_geometry(7184, 1.5, true);
+        s.set_geometry(7184, 1.5, 37);
         let mut states = Vec::new();
         let mut inpos = 0i64;
         let mut curpos = 0i64;
@@ -909,7 +1179,7 @@ mod tests {
     fn sched_stays_steady_without_events() {
         let q = q_with(1024, 0, &[0.0; 20]);
         let mut s = TransientSched::new();
-        s.set_geometry(7184, 1.5, true);
+        s.set_geometry(7184, 1.5, 37);
         for g in 0..8 {
             let out = s.step(&q, g * 3592, g * 5388, 1.5, 48000, 3592, 5388);
             assert_eq!(out.state, 0);
@@ -926,12 +1196,12 @@ mod tests {
         // hop = round(round(7184*0.7/6)/1.19) = round(838/1.19) = 704,
         // step = round(704*1.19) = round(837.76) = 838, span = round(7184*0.7/704) = 7,
         // max_w = round(7*1.4*sqrt(1.19)) = round(10.69) = 11.
-        s.set_geometry(7184, 1.19, true);
+        s.set_geometry(7184, 1.19, 37);
         assert_eq!(s.steady_hop, 704);
         assert_eq!(s.steady_step, 838);
         assert_eq!(s.max_w, 11);
         // slope < 1 clamps the sqrt factor at 1: hop 1117, span 5, max_w 7.
-        s.set_geometry(7184, 0.75, true);
+        s.set_geometry(7184, 0.75, 37);
         assert_eq!(s.steady_hop, 1117);
         assert_eq!(s.max_w, 7);
     }
