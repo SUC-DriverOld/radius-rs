@@ -65,6 +65,7 @@ pub mod formant;
 pub mod noise;
 pub mod phase;
 pub mod rate_gen;
+pub mod spectral_gate;
 pub mod synth;
 pub mod transient;
 pub mod vocoder;
