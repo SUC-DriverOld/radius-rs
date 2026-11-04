@@ -131,8 +131,10 @@ fn td_acceptance_granule_structure() {
     };
     assert_eq!(st_neg.n_granule, 1719, "-3 granule count");
     assert_eq!(st_neg.n_transient, 19, "-3 transient count");
-    assert_eq!(out.len() / 2, 1_393_118, "+3 output frames");
-    assert_eq!(out_neg.len() / 2, 1_393_182, "-3 output frames");
+    // round() drain law (doc SS11, five live samples) adds up to +1 frame per
+    // drain over the 29 s corpus: 1_393_118 (trunc) -> 1_393_119 (round).
+    assert_eq!(out.len() / 2, 1_393_119, "+3 output frames");
+    assert_eq!(out_neg.len() / 2, 1_393_183, "-3 output frames");
 }
 
 /// The acceptance corpus at four shifts: finite, duration preserving, working.

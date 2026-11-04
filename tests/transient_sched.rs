@@ -83,11 +83,13 @@ fn transient_sched_changes_pitch_up_output() {
 
 #[test]
 fn transient_hop_override_alters_timing() {
-    // The experimental hop re-timing path (off by default) must itself change
-    // the render relative to gates-only.
+    // The dual-queue re-timing path (default since the §13.6 port) must itself
+    // change the render relative to gates-only — the baseline now opts out
+    // explicitly.
     let x = drum_train();
     let mut gates = VocoderState::new(48_000, 2);
     gates.set_ratio(4.0, 100.0);
+    gates.ts_hop_override = false;
     let out_gates = gates.render(&x);
     let mut hop = VocoderState::new(48_000, 2);
     hop.set_ratio(4.0, 100.0);

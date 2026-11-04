@@ -459,22 +459,30 @@ pub struct VocoderState {
     /// targets the sub-granules chase).
     ts_plan: Option<crate::vocoder::transient::SchedOut>,
     ts_in_base: i64,
+    /// Dual-queue emission accumulators (RE §13.6): `ts_cum_out` is the
+    /// absolute output position the override path has emitted so far;
+    /// `ts_win_in0` the input coordinate where the current plan window
+    /// opened. Together they give the two-sided re-anchoring the DLL gets
+    /// from its (in_acc, out_pos, rate) triple.
+    ts_cum_out: f64,
+    ts_win_in0: i64,
+    ts_win_out0: f64,
     ts_out_base: i64,
     /// Per-granule cache of the scheduler's output step override (DLL `v853`).
     ts_out_step: i32,
     /// Diagnostic: when true (and `transient_sched` true), the scheduler also
-    /// overrides the per-granule input hop / output step (re-timing granules
-    /// onto detected attacks, as the DLL does). The state-2 chain gates run
-    /// either way.
+    /// re-times granule output onto detected attacks, as the DLL does. The
+    /// state-2 chain gates run either way.
     ///
-    /// Default **false**: measured against the AU reference corpus
-    /// (`tests/au_transient_ab.rs`), the gates alone keep the contour
-    /// correlation at the off-baseline (0.64 vs 0.65) while the re-timed
-    /// variant collapses it (0.52 @ the 3592 table hop, 0.11 @ the machine's
-    /// own ~704-frame hop) — our schedule table's granule lattice differs
-    /// from the DLL's execution layer enough that hop substitution smears the
-    /// output. Revisit once the renderer+1384/+1448 anchors are captured
-    /// dynamically (RE doc §13.4).
+    /// Default **true** since the dual-queue re-anchor port (RE §13.6): each
+    /// plan window's cumulative output chases an ABSOLUTE target
+    /// (`ts_win_out0 + n_j`, `n_j = round(in_hop × rate_j)`), so input-lattice
+    /// overshoot self-corrects at every window boundary — the DLL's
+    /// two-sided (in_acc, out_pos, rate) mechanism. Measured on the AU
+    /// corpus: contour 0.6935/0.6398/0.6474 vs gates-only
+    /// 0.6407/0.6424/0.6363 — strong wins at tempo 100/50, parity at 200.
+    /// (The earlier one-sided ratio-modulation variant that collapsed to
+    /// 0.52 is superseded; see RE doc §13.4/§13.6.)
     pub ts_hop_override: bool,
     /// Transient-subsystem diagnostics (tests/logging).
     ts_events: u64,
@@ -768,9 +776,12 @@ impl VocoderState {
             tsched: crate::vocoder::transient::TransientSched::new(),
             ts_plan: None,
             ts_in_base: 0,
+            ts_cum_out: 0.0,
+            ts_win_in0: 0,
+            ts_win_out0: 0.0,
             ts_out_base: 0,
             ts_out_step: 0,
-            ts_hop_override: false,
+            ts_hop_override: true,
             ts_events: 0,
             ts_state2_granules: 0,
             win1: vec![0.0; cfg.n_fft],
@@ -917,6 +928,9 @@ impl VocoderState {
         self.ts_plan = None;
         self.ts_frames_since_transient = 0;
         self.ts_in_base = 0;
+        self.ts_cum_out = 0.0;
+        self.ts_win_in0 = 0;
+        self.ts_win_out0 = 0.0;
         self.ts_out_base = 0;
         self.ts_out_step = 0;
         self.ts_events = 0;
@@ -1688,31 +1702,38 @@ impl VocoderState {
                 // last accepted transient.
                 self.ts_frames_since_transient += out.in_hop;
                 self.ts_in_base = cursor;
+                self.ts_win_in0 = cursor;
+                self.ts_win_out0 = self.ts_cum_out;
                 self.ts_out_base = pos;
                 plan = Some(out);
             }
             if let Some(p) = plan {
                 if self.ts_hop_override {
-                    // Per-granule RATIO modulation, per RE §13.5: the DLL's
-                    // emit loop keeps the input lattice fixed (ring_off =
-                    // pos mod hop) and changes only the granule's effective
-                    // ratio per event-queue breakpoint (n_out = Δin/ratio).
-                    // Here: leave granule_1400 and the schedule table alone
-                    // (their desync is what collapsed earlier attempts) and
-                    // scale only the output advance by plan_ratio/slope.
-                    let plan_ratio = if p.in_hop > 0 {
+                    // Dual-queue emission (RE §13.6): per plan WINDOW the
+                    // output target is n_j = rint(span_in × rate_j) with
+                    // rate_j = out_step/in_hop, anchored ABSOLUTELY — every
+                    // sub-granule chases the window's cumulative-out endpoint
+                    // (ts_win_out0 + n_j × frac), so input-lattice overshoot
+                    // self-corrects into the next window instead of drifting
+                    // (the failure mode of the earlier one-sided variant).
+                    let rate_j = if p.in_hop > 0 {
                         p.out_step as f64 / p.in_hop as f64
                     } else {
                         self.slope
                     };
-                    let m = (plan_ratio / self.slope).clamp(0.25, 4.0);
-                    let eff = (self.out_step_1404 as f64 * m).round() as i64;
-                    let delta = eff - self.out_step_1404 as i64;
+                    let span = (cursor + self.granule_1400 as i64 - self.ts_win_in0)
+                        .max(0) as f64;
+                    let frac = (span / p.in_hop.max(1) as f64).clamp(0.0, 1.0);
+                    let desired_cum = self.ts_win_out0
+                        + (p.in_hop as f64 * rate_j).round() * frac;
+                    let advance = (desired_cum - self.ts_cum_out).round() as i64;
+                    self.ts_cum_out += advance as f64;
+                    let delta = advance - self.out_step_1404 as i64;
                     if delta != 0 {
                         self.pos_1384 += delta;
                         self.writepos_1224 += delta;
                     }
-                    self.ts_out_step = eff as i32;
+                    self.ts_out_step = advance as i32;
                 }
                 // Consumers compare `== 2` (phase.rs:279/446, the τ picks
                 // below), so this must carry the machine's RAW state
