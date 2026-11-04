@@ -388,6 +388,24 @@ pub struct VocoderState {
     g_index: i64,
     fed_total: i64,
     out_total: i64,
+    // ---- §4 streaming parameter commit chain ----
+    // The DLL stages mid-stream parameter changes in pending slots
+    // (flag[296] stretch / flag[297] pitch) and applies them at the top of
+    // the processing loop when the commit gate passes: input base == 0 or
+    // ≥ 32 frames advanced since the last commit (doc §4). `set_ratio`
+    // before the first feed applies immediately (identical to the old
+    // behaviour); after it, the change is staged here.
+    pending_semis: Option<f64>,
+    pending_tempo: Option<f64>,
+    /// `fed_total` at the last mid-stream commit — the DLL's `in_base`.
+    commit_in_base: i64,
+    /// Schedule-continuity anchor — the additive counterpart of the DLL's
+    /// `out_base`/`in_base` time-map remap. Applied to `vc_calc_sched`
+    /// positions in `process_granule` so a commit never jumps the granule
+    /// lattice: after a commit the next granule lands at
+    /// `pos_last + out_step_new`. Zero until the first mid-stream commit,
+    /// so single-parameter renders stay bit-identical.
+    sched_pos_offset: i64,
     /// Output frames produced, for progress reporting.
     ///
     /// Shared rather than owned so a watchdog thread can poll it while the
@@ -721,6 +739,10 @@ impl VocoderState {
             g_index: 0,
             fed_total: 0,
             out_total: 0,
+            pending_semis: None,
+            pending_tempo: None,
+            commit_in_base: 0,
+            sched_pos_offset: 0,
             progress: new_progress_counter(),
             progress_total: 1,
             out_reported: 0,
@@ -824,6 +846,20 @@ impl VocoderState {
     /// synthesis. A 200 % tempo therefore doubles the duration and leaves the pitch
     /// where `semis` put it.
     pub fn set_ratio(&mut self, semis: f64, tempo: f64) {
+        if self.fed_total > 0 {
+            // §4: once streaming has started, parameter changes are staged in
+            // the pending slots (the DLL's flag[296]/flag[297]) and committed
+            // at the next `feed` boundary — see `commit_pending`.
+            self.pending_semis = Some(semis);
+            self.pending_tempo = Some(tempo);
+            return;
+        }
+        self.apply_ratio(semis, tempo);
+    }
+
+    /// Apply the parameters immediately (the pre-stream path of
+    /// [`Self::set_ratio`], also used by the §4 commit).
+    fn apply_ratio(&mut self, semis: f64, tempo: f64) {
         self.stretch = tempo / 100.0;
         let pr = 2.0f64.powf(semis / 12.0);
         let s = 12.0f32 * (pr as f32).log2();
@@ -843,6 +879,67 @@ impl VocoderState {
         // Keep the formant operator in step: its ratio is the pitch ratio offset by
         // the formant shift, and it must follow the pitch as well.
         self.sync_formant_ratio();
+    }
+
+    /// The §4 streaming commit, run at the top of every [`Self::feed`] (the
+    /// DLL does it at the head of its processing loop):
+    ///
+    /// ```text
+    /// if (in_base == 0 || fed_total - in_base >= 32):
+    ///     stretch slot: out_base += (cur_in - in_base) * stretch_old
+    ///     pitch  slot: out_base += (cur_in - in_base) * stretch  // Δin == 0 here
+    /// ```
+    ///
+    /// In table coordinates the remap is one additive anchor on the last
+    /// processed group: after a commit,
+    /// `pos(g) = pos_last + (grp(g) - grp_prev) * out_step_new`, i.e.
+    /// `sched_pos_offset = pos_last - grp_prev * out_step_new`
+    /// (`pos(g) = grp(g)*out_step + offset`; `grp_prev` is the group of the
+    /// last processed granule). Both slots remapped in one anchor because the
+    /// pitch slot's Δin is zero once the stretch slot has reset `in_base`.
+    /// `acc_1440` re-anchors to the same lattice so the fallback cursor path
+    /// stays consistent.
+    fn commit_pending(&mut self) {
+        if self.pending_semis.is_none() && self.pending_tempo.is_none() {
+            return;
+        }
+        // §4 gate: commit when the input base is still 0 or ≥ 32 frames have
+        // arrived since the last commit.
+        if !(self.commit_in_base == 0 || self.fed_total - self.commit_in_base >= 32) {
+            return;
+        }
+        let semis = self.pending_semis.unwrap_or_else(|| {
+            12.0 * self.ratio.log2()
+        });
+        let tempo = self.pending_tempo.unwrap_or(self.stretch * 100.0);
+        // Size the new table step with the pending params (mirror of
+        // apply_ratio's derivation) so the anchor uses the post-commit pace.
+        let pr = 2.0f64.powf(semis / 12.0);
+        let s = 12.0f32 * (pr as f32).log2();
+        let new_ratio = 2.0f64.powf(s as f64 / 12.0);
+        let new_slope = new_ratio * (tempo / 100.0);
+        let g_next = self.g_index.max(5);
+        let os_new = vc_calc_sched(g_next, new_ratio, new_slope, self.cfg.step_base).3;
+        if os_new > 0 {
+            // `pos_1384` is constant within each group of 4 sub-granules and
+            // advances one `out_step` per group, so the anchor is the last
+            // processed group: pos(g) = pos_last + (grp(g) - grp_prev)*os_new.
+            let grp_prev = (g_next - 2).max(0) / 4;
+            self.sched_pos_offset = self.pos_1384 - grp_prev * os_new;
+        }
+        // Apply (stretch slot first, then pitch — one call for both, matching
+        // the remap algebra above), then D46: a slope change resets a transient
+        // machine in state 1/2 to 0 (§13.2). The machine's inpos re-mapping is
+        // absorbed by the cursor-driven plan machinery: the next plan anchors
+        // at the current `cursor_1376`.
+        self.apply_ratio(semis, tempo);
+        self.acc_1440 = self.pos_1384 as f64;
+        if self.tsched.state == 1 || self.tsched.state == 2 {
+            self.tsched.state = 0;
+        }
+        self.commit_in_base = self.fed_total;
+        self.pending_semis = None;
+        self.pending_tempo = None;
     }
 
     /// Enable or disable the transient-preservation subsystem
@@ -940,6 +1037,12 @@ impl VocoderState {
         self.ts_out_step = 0;
         self.ts_events = 0;
         self.ts_state2_granules = 0;
+        // §4 commit chain: a fresh stream starts with no pending parameters
+        // and an un-anchored schedule.
+        self.pending_semis = None;
+        self.pending_tempo = None;
+        self.commit_in_base = 0;
+        self.sched_pos_offset = 0;
     }
 
     // -----------------------------------------------------------------
@@ -1684,7 +1787,10 @@ impl VocoderState {
         }
         let se_curr = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base);
         let se_next = vc_calc_sched(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
-        self.pos_1384 = se_curr.0;
+        // §4 commit anchor: keeps the granule lattice continuous across
+        // mid-stream parameter commits (zero until one happens — see
+        // `commit_pending`).
+        self.pos_1384 = se_curr.0 + self.sched_pos_offset;
         self.writepos_1224 = self.pos_1384 + self.hop_1420 as i64;
         self.sched_cdel = se_curr.1;
         if se_curr.1 > 0 {
@@ -1754,7 +1860,14 @@ impl VocoderState {
                     let frac = (span / p.in_hop.max(1) as f64).clamp(0.0, 1.0);
                     let desired_cum = self.ts_win_out0
                         + (p.in_hop as f64 * rate_j).round() * frac;
-                    let advance = (desired_cum - self.ts_cum_out).round() as i64;
+                    // DLL emission never retreats (`sub_18014DF50` targets are
+                    // monotone node positions) — clamp the per-sub-granule
+                    // advance at zero so a mid-stream commit's table jump
+                    // can't make the chase pull output backwards (the commit
+                    // re-anchor case; offline single-parameter renders always
+                    // have positive ~table-step advances).
+                    let advance =
+                        (desired_cum - self.ts_cum_out).round().clamp(0.0, f64::MAX) as i64;
                     self.ts_cum_out += advance as f64;
                     let delta = advance - self.out_step_1404 as i64;
                     if delta != 0 {
@@ -1869,6 +1982,9 @@ impl VocoderState {
     /// now deliberately differs from the reference, and the parity tests above are
     /// measured on material where the two agree.
     pub fn feed(&mut self, x: &[f32], nin: usize) -> i64 {
+        // §4 commit gate: parameter changes staged by a mid-stream
+        // `set_ratio` are applied here, at the head of the processing loop.
+        self.commit_pending();
         let nch = self.cfg.nch;
         let nbands = self.cfg.nbands;
         if self.xovers.is_empty() {
@@ -2191,5 +2307,121 @@ impl VocoderState {
     /// Number of granules made (diagnostics).
     pub fn granules_made(&self) -> i64 {
         self.out_total
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    /// Deterministic mono test signal (two-tone + AM).
+    fn signal(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                (0.5 * (2.0 * std::f64::consts::PI * 220.0 * t).sin()
+                    + 0.3 * (2.0 * std::f64::consts::PI * 554.0 * t).sin()
+                    + 0.1 * (2.0 * std::f64::consts::PI * 13.0 * t).cos())
+                    as f32
+            })
+            .collect()
+    }
+
+    /// (a) A `set_ratio` before the first feed applies immediately: one call
+    /// and a replaced pre-stream call give bit-identical renders, and no
+    /// commit/anchor ever fires (offset stays 0) — the pre-change behaviour.
+    #[test]
+    fn pre_stream_set_ratio_is_immediate_and_bit_identical() {
+        let x = signal(16_384);
+        let mut a = VocoderState::new(48_000, 1);
+        a.set_ratio(3.0, 150.0);
+        let ra = a.render(&x);
+        let mut b = VocoderState::new(48_000, 1);
+        b.set_ratio(0.0, 100.0);
+        b.set_ratio(3.0, 150.0);
+        let rb = b.render(&x);
+        assert_eq!(ra.len(), rb.len());
+        assert!(ra.iter().zip(&rb).all(|(u, v)| u.to_bits() == v.to_bits()));
+        assert_eq!(b.sched_pos_offset, 0);
+        assert!(b.pending_semis.is_none() && b.pending_tempo.is_none());
+    }
+
+    /// (b) A mid-stream `set_ratio` commits at a feed boundary with a
+    /// continuous granule lattice: within the current group the position is
+    /// unchanged, the next group steps by the NEW `out_step`, and nothing
+    /// jumps backwards.
+    #[test]
+    fn mid_stream_commit_keeps_schedule_continuous() {
+        // The transient subsystem is disabled here to observe the pure
+        // schedule table + commit anchor (the dual-queue chase redistributes
+        // output within plan windows on top of this lattice).
+        let mut st = VocoderState::new(48_000, 1);
+        st.set_transient_sched(false);
+        st.set_ratio(0.0, 100.0);
+        st.start_streaming();
+        let sil = vec![0.0f32; 30_000];
+        st.feed(&sil, 30_000);
+        assert!(st.g_index >= 8, "warm-up done");
+
+        // Step granules one at a time to watch the position sequence.
+        let mut seq = Vec::new();
+        for _ in 0..6 {
+            st.process_granule();
+            seq.push(st.pos_1384);
+        }
+        // Mid-group commit (g_index % 4 != 1): the position must hold.
+        st.set_ratio(3.0, 200.0);
+        st.commit_pending();
+        let os_new =
+            vc_calc_sched(st.g_index.max(5), st.ratio, st.slope, st.cfg.step_base).3;
+        assert!(os_new > 0);
+        let mut post = Vec::new();
+        for _ in 0..6 {
+            st.process_granule();
+            post.push(st.pos_1384);
+        }
+        // Commit applied...
+        assert!((st.slope - (st.ratio * 2.0)).abs() < 1e-12);
+        assert_eq!(st.pending_semis, None);
+        // ...first post-commit granule stays anchored (same group, no jump)…
+        assert_eq!(post[0], *seq.last().unwrap());
+        // …the sequence never decreases…
+        assert!(post.windows(2).all(|w| w[1] >= w[0]), "post={post:?}");
+        // …and group-boundary steps are exactly the new table step.
+        let steps: Vec<i64> = post.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().all(|&d| d == 0 || d == os_new), "steps={steps:?}");
+    }
+
+    /// (c) The 32-frame gate: the first commit (input base 0) passes, a
+    /// second one waits until ≥ 32 frames have arrived since the last commit.
+    #[test]
+    fn commit_gates_on_32_frames() {
+        let mut st = VocoderState::new(48_000, 1);
+        st.set_ratio(0.0, 100.0);
+        st.start_streaming();
+        let sil = vec![0.0f32; 30_000];
+        st.feed(&sil, 30_000);
+        let slope0 = st.slope;
+
+        // First mid-stream change: in_base == 0 → commits immediately.
+        st.set_ratio(3.0, 200.0);
+        let small = vec![0.0f32; 8];
+        st.feed(&small, 8);
+        assert!((st.slope - slope0).abs() > 1e-9, "first commit fired");
+
+        // Second change: fewer than 32 frames since the commit → deferred.
+        st.set_ratio(-3.0, 50.0);
+        let slope1 = st.slope;
+        st.feed(&small, 8); // 8 more (< 32)
+        assert!((st.slope - slope1).abs() < 1e-12, "gate holds under 32");
+        assert!(st.pending_semis.is_some());
+        st.feed(&small, 4); // 12 total (< 32)
+        assert!((st.slope - slope1).abs() < 1e-12, "gate still holds at 12");
+        let more = vec![0.0f32; 24];
+        st.feed(&more, 24); // 36 ≥ 32 at the NEXT feed top → commits
+        assert!((st.slope - slope1).abs() < 1e-12, "still old at 36 (gate sees pre-feed 12)");
+        st.feed(&more, 24); // top sees 36 ≥ 32 → commits
+        assert!((st.slope - slope1).abs() > 1e-12, "commit at ≥32");
+        assert_eq!(st.pending_semis, None);
     }
 }
