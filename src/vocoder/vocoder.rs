@@ -61,10 +61,14 @@ fn profile_enabled() -> bool {
 
 /// Opt-in approximation path for the expensive phase-to-cartesian conversion.
 /// The default remains the reference-compatible f64 `sin_cos`; setting
-/// `RADIUS_VC_FAST_MATH=1` uses the platform f32 implementation instead.
+/// `RADIUS_VC_FAST_MATH=1` — or selecting the `fast` FFT backend, which
+/// internalizes this behavior — uses the platform f32 implementation instead.
 fn fast_math_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RADIUS_VC_FAST_MATH").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("RADIUS_VC_FAST_MATH").is_some()
+            || crate::fft::backend() == crate::fft::Backend::Fast
+    })
 }
 
 /// Number of threads the vocoder may use for per-channel work.
@@ -419,9 +423,15 @@ impl AssemblyWorker {
     fn spawn() -> Self {
         let (tx, job_rx) = std::sync::mpsc::channel::<AssemblyJob>();
         let (reply_tx, rx) = std::sync::mpsc::channel::<(Vec<f32>, Vec<f32>, Vec<f32>)>();
+        // The worker selects its FFT backend on first use; a backend chosen
+        // via `set_backend` (the CLI `--fft` flag) lives on the spawning
+        // thread only, so propagate it explicitly. `RADIUS_FFT` reaches the
+        // worker through the environment either way.
+        let worker_backend = crate::fft::backend();
         let handle = std::thread::Builder::new()
             .name("vc-assembly".into())
             .spawn(move || {
+                crate::fft::set_backend(worker_backend);
                 // Warm per-worker scratch; sized on the first job and kept.
                 let mut cart = Vec::new();
                 let mut frame = Vec::new();
@@ -1329,7 +1339,11 @@ impl VocoderState {
         let floor = f32::from_bits(MAG_FLOOR_BITS);
         {
             let c = &mut self.ch[ch];
-            cart_to_polar_into(&self.cart, &mut c.mag, &mut c.mask);
+            if fast_math_enabled() {
+                cart_to_polar_into_f32(&self.cart, &mut c.mag, &mut c.mask);
+            } else {
+                cart_to_polar_into(&self.cart, &mut c.mag, &mut c.mask);
+            }
             for k in 0..nb {
                 c.mag[k] = c.mag[k].max(floor);
             }

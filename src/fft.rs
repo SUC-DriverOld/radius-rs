@@ -1,13 +1,14 @@
-//! FFT selection: one bit-exact kernel (default) and one fast kernel (opt-in).
+//! FFT selection: one bit-exact kernel (default) and two fast kernels (opt-in).
 //!
 //! The engines call [`with_plan`] / [`fwd`] / [`inv`] and read a plain `&mut Fft`;
 //! which implementation `Fft` wraps is decided at *run time* per thread, so a
-//! single build carries both.
+//! single build carries all three.
 //!
 //! | backend | kernel | character |
 //! |---|---|---|
 //! | [`Backend::Radix2`] (default) | [`crate::fft_radix2`] | radix-2 DIT with the reference's twiddle table and per-operation `f32` rounding — **bit-exact** with the engine this crate reproduces |
-//! | [`Backend::Rustfft`] (`--fft rustfft`) | the `rustfft` crate | mixed-radix, faster but not bit-exact |
+//! | [`Backend::Rustfft`] (`--fft rustfft`) | the `rustfft` crate + `realfft` for the vocoder's real-signal transforms | mixed-radix, faster, not bit-exact |
+//! | [`Backend::Fast`] (`--fft fast`) | the `rustfft` path plus f32 transcendentals in the vocoder (phase→cartesian `sin_cos`, cartesian→polar magnitude) | fastest, least exact |
 //!
 //! Why the default is not simply `rustfft`, measured on `tests/test.wav`
 //! (+3 semitones, 29.03 s, 48 kHz stereo):
@@ -28,8 +29,8 @@
 //! Selecting a backend:
 //!
 //! * per thread, from code: [`set_backend`] / [`backend`];
-//! * process-wide, from the environment: `RADIUS_FFT=rustfft` (or `=radix2`,
-//!   the default) — read once per thread on first use.
+//! * process-wide, from the environment: `RADIUS_FFT=rustfft` (or `=fast`,
+//!   `=radix2`, the default) — read once per thread on first use.
 
 use std::cell::Cell;
 
@@ -37,22 +38,28 @@ use crate::fft_radix2;
 
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft as RustFft, FftPlanner};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 /// Which FFT implementation to use.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
     /// The crate's own radix-2 kernel — bit-exact with the reference engine.
     Radix2,
-    /// The `rustfft` crate — faster, but not bit-exact.
+    /// The `rustfft` crate (real transforms via `realfft`) — faster, but not
+    /// bit-exact.
     Rustfft,
+    /// The `rustfft` path plus f32 transcendentals in the vocoder — the
+    /// fastest, breaking bit-exactness further.
+    Fast,
 }
 
 impl Backend {
-    /// Parse a backend name (`radix2`, `rustfft`, case-insensitive).
+    /// Parse a backend name (`radix2`, `rustfft`, `fast`, case-insensitive).
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "radix2" | "radix-2" | "exact" | "default" => Some(Backend::Radix2),
-            "rustfft" | "fast" => Some(Backend::Rustfft),
+            "rustfft" => Some(Backend::Rustfft),
+            "fast" => Some(Backend::Fast),
             _ => None,
         }
     }
@@ -62,14 +69,14 @@ impl Backend {
         match self {
             Backend::Radix2 => "radix2",
             Backend::Rustfft => "rustfft",
+            Backend::Fast => "fast",
         }
     }
 
     /// Is this backend compiled in?
     pub fn is_available(self) -> bool {
         match self {
-            Backend::Radix2 => true,
-            Backend::Rustfft => true,
+            Backend::Radix2 | Backend::Rustfft | Backend::Fast => true,
         }
     }
 }
@@ -125,16 +132,47 @@ enum Inner {
         forward: std::sync::Arc<dyn RustFft<f32>>,
         inverse: std::sync::Arc<dyn RustFft<f32>>,
         scratch: Vec<Complex32>,
+        // Persistent complex staging for `cfft` — the per-call `Vec` build of
+        // this buffer was a measurable cost in the TD front-end under the
+        // rustfft backend (same arithmetic, zero allocation).
+        cbuf: Vec<Complex32>,
+        // Real-signal fast path (r2c/c2r via `realfft`). The c2r inverse is
+        // safe for both fast backends (its output is linear downstream — no
+        // discrete decision branches on it), but the r2c analysis forward is
+        // gated to `fast` only: the quality gate measured the analysis-side
+        // ULP profile of `realfft` flipping enough peak-search/unwrap
+        // decisions to drop the vocoder corr from 0.9944 to 0.7944 against
+        // the radix-2 reference.
+        r2c: std::sync::Arc<dyn RealToComplex<f32>>,
+        c2r: std::sync::Arc<dyn ComplexToReal<f32>>,
+        // Spectrum staging for both real directions (n/2+1 complex values).
+        rspec: Vec<Complex32>,
+        // Backend::Fast? Then the analysis forwards also take the r2c path.
+        full_real: bool,
     },
+}
+
+impl Inner {
+    #[inline]
+    fn is_real_accelerated(&self) -> bool {
+        matches!(self, Inner::Rustfft { .. })
+    }
+
+    /// May the *analysis forward* transforms use r2c (Fast only)?
+    #[inline]
+    fn fwd_real_ok(&self) -> bool {
+        matches!(self, Inner::Rustfft { full_real: true, .. })
+    }
 }
 
 impl Fft {
     /// Build a plan for size `n` using the thread's selected backend.
     pub fn new(n: usize) -> Self {
         assert!(n.is_power_of_two(), "FFT size must be a power of two: {n}");
-        let inner = match backend() {
+        let b = backend();
+        let inner = match b {
             Backend::Radix2 => Inner::Radix2(fft_radix2::Fft::new(n)),
-            Backend::Rustfft => {
+            Backend::Rustfft | Backend::Fast => {
                 let mut planner = FftPlanner::<f32>::new();
                 let forward = planner.plan_fft_forward(n);
                 let inverse = planner.plan_fft_inverse(n);
@@ -144,10 +182,18 @@ impl Fft {
                         .get_inplace_scratch_len()
                         .max(inverse.get_inplace_scratch_len())
                 ];
+                let mut rplanner = RealFftPlanner::<f32>::new();
+                let r2c = rplanner.plan_fft_forward(n);
+                let c2r = rplanner.plan_fft_inverse(n);
                 Inner::Rustfft {
                     forward,
                     inverse,
                     scratch,
+                    cbuf: vec![Complex32::new(0.0, 0.0); n],
+                    r2c,
+                    c2r,
+                    rspec: vec![Complex32::new(0.0, 0.0); n / 2 + 1],
+                    full_real: b == Backend::Fast,
                 }
             }
         };
@@ -189,10 +235,21 @@ impl Fft {
 
     /// Forward real transform writing into caller-owned cartesian storage.
     /// The transform work arrays are retained by the plan and reused.
+    ///
+    /// Under the `fast` backend this uses `realfft`'s r2c transform (half the
+    /// butterflies of the complex transform); under radix-2 and plain
+    /// `rustfft` the bit-exact / decision-stable complex path runs unchanged
+    /// (see the quality-gate note on [`Inner`]).
     pub fn fwd_into(&mut self, src: &[f32], dst: &mut [f32]) {
         let n = self.n;
         assert_eq!(src.len(), n);
         assert_eq!(dst.len(), n + 2);
+        if self.inner.fwd_real_ok() {
+            let mut re = std::mem::take(&mut self.work_re);
+            re.copy_from_slice(src);
+            self.r2c_from_re(re, dst);
+            return;
+        }
         let mut re = std::mem::take(&mut self.work_re);
         let mut im = std::mem::take(&mut self.work_im);
         re.copy_from_slice(src);
@@ -211,6 +268,10 @@ impl Fft {
         let n = self.n;
         assert_eq!(src.len(), n);
         assert_eq!(dst.len(), n + 2);
+        if self.inner.fwd_real_ok() {
+            self.r2c_from_re_take(src, dst);
+            return;
+        }
         let mut im = std::mem::take(&mut self.work_im);
         im.fill(0.0);
         self.cfft(src, &mut im, false);
@@ -226,10 +287,40 @@ impl Fft {
     }
 
     /// Inverse cartesian transform writing into caller-owned real storage.
+    ///
+    /// Under the rustfft/fast backends this uses `realfft`'s c2r transform
+    /// (decision-safe: the synthesis output is linear downstream) with the
+    /// 1/N normalization this method's contract carries; under radix-2 the
+    /// bit-exact hermitian complex path runs unchanged.
     pub fn inv_into(&mut self, cart: &[f32], dst: &mut [f32]) {
         let n = self.n;
         assert_eq!(cart.len(), n + 2);
         assert_eq!(dst.len(), n);
+        if self.inner.is_real_accelerated() {
+            let Inner::Rustfft {
+                c2r, rspec, ..
+            } = &mut self.inner
+            else {
+                unreachable!("is_real_accelerated implies Rustfft inner")
+            };
+            let m = n >> 1;
+            rspec[0] = Complex32::new(cart[0], 0.0);
+            for k in 1..m {
+                rspec[k] = Complex32::new(cart[2 * k], cart[2 * k + 1]);
+            }
+            rspec[m] = Complex32::new(cart[n], 0.0);
+            // The simple `process` uses the input as workspace and errors on
+            // length mismatch; both are satisfied by construction. `realfft`
+            // follows rustfft's unnormalized convention, so the 1/N that the
+            // radix-2 inverse applies after its transform is applied here.
+            c2r.process(rspec, dst)
+                .expect("realfft c2r: buffers sized by construction");
+            let s = 1.0f32 / (n as f32);
+            for v in dst.iter_mut() {
+                *v *= s;
+            }
+            return;
+        }
         let m = n >> 1;
         let mut re = std::mem::take(&mut self.work_re);
         let mut im = std::mem::take(&mut self.work_im);
@@ -250,6 +341,49 @@ impl Fft {
         dst.copy_from_slice(&re);
         self.work_re = re;
         self.work_im = im;
+    }
+
+    /// r2c helper for `fwd_into`: `re` is a persistent plan buffer holding the
+    /// real signal; the spectrum staging is packed into `dst` afterwards.
+    fn r2c_from_re(&mut self, mut re: Vec<f32>, dst: &mut [f32]) {
+        let n = self.n;
+        let Inner::Rustfft { r2c, rspec, .. } = &mut self.inner
+        else {
+            unreachable!("is_real_accelerated implies Rustfft inner")
+        };
+        r2c.process(&mut re, rspec)
+            .expect("realfft r2c: buffers sized by construction");
+        let m = n >> 1;
+        dst[0] = rspec[0].re;
+        dst[1] = 0.0;
+        for k in 1..m {
+            dst[2 * k] = rspec[k].re;
+            dst[2 * k + 1] = rspec[k].im;
+        }
+        dst[n] = rspec[m].re;
+        dst[n + 1] = 0.0;
+        self.work_re = re;
+    }
+
+    /// r2c helper for `fwd_in_place`: the caller's real buffer is consumed as
+    /// the transform workspace (the `realfft` r2c overwrites its input).
+    fn r2c_from_re_take(&mut self, src: &mut [f32], dst: &mut [f32]) {
+        let n = self.n;
+        let Inner::Rustfft { r2c, rspec, .. } = &mut self.inner
+        else {
+            unreachable!("is_real_accelerated implies Rustfft inner")
+        };
+        r2c.process(src, rspec)
+            .expect("realfft r2c: buffers sized by construction");
+        let m = n >> 1;
+        dst[0] = rspec[0].re;
+        dst[1] = 0.0;
+        for k in 1..m {
+            dst[2 * k] = rspec[k].re;
+            dst[2 * k + 1] = rspec[k].im;
+        }
+        dst[n] = rspec[m].re;
+        dst[n + 1] = 0.0;
     }
 
     /// In-place complex transform. Unscaled going forward; the inverse is scaled
@@ -273,19 +407,26 @@ impl Fft {
                 forward,
                 inverse: inv,
                 scratch,
+                cbuf,
+                ..
             } => {
                 let n = self.n;
-                let mut buf: Vec<Complex32> =
-                    (0..n).map(|i| Complex32::new(re[i], im[i])).collect();
+                // Persistent staging: same values, same order, no per-call
+                // heap allocation (the TD front-end hits this per pitch call).
+                let buf = cbuf;
+                for i in 0..n {
+                    buf[i].re = re[i];
+                    buf[i].im = im[i];
+                }
                 if inverse {
-                    inv.process_with_scratch(&mut buf, scratch);
+                    inv.process_with_scratch(buf, scratch);
                     let s = 1.0f32 / (n as f32);
                     for v in buf.iter_mut() {
                         v.re *= s;
                         v.im *= s;
                     }
                 } else {
-                    forward.process_with_scratch(&mut buf, scratch);
+                    forward.process_with_scratch(buf, scratch);
                 }
                 for i in 0..n {
                     re[i] = buf[i].re;
@@ -395,13 +536,59 @@ mod tests {
         for n in [128usize, 256, 1024, 2048, 4096, 8192] {
             round_trip(n);
         }
-        {
-            set_backend(Backend::Rustfft);
+        for b in [Backend::Rustfft, Backend::Fast] {
+            set_backend(b);
             for n in [128usize, 256, 1024, 2048, 4096, 8192, 16384] {
                 round_trip(n);
+                round_trip_into(n);
+                round_trip_in_place(n);
             }
             set_backend(Backend::Radix2);
         }
+    }
+
+    /// Round-trip through the caller-owned-buffer entries — this is the path
+    /// the vocoder uses, and under the fast backends it goes through
+    /// `realfft` (r2c + c2r with its own 1/N normalization).
+    fn round_trip_into(n: usize) {
+        let mut x = vec![0.0f32; n];
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f64 / n as f64;
+            *v = ((t * 5.0).sin() * 0.6 + (t * 19.0).cos() * 0.4) as f32;
+        }
+        let mut cart = vec![0.0f32; n + 2];
+        let mut y = vec![0.0f32; n];
+        with_plan(n, |p| {
+            p.fwd_into(&x, &mut cart);
+            p.inv_into(&cart, &mut y);
+        });
+        let max_diff = x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "n={n} into roundtrip max_diff={max_diff}");
+    }
+
+    fn round_trip_in_place(n: usize) {
+        let mut x = vec![0.0f32; n];
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f64 / n as f64;
+            *v = ((t * 7.0).sin() * 0.5 + (t * 29.0).cos() * 0.5) as f32;
+        }
+        let want = x.clone();
+        let mut cart = vec![0.0f32; n + 2];
+        let mut y = vec![0.0f32; n];
+        with_plan(n, |p| {
+            p.fwd_in_place(&mut x, &mut cart);
+            p.inv_into(&cart, &mut y);
+        });
+        let max_diff = want
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-4, "n={n} in-place roundtrip max_diff={max_diff}");
     }
 
     /// The cached wrapper must agree with a freshly built radix-2 plan.
@@ -451,10 +638,13 @@ mod tests {
     fn backend_names_parse() {
         assert_eq!(Backend::parse("radix2"), Some(Backend::Radix2));
         assert_eq!(Backend::parse(" RustFFT "), Some(Backend::Rustfft));
+        assert_eq!(Backend::parse("FAST"), Some(Backend::Fast));
         assert_eq!(Backend::parse("nope"), None);
         // selecting an unavailable backend must fall back cleanly
-        set_backend(Backend::Rustfft);
-        assert!(backend().is_available());
+        for b in [Backend::Rustfft, Backend::Fast] {
+            set_backend(b);
+            assert!(backend().is_available());
+        }
         set_backend(Backend::Radix2);
         assert_eq!(backend(), Backend::Radix2);
     }

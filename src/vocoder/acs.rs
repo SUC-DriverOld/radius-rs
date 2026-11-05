@@ -236,6 +236,42 @@ pub fn cart_to_polar_into(cart: &[f32], mag: &mut [f32], phase: &mut [f32]) {
     }
 }
 
+/// The `fast`-backend variant of [`cart_to_polar_into`]: the angle polynomial
+/// is identical; the magnitude drops the f64 sqrt promotion for a pure f32
+/// `sqrt` (the reference path keeps f64 — that is the bit-exact contract).
+pub fn cart_to_polar_into_f32(cart: &[f32], mag: &mut [f32], phase: &mut [f32]) {
+    let n = cart.len() / 2;
+    assert!(mag.len() >= n && phase.len() >= n);
+    for k in 0..n {
+        let re = cart[2 * k];
+        let im = cart[2 * k + 1];
+        let are = re.abs();
+        let aim = im.abs();
+        let mut mx = if are > aim { are } else { aim };
+        if mx == 0.0 {
+            mx = 1.0;
+        }
+        let mn = if aim > are { are } else { aim };
+        let r = mn / mx;
+        let r2 = r * r;
+        let mut p = fma(CTP_COEF[0], r2, CTP_COEF[1]);
+        for c in &CTP_COEF[2..] {
+            p = fma(p, r2, *c);
+        }
+        p = fma(p, r2, 1.0);
+        let re2 = re * re;
+        mag[k] = fma(im, im, re2).sqrt();
+        let mut ang = r * p;
+        if aim > are {
+            ang = PI_2_F - ang;
+        }
+        if re < 0.0 {
+            ang = PI_F - ang;
+        }
+        phase[k] = if im.is_sign_negative() { -ang } else { ang };
+    }
+}
+
 /// `threshold_lt_inplace` (`vocoder_ops.py:1746`) — `Threshold_LT_InPlace`
 /// (`vDSP_vthr`): a lower clamp, **not** a zeroing.
 #[inline]
