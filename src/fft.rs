@@ -1,14 +1,13 @@
-//! FFT selection: one bit-exact kernel (default) and two fast kernels (opt-in).
+//! FFT selection: one bit-exact kernel (default) and one fast kernel (opt-in).
 //!
 //! The engines call [`with_plan`] / [`fwd`] / [`inv`] and read a plain `&mut Fft`;
 //! which implementation `Fft` wraps is decided at *run time* per thread, so a
-//! single build carries all three.
+//! single build carries both.
 //!
 //! | backend | kernel | character |
 //! |---|---|---|
 //! | [`Backend::Radix2`] (default) | [`crate::fft_radix2`] | radix-2 DIT with the reference's twiddle table and per-operation `f32` rounding — **bit-exact** with the engine this crate reproduces |
-//! | [`Backend::Rustfft`] (`--fft rustfft`) | the `rustfft` crate + `realfft` for the vocoder's real-signal transforms | mixed-radix, faster, not bit-exact |
-//! | [`Backend::Fast`] (`--fft fast`) | the `rustfft` path plus f32 transcendentals in the vocoder (phase→cartesian `sin_cos`, cartesian→polar magnitude) | fastest, least exact |
+//! | [`Backend::Rustfft`] (`--fft rustfft`) | the `rustfft` crate + `realfft` for the vocoder's real-signal inverse | mixed-radix, faster, not bit-exact |
 //!
 //! Why the default is not simply `rustfft`, measured on `tests/test.wav`
 //! (+3 semitones, 29.03 s, 48 kHz stereo):
@@ -22,14 +21,14 @@
 //! whitened autocorrelation peak, and on this corpus every decision lands the
 //! same way. The vocoder cannot: its peak search, phase unwrapping and pitch
 //! coherence all branch on magnitudes, so the last-bit differences flip discrete
-//! decisions and the output decorrelates to 0.994 — far outside the reference's
-//! own acceptance floor of `corr > 0.9999`. That is why the fast kernel is
-//! opt-in and never the default.
+//! decisions and the output decorrelates — the 0.9944 row above predates the
+//! transient scheduler going default; on today's chain the fast kernel's corr
+//! sits near 0.84. That is why it is opt-in and never the default.
 //!
 //! Selecting a backend:
 //!
 //! * per thread, from code: [`set_backend`] / [`backend`];
-//! * process-wide, from the environment: `RADIUS_FFT=rustfft` (or `=fast`,
+//! * process-wide, from the environment: `RADIUS_FFT=rustfft` (or
 //!   `=radix2`, the default) — read once per thread on first use.
 
 use std::cell::Cell;
@@ -48,18 +47,14 @@ pub enum Backend {
     /// The `rustfft` crate (real transforms via `realfft`) — faster, but not
     /// bit-exact.
     Rustfft,
-    /// The `rustfft` path plus f32 transcendentals in the vocoder — the
-    /// fastest, breaking bit-exactness further.
-    Fast,
 }
 
 impl Backend {
-    /// Parse a backend name (`radix2`, `rustfft`, `fast`, case-insensitive).
+    /// Parse a backend name (`radix2`, `rustfft`, case-insensitive).
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "radix2" | "radix-2" | "exact" | "default" => Some(Backend::Radix2),
             "rustfft" => Some(Backend::Rustfft),
-            "fast" => Some(Backend::Fast),
             _ => None,
         }
     }
@@ -69,14 +64,13 @@ impl Backend {
         match self {
             Backend::Radix2 => "radix2",
             Backend::Rustfft => "rustfft",
-            Backend::Fast => "fast",
         }
     }
 
     /// Is this backend compiled in?
     pub fn is_available(self) -> bool {
         match self {
-            Backend::Radix2 | Backend::Rustfft | Backend::Fast => true,
+            Backend::Radix2 | Backend::Rustfft => true,
         }
     }
 }
@@ -172,7 +166,7 @@ impl Fft {
         let b = backend();
         let inner = match b {
             Backend::Radix2 => Inner::Radix2(fft_radix2::Fft::new(n)),
-            Backend::Rustfft | Backend::Fast => {
+            Backend::Rustfft => {
                 let mut planner = FftPlanner::<f32>::new();
                 let forward = planner.plan_fft_forward(n);
                 let inverse = planner.plan_fft_inverse(n);
@@ -193,7 +187,12 @@ impl Fft {
                     r2c,
                     c2r,
                     rspec: vec![Complex32::new(0.0, 0.0); n / 2 + 1],
-                    full_real: b == Backend::Fast,
+                    // The r2c analysis forward stays off: the quality gate
+                    // measured the analysis-side ULP profile of `realfft`
+                    // flipping enough peak-search/unwrap decisions to drop
+                    // the vocoder corr from 0.9944-era numbers to 0.79. The
+                    // c2r inverse is safe (linear downstream).
+                    full_real: false,
                 }
             }
         };
@@ -536,7 +535,7 @@ mod tests {
         for n in [128usize, 256, 1024, 2048, 4096, 8192] {
             round_trip(n);
         }
-        for b in [Backend::Rustfft, Backend::Fast] {
+        for b in [Backend::Rustfft] {
             set_backend(b);
             for n in [128usize, 256, 1024, 2048, 4096, 8192, 16384] {
                 round_trip(n);
@@ -638,10 +637,9 @@ mod tests {
     fn backend_names_parse() {
         assert_eq!(Backend::parse("radix2"), Some(Backend::Radix2));
         assert_eq!(Backend::parse(" RustFFT "), Some(Backend::Rustfft));
-        assert_eq!(Backend::parse("FAST"), Some(Backend::Fast));
         assert_eq!(Backend::parse("nope"), None);
         // selecting an unavailable backend must fall back cleanly
-        for b in [Backend::Rustfft, Backend::Fast] {
+        for b in [Backend::Rustfft] {
             set_backend(b);
             assert!(backend().is_available());
         }

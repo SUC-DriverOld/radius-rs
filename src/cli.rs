@@ -15,12 +15,9 @@ use clap::{Parser, ValueEnum};
 pub enum FftBackend {
     /// Reference-compatible radix-2 FFT (default).
     Radix2,
-    /// Faster mixed-radix FFT (real transforms via realfft); vocoder output
+    /// Faster mixed-radix FFT (real inverse via realfft); vocoder output
     /// is not bit-exact.
     Rustfft,
-    /// The rustfft path plus f32 transcendentals in the vocoder — fastest,
-    /// least exact.
-    Fast,
 }
 
 impl FftBackend {
@@ -28,7 +25,6 @@ impl FftBackend {
         match self {
             Self::Radix2 => Backend::Radix2,
             Self::Rustfft => Backend::Rustfft,
-            Self::Fast => Backend::Fast,
         }
     }
 }

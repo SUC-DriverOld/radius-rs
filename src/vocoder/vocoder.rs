@@ -61,14 +61,10 @@ fn profile_enabled() -> bool {
 
 /// Opt-in approximation path for the expensive phase-to-cartesian conversion.
 /// The default remains the reference-compatible f64 `sin_cos`; setting
-/// `RADIUS_VC_FAST_MATH=1` — or selecting the `fast` FFT backend, which
-/// internalizes this behavior — uses the platform f32 implementation instead.
+/// `RADIUS_VC_FAST_MATH=1` uses the platform f32 implementation instead.
 fn fast_math_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("RADIUS_VC_FAST_MATH").is_some()
-            || crate::fft::backend() == crate::fft::Backend::Fast
-    })
+    *ENABLED.get_or_init(|| std::env::var_os("RADIUS_VC_FAST_MATH").is_some())
 }
 
 /// Number of threads the vocoder may use for per-channel work.
