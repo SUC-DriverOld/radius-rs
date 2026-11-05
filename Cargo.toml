@@ -1,6 +1,6 @@
 [package]
 name = "radius-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Rust rewrite of the Radius time-domain and phase-vocoder pitch-shift engines"
 readme = "README.md"
