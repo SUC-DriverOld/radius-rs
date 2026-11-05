@@ -21,6 +21,15 @@ Radius supports two pitch-shifting engines, selectable at run time:
 
 ## Quick start
 
+Linux release builds use Ubuntu 22.04 and reject strong GLIBC requirements newer
+than 2.35 for both the CLI and shared library. The release workflow also loads the
+CLI in an Ubuntu 22.04 container. Building on a newer system can raise that ABI
+baseline; use `bash scripts/check-linux-abi.sh BINARY 2.35` to verify the result.
+
+Vocoder input history includes the transient detector's lookahead, including at
+low sample rates. Large streaming `feed` calls are processed in bounded blocks;
+callers do not need to split them themselves.
+
 ```bash
 # library, cdylib, staticlib and the radius binary
 cargo build --release

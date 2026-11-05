@@ -21,6 +21,13 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+const FEED_BLOCK_FRAMES: usize = 1024;
+
+fn transient_lookahead(sr: u32) -> i64 {
+    let need = ((sr as f64 * 0.1) as i64).max(8380) + 7 * 128;
+    ((need + 127) / 128) * 128
+}
+
 #[derive(Default, Clone, Copy)]
 struct VcProfile {
     fill: Duration,
@@ -859,7 +866,14 @@ impl VocoderState {
     pub fn with_config(cfg: VocoderConfig) -> Self {
         let cfg = cfg;
         let (nb, n_ch) = (cfg.nb_bins, cfg.nch);
-        let ring_cap = 4 * cfg.n_write;
+        // The transient scheduler waits before reading the analysis window.
+        // At low rates 4*n_write is shorter than that delay, so later input
+        // (including the final silence feed) would overwrite unread samples.
+        // Preserve one analysis window plus the lookahead and a driver block.
+        // Both halves passed to FillGranule must sum to the physical capacity.
+        let ring_cap = (4 * cfg.n_write)
+            .max(transient_lookahead(cfg.sr) as usize + cfg.n_write + FEED_BLOCK_FRAMES)
+            .next_multiple_of(2);
         // All rates run on the generated banks — the DLL computes everything
         // at init from the rate, and so does this engine (rate_gen).
         let win = crate::vocoder::rate_gen::win_table(cfg.n_write);
@@ -2465,6 +2479,23 @@ impl VocoderState {
         // `set_ratio` are applied here, at the head of the processing loop.
         self.commit_pending();
         let nch = self.cfg.nch;
+        if nin == 0 {
+            self.feed_block(x, 0);
+        } else {
+            // Public streaming callers may submit more than one driver block.
+            // Pump between blocks so unread lookahead never gets overwritten.
+            for start in (0..nin).step_by(FEED_BLOCK_FRAMES) {
+                let end = (start + FEED_BLOCK_FRAMES).min(nin);
+                self.feed_block(&x[start * nch..end * nch], end - start);
+            }
+        }
+        let made = self.out_total - self.out_reported;
+        self.out_reported = self.out_total;
+        made
+    }
+
+    fn feed_block(&mut self, x: &[f32], nin: usize) {
+        let nch = self.cfg.nch;
         let nbands = self.cfg.nbands;
         if self.xovers.is_empty() {
             self.xovers = (0..nch)
@@ -2557,17 +2588,13 @@ impl VocoderState {
         // AU corpus) — hold the pump back far enough that both always see
         // finalised scores (2026-11-04 audit D60).
         let margin = if self.cfg.transient_sched {
-            let need = (((self.cfg.sr as f64) * 0.1) as i64).max(8380) + 7 * 128;
-            ((need + 127) / 128) * 128
+            transient_lookahead(self.cfg.sr)
         } else {
             0
         };
         while self.cursor_1376 + (self.hop_1420 as i64) + margin < self.fed_total {
             self.process_granule();
         }
-        let made = self.out_total - self.out_reported;
-        self.out_reported = self.out_total;
-        made
     }
 
     /// `take_output` — drain the settled region of the output ring.
@@ -2655,7 +2682,7 @@ impl VocoderState {
         let mut drain_phase = 0.0f64;
         let mut out_n = 0usize;
         let mut pos = 0usize;
-        const CH: usize = 1024;
+        const CH: usize = FEED_BLOCK_FRAMES;
         let mut chunk = vec![0.0f32; CH * nch];
         // Feed the whole input, then keep feeding silence while the drain still has
         // signal to take — the reference's own loop, which runs until it has
@@ -2670,7 +2697,7 @@ impl VocoderState {
         // now so does this. Termination is the `out_n >= target` check plus the drain's
         // own `head <= drain_phase`, exactly as in the reference.
         while out_n < target {
-            let n = if pos == 0 { 448 } else { 1024 };
+            let n = if pos == 0 { 448 } else { CH };
             for v in chunk[..n * nch].iter_mut() {
                 *v = 0.0;
             }
