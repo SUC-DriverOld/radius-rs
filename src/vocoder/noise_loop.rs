@@ -156,8 +156,9 @@ pub struct NoiseLoopCtx<'a> {
     pub sr: u32,
     /// Machine state (renderer+2448) — the ×10 gate requires `!= 2`.
     pub state: i32,
-    /// Time-base normalizer `v173` (L1503-1513: quality ≥ 10 → preset `v894`,
-    /// undecoded; 1.0 = pass the raw frame arithmetic through).
+    /// Time-base normalizer `v173` (L1503-1513, doc 13.11.3): 200.0 at High
+    /// quality (q>=10 — the offline-geometry path our renders take); q<10
+    /// interpolates the 24-entry breakpoint table (preview only).
     pub time_base: f32,
     /// σ = renderer+3560 for loop D's ramp bounds (undecoded; 1.0).
     pub sigma: f32,

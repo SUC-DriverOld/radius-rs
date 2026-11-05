@@ -2292,7 +2292,11 @@ impl VocoderState {
                             n_fft,
                             sr,
                             state,
-                            time_base: 1.0,
+                            // v173 (L1503-1513, doc 13.11.3): High quality
+                            // (q>=10, our offline-geometry path) is the
+                            // constant 200.0f; only q<10 interpolates the
+                            // breakpoint table.
+                            time_base: 200.0,
                             sigma: 1.0,
                             stretch,
                         };
