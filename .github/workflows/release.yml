@@ -79,7 +79,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: macOS-arm64
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-x64
     runs-on: ${{ matrix.os }}
@@ -100,7 +100,20 @@ jobs:
       # CARGO_PROFILE_RELEASE_DEBUG=true here bloated the staticlib from
       # 40 MB to 180 MB and was removed for exactly that reason).
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check short-audio regression
+        run: cargo test --release --locked --target ${{ matrix.target }} --test short_audio_regression
+
+      - name: Check Linux ABI and loader compatibility
+        if: runner.os == 'Linux'
+        run: |
+          t="target/${{ matrix.target }}/release"
+          bash tests/linux_abi_guard.sh
+          bash scripts/check-linux-abi.sh "$t/radius" 2.35
+          bash scripts/check-linux-abi.sh "$t/libradius_rs.so" 2.35
+          docker run --rm -v "$PWD:/work:ro" ubuntu:22.04 \
+            "/work/$t/radius" --help
 
       # ---- Windows: radius-<ver>-windows-x64.exe + sdk zip ----
       - name: Package (Windows)
