@@ -200,35 +200,49 @@ pub fn new_progress_counter() -> ProgressCounter {
     std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))
 }
 
-/// `vc_calc_sched` (`pyradius/tables.py`): `(pos, cdel, in_step, out_step)`.
+/// Legacy reference schedule (`pyradius/tables.py`): `(pos, cdel, in_step, out_step)`.
 ///
-/// The two rates of the tempo mechanism meet here (see [`VocoderState::slope`]):
-/// the **branch** — whether the analysis step widens by √2 — is selected by the
-/// *pitch* ratio, exactly as in the pitch-only reference (that is the table
-/// lookup pyradius mirrors, and the pitch corpus pins it bit-exactly), while
-/// `out_step` always paces the output ring by the **slope** `pitch × stretch`.
-///
-/// So at pitch +3 / tempo 50 the schedule is (222, 132) — the plain law — and
-/// not the √2 pair pyradius would print for a ratio below 1, because the pitch
-/// is still above 1. Measured against the Audition reference render this is the
-/// better law by a wide margin (envelope correlation 0.843 vs 0.789, spectrum
-/// 0.963 vs 0.956); pacing the ring by the stretch alone instead of the slope
-/// collapses it to 0.32.
+/// This retains the original fixed, rounded `out_step` for reference comparisons
+/// and existing callers. [`VocoderState`] now rounds cumulative output positions
+/// so a fractional output hop cannot cause long-term timing drift.
 pub fn vc_calc_sched(g: i64, pitch_ratio: f64, slope: f64, nominal_step: f64) -> (i64, i64, i64, i64) {
     if g < 5 {
         return (0, 0, 0, 0);
     }
     let grp = (g - 1) / 4;
-    let (in_step, out_step) = if pitch_ratio >= 1.0 {
-        let i = nominal_step.round() as i64;
-        (i, (i as f64 * slope).round() as i64)
-    } else {
-        let i = (nominal_step * std::f64::consts::SQRT_2).round() as i64;
-        (i, (i as f64 * slope).round() as i64)
-    };
+    let in_step = vc_input_step(pitch_ratio, nominal_step);
+    let out_step = (in_step as f64 * slope).round() as i64;
     let pos = grp * out_step;
     let cdel = if g % 4 == 1 { in_step } else { 0 };
     (pos, cdel, in_step, out_step)
+}
+
+fn vc_input_step(pitch_ratio: f64, nominal_step: f64) -> i64 {
+    // Only pitch selects the analysis hop; tempo scales the output hop.
+    if pitch_ratio >= 1.0 {
+        nominal_step.round() as i64
+    } else {
+        (nominal_step * std::f64::consts::SQRT_2).round() as i64
+    }
+}
+
+/// The actual output hop is the difference between consecutive rounded positions.
+fn vc_calc_sched_precise(
+    g: i64,
+    pitch_ratio: f64,
+    slope: f64,
+    nominal_step: f64,
+) -> (i64, i64, i64, i64) {
+    if g < 5 {
+        return (0, 0, 0, 0);
+    }
+    let group = (g - 1) / 4;
+    let in_step = vc_input_step(pitch_ratio, nominal_step);
+    let ideal_hop = in_step as f64 * slope;
+    let pos_at = |group: i64| (group as f64 * ideal_hop).round() as i64;
+    let pos = pos_at(group);
+    let cdel = if g % 4 == 1 { in_step } else { 0 };
+    (pos, cdel, in_step, pos - pos_at(group - 1))
 }
 
 /// Run configuration (the engine's calibrated case plus the rate-dependent
@@ -258,8 +272,8 @@ pub struct VocoderConfig {
     /// **Defaults to `true`**: AU's engine runs this machinery at any tempo ≥
     /// 100, so parity with AU requires it. Renders therefore diverge from
     /// pyradius (which never had it) by design; pyradius/libradius are now a
-    /// code reference only. The bit-exact pyradius regression tests opt out
-    /// explicitly via [`VocoderState::set_transient_sched`]`(false)`.
+    /// code reference only. Disabling this via [`VocoderState::set_transient_sched`]
+    /// isolates the transient subsystem; it does not restore the legacy schedule.
     pub transient_sched: bool,
     /// Experimental: let RPT take the DLL's B2 noise-floor branch while the
     /// transient machine is in state 2. Our `b_710` reference is a structural
@@ -380,14 +394,12 @@ impl Channel {
 
 /// Immutable inputs of the assembly tail (P2C → IFFT → fold → OAC), shared
 /// with the persistent worker via `Arc`. Everything here is written only by
-/// the `VocoderState` constructor; the per-granule scalars (`g_index`,
-/// `ratio`, `slope`, `ts_out_step`, `step_1412`, `pos_1384`, `hop_1420`)
+/// the `VocoderState` constructor; the per-granule output positions and steps
 /// travel with each job instead.
 struct AssemblyCtx {
     synth_a: Vec<f32>,
     synth_b: Vec<f32>,
     edge_gain: [f32; 4],
-    step_base: f64,
     precision: i32,
     nb_bins: usize,
     n_fft: usize,
@@ -404,9 +416,7 @@ struct AssemblyJob {
     mag: Vec<f32>,
     phase: Vec<f32>,
     out_plane: Vec<f32>,
-    g_index: i64,
-    ratio: f64,
-    slope: f64,
+    out_step: i32,
     ts_out_step: i32,
     step_1412: i32,
     pos_1384: i64,
@@ -453,9 +463,7 @@ impl AssemblyWorker {
                     let mut out_plane = job.out_plane;
                     VocoderState::assembly_tail_compute(
                         ctx,
-                        job.g_index,
-                        job.ratio,
-                        job.slope,
+                        job.out_step,
                         job.ts_out_step,
                         job.step_1412,
                         job.pos_1384,
@@ -536,10 +544,9 @@ pub struct VocoderState {
     /// `fed_total` at the last mid-stream commit — the DLL's `in_base`.
     commit_in_base: i64,
     /// Schedule-continuity anchor — the additive counterpart of the DLL's
-    /// `out_base`/`in_base` time-map remap. Applied to `vc_calc_sched`
-    /// positions in `process_granule` so a commit never jumps the granule
-    /// lattice: after a commit the next granule lands at
-    /// `pos_last + out_step_new`. Zero until the first mid-stream commit,
+    /// `out_base`/`in_base` time-map remap. Keeps the last processed group at
+    /// the same position when its schedule slope changes. Zero until the
+    /// first mid-stream commit,
     /// so single-parameter renders stay bit-identical.
     sched_pos_offset: i64,
     /// Output frames produced, for progress reporting.
@@ -710,11 +717,10 @@ pub struct VocoderState {
     /// advances 2.378414 (= 2 * 2^(3/12)) per input frame, so the finished audio
     /// runs `2.378414 / 1.189207 = 2.0x` as long at the requested pitch.
     ///
-    /// Here that means: the granule schedule (`vc_calc_sched`) is generated for
-    /// `slope`, so `pos` (the ring write cursor) advances `slope` per input
-    /// frame, while the drain in [`VocoderState::render_to`] still reads at
-    /// `ratio`. A `stretch` of 1.0 leaves `slope == ratio` bit-exactly, so the
-    /// pitch-only path is unchanged.
+    /// The granule schedule rounds its cumulative positions, so the ring write
+    /// cursor advances at `slope` per input frame on average. The drain in
+    /// [`VocoderState::render_to`] reads at `ratio`; at 100% stretch the two rates
+    /// are equal.
     pub slope: f64,
     /// Output gain in dB, applied to the finished samples. 0.0 is a no-op.
     pub gain_db: f64,
@@ -1077,11 +1083,10 @@ impl VocoderState {
     ///
     /// In table coordinates the remap is one additive anchor on the last
     /// processed group: after a commit,
-    /// `pos(g) = pos_last + (grp(g) - grp_prev) * out_step_new`, i.e.
-    /// `sched_pos_offset = pos_last - grp_prev * out_step_new`
-    /// (`pos(g) = grp(g)*out_step + offset`; `grp_prev` is the group of the
-    /// last processed granule). Both slots remapped in one anchor because the
-    /// pitch slot's Δin is zero once the stretch slot has reset `in_base`.
+    /// `pos(g) = pos_last + new_pos(g) - new_pos(g_prev)`, where `new_pos`
+    /// rounds the cumulative position under the new slope. Both slots remap
+    /// in one anchor because the pitch slot's Δin is zero once the stretch
+    /// slot has reset `in_base`.
     /// `acc_1440` re-anchors to the same lattice so the fallback cursor path
     /// stays consistent.
     fn commit_pending(&mut self) {
@@ -1097,20 +1102,18 @@ impl VocoderState {
             12.0 * self.ratio.log2()
         });
         let tempo = self.pending_tempo.unwrap_or(self.stretch * 100.0);
-        // Size the new table step with the pending params (mirror of
+        // Compute the new schedule slope with the pending params (mirror of
         // apply_ratio's derivation) so the anchor uses the post-commit pace.
         let pr = 2.0f64.powf(semis / 12.0);
         let s = 12.0f32 * (pr as f32).log2();
         let new_ratio = 2.0f64.powf(s as f64 / 12.0);
         let new_slope = new_ratio * (tempo / 100.0);
         let g_next = self.g_index.max(5);
-        let os_new = vc_calc_sched(g_next, new_ratio, new_slope, self.cfg.step_base).3;
-        if os_new > 0 {
-            // `pos_1384` is constant within each group of 4 sub-granules and
-            // advances one `out_step` per group, so the anchor is the last
-            // processed group: pos(g) = pos_last + (grp(g) - grp_prev)*os_new.
+        if new_slope > 0.0 {
             let grp_prev = (g_next - 2).max(0) / 4;
-            self.sched_pos_offset = self.pos_1384 - grp_prev * os_new;
+            let new_pos =
+                vc_calc_sched_precise(grp_prev * 4 + 1, new_ratio, new_slope, self.cfg.step_base).0;
+            self.sched_pos_offset = self.pos_1384 - new_pos;
         }
         // Apply (stretch slot first, then pitch — one call for both, matching
         // the remap algebra above), then D46: a slope change resets a transient
@@ -1316,8 +1319,7 @@ impl VocoderState {
         let hopf = if self.tsched.steady_hop > 0 {
             self.tsched.steady_hop as f32
         } else if self.step_1412 > 0 {
-            // machine inactive (transient_sched off): keep the historical
-            // rate basis so the pyradius golden path is unchanged
+            // With the transient machine inactive, use the regular output hop.
             self.step_1412 as f32
         } else {
             288.0
@@ -1831,7 +1833,7 @@ impl VocoderState {
     /// `_ev_oac` — `OverlapAddChannel`, on explicit buffers so the assembly
     /// tail can run per channel. Everything it reads is either per-channel or
     /// an immutable scheduling input with the same value for both channels of
-    /// one granule (the serial loop observed `g_index` unchanged).
+    /// one granule.
     #[allow(clippy::too_many_arguments)]
     fn oac_channel(
         win1: &mut [f32],
@@ -1840,10 +1842,7 @@ impl VocoderState {
         synth_a: &[f32],
         synth_b: &[f32],
         edge_gain: &[f32; 4],
-        g_index: i64,
-        ratio: f64,
-        slope: f64,
-        step_base: f64,
+        out_step: i32,
         ts_out_step: i32,
         step_1412: i32,
         pos_1384: i64,
@@ -1855,9 +1854,7 @@ impl VocoderState {
         v8_len_a: usize,
         v9_len_b: usize,
     ) {
-        let sched_now = vc_calc_sched(g_index, ratio, slope, step_base);
-        let sched_next = vc_calc_sched(g_index + 1, ratio, slope, step_base);
-        let mut a3 = (sched_next.0 - sched_now.0) as i32;
+        let mut a3 = out_step;
         if a3 <= 0 {
             a3 = step_1412;
         }
@@ -1989,7 +1986,6 @@ impl VocoderState {
                     synth_a: self.synth_a.clone(),
                     synth_b: self.synth_b.clone(),
                     edge_gain: self.edge_gain,
-                    step_base: self.cfg.step_base,
                     precision: self.cfg.precision,
                     nb_bins: self.cfg.nb_bins,
                     n_fft: self.cfg.n_fft,
@@ -2002,9 +1998,7 @@ impl VocoderState {
             .clone();
         // Immutable scheduling inputs shared by both channels; the serial
         // loop observed these unchanged across the r-loop.
-        let g_index = self.g_index;
-        let ratio = self.ratio;
-        let slope = self.slope;
+        let out_step = self.out_step_1404;
         let ts_out_step = self.ts_out_step;
         let step_1412 = self.step_1412;
         let pos_1384 = self.pos_1384;
@@ -2031,9 +2025,7 @@ impl VocoderState {
                     mag: mag1,
                     phase: phase1,
                     out_plane: plane1,
-                    g_index,
-                    ratio,
-                    slope,
+                    out_step,
                     ts_out_step,
                     step_1412,
                     pos_1384,
@@ -2046,9 +2038,7 @@ impl VocoderState {
             let out0 = &mut self.out_ring[..ring_out_len];
             Self::assembly_tail_compute(
                 &ctx,
-                g_index,
-                ratio,
-                slope,
+                out_step,
                 ts_out_step,
                 step_1412,
                 pos_1384,
@@ -2073,9 +2063,7 @@ impl VocoderState {
                 let out = &mut self.out_ring[s..e];
                 Self::assembly_tail_compute(
                     &ctx,
-                    g_index,
-                    ratio,
-                    slope,
+                    out_step,
                     ts_out_step,
                     step_1412,
                     pos_1384,
@@ -2101,9 +2089,7 @@ impl VocoderState {
     #[allow(clippy::too_many_arguments)]
     fn assembly_tail_compute(
         ctx: &AssemblyCtx,
-        g_index: i64,
-        ratio: f64,
-        slope: f64,
+        out_step: i32,
         ts_out_step: i32,
         step_1412: i32,
         pos_1384: i64,
@@ -2149,10 +2135,7 @@ impl VocoderState {
             &ctx.synth_a,
             &ctx.synth_b,
             &ctx.edge_gain,
-            g_index,
-            ratio,
-            slope,
-            ctx.step_base,
+            out_step,
             ts_out_step,
             step_1412,
             pos_1384,
@@ -2206,8 +2189,10 @@ impl VocoderState {
         if profile_enabled() {
             VC_PROFILE.with(|p| p.borrow_mut().granules += 1);
         }
-        let se_curr = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base);
-        let se_next = vc_calc_sched(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
+        let se_curr =
+            vc_calc_sched_precise(self.g_index, self.ratio, self.slope, self.cfg.step_base);
+        let se_next =
+            vc_calc_sched_precise(self.g_index + 1, self.ratio, self.slope, self.cfg.step_base);
         // §4 commit anchor: keeps the granule lattice continuous across
         // mid-stream parameter commits (zero until one happens — see
         // `commit_pending`).
@@ -2450,7 +2435,7 @@ impl VocoderState {
             );
         }
         if ph == 0 {
-            self.sched_cdel = vc_calc_sched(self.g_index, self.ratio, self.slope, self.cfg.step_base).1;
+            self.sched_cdel = se_next.1;
             self.ev_cursor_advance();
         } else {
             self.sched_cdel = -1;
@@ -2833,6 +2818,23 @@ mod commit_tests {
             .collect()
     }
 
+    #[test]
+    fn fractional_hop_position_stays_within_half_a_frame() {
+        for (pitch, stretch) in [(3.0, 1.0), (4.0, 1.0), (5.0, 1.0), (-2.0, 1.0), (4.0, 0.9)] {
+            let ratio = 2.0f64.powf(pitch / 12.0);
+            let slope = ratio * stretch;
+            let mut prev = 0;
+            let hop = vc_input_step(ratio, 222.0) as f64 * slope;
+            for group in 1..=100_000 {
+                let (pos, _, _, step) = vc_calc_sched_precise(group * 4 + 1, ratio, slope, 222.0);
+                assert!((pos as f64 - group as f64 * hop).abs() <= 0.5);
+                assert_eq!(step, pos - prev);
+                assert!(step == hop.floor() as i64 || step == hop.ceil() as i64);
+                prev = pos;
+            }
+        }
+    }
+
     /// (a) A `set_ratio` before the first feed applies immediately: one call
     /// and a replaced pre-stream call give bit-identical renders, and no
     /// commit/anchor ever fires (offset stays 0) — the pre-change behaviour.
@@ -2854,8 +2856,8 @@ mod commit_tests {
 
     /// (b) A mid-stream `set_ratio` commits at a feed boundary with a
     /// continuous granule lattice: within the current group the position is
-    /// unchanged, the next group steps by the NEW `out_step`, and nothing
-    /// jumps backwards.
+    /// unchanged, the next group advances at the new rate, and nothing jumps
+    /// backwards.
     #[test]
     fn mid_stream_commit_keeps_schedule_continuous() {
         // The transient subsystem is disabled here to observe the pure
@@ -2876,13 +2878,11 @@ mod commit_tests {
             seq.push(st.pos_1384);
         }
         // Mid-group commit (g_index % 4 != 1): the position must hold.
-        st.set_ratio(3.0, 200.0);
+        st.set_ratio(4.0, 200.0);
         st.commit_pending();
-        let os_new =
-            vc_calc_sched(st.g_index.max(5), st.ratio, st.slope, st.cfg.step_base).3;
-        assert!(os_new > 0);
+        let ideal_hop = vc_input_step(st.ratio, st.cfg.step_base) as f64 * st.slope;
         let mut post = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..32 {
             st.process_granule();
             post.push(st.pos_1384);
         }
@@ -2893,9 +2893,18 @@ mod commit_tests {
         assert_eq!(post[0], *seq.last().unwrap());
         // …the sequence never decreases…
         assert!(post.windows(2).all(|w| w[1] >= w[0]), "post={post:?}");
-        // …and group-boundary steps are exactly the new table step.
-        let steps: Vec<i64> = post.windows(2).map(|w| w[1] - w[0]).collect();
-        assert!(steps.iter().all(|&d| d == 0 || d == os_new), "steps={steps:?}");
+        // …and group-boundary steps use both integers around the new ideal hop.
+        let steps: Vec<i64> = post
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&d| d != 0)
+            .collect();
+        assert!(steps.contains(&(ideal_hop.floor() as i64)), "steps={steps:?}");
+        assert!(steps.contains(&(ideal_hop.ceil() as i64)), "steps={steps:?}");
+        assert!(
+            steps.iter().all(|&d| (d as f64 - ideal_hop).abs() < 1.0),
+            "steps={steps:?}"
+        );
     }
 
     /// (c) The 32-frame gate: the first commit (input base 0) passes, a

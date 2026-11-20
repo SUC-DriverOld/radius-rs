@@ -116,3 +116,60 @@ fn transient_sched_engages_on_tempo_stretch() {
     assert!(state2 > 0, "compress-side should reach state 2, got {state2}");
     assert!(!out.is_empty());
 }
+
+#[test]
+fn vocoder_does_not_accumulate_beat_drift() {
+    const RATE: usize = 44_100;
+    const HITS: usize = 24;
+    let beat_frame = |i| RATE / 4 + i * (RATE / 2);
+    let mut rng = 241u32;
+    let hit: Vec<_> = (0..RATE * 60 / 1000)
+        .map(|i| {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = f64::from(rng) / f64::from(u32::MAX) - 0.5;
+            (noise * (-(i as f64) / (RATE as f64 * 0.008)).exp()) as f32
+        })
+        .collect();
+    let mut input = vec![0.0; RATE * HITS / 2];
+    for i in 0..HITS {
+        let start = beat_frame(i);
+        input[start..start + hit.len()].copy_from_slice(&hit);
+    }
+
+    // Use several attacks at each end so a constant offset or the jitter of
+    // one hit is not mistaken for drift. The old schedule rounds +4 up and
+    // +5 down, producing about 10 ms of drift in opposite directions here.
+    for (pitch, tempo) in [(4.0, 100.0), (5.0, 100.0), (4.0, 90.0)] {
+        let stretch = tempo / 100.0;
+        let target = (input.len() as f64 * stretch).round() as usize;
+        let mut st = VocoderState::new(RATE as u32, 1);
+        st.set_ratio(pitch, tempo);
+        let out = st.render_to(&input, target);
+        assert_eq!(out.len(), target);
+
+        let mean_offset = |beats: std::ops::Range<usize>| {
+            let n = beats.len() as f64;
+            beats
+                .map(|i| {
+                    let expected = (beat_frame(i) as f64 * stretch).round() as usize;
+                    let radius = RATE / 8;
+                    let (sum, weighted) = out[expected - radius..expected + radius]
+                        .iter()
+                        .enumerate()
+                        .fold((0.0, 0.0), |(sum, weighted), (k, &x)| {
+                            let energy = f64::from(x).powi(2);
+                            (sum + energy, weighted + energy * k as f64)
+                        });
+                    assert!(sum > 0.01, "missing attack {i} at {pitch:+} st, {tempo}%");
+                    weighted / sum - radius as f64
+                })
+                .sum::<f64>()
+                / n
+        };
+        let drift_ms = (mean_offset(HITS - 4..HITS) - mean_offset(0..4)) * 1000.0 / RATE as f64;
+        assert!(
+            drift_ms.abs() < 2.0,
+            "{pitch:+} st, {tempo}%: {drift_ms:+.3} ms drift"
+        );
+    }
+}

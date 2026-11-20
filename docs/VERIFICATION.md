@@ -17,6 +17,10 @@ The reference's own acceptance floor is `max|d| < 5e-4` **and** `corr > 0.9999`.
 
 The residual is pure `f32` associativity noise: sample counts, granule counts, transient counts, output lengths and amplitudes all match exactly, and roughly two thirds of all samples are bit-identical.
 
+The vocoder rows are historical: they predate the cumulative-hop timing fix.
+Current vocoder renders intentionally depart from the legacy schedule; the
+operator-level golden vectors still test the reference arithmetic.
+
 The references are produced by the development tool `tools/gen_refs.py`, which runs the `pyradius` reference implementation and writes the renders into `.ref/`. That tool needs a `pyradius` checkout, which is not part of this crate; the parity tests pick up `.ref/` automatically and skip when it is absent.
 
 ## Stereo, and why the vocoder used to collapse it
@@ -43,9 +47,9 @@ Losing that relationship is not cosmetic. Magnitude-squared coherence between L 
 
 `corr(L,R)` goes 0.0192 → 0.7046 and `side/mid` −0.17 dB → −7.61 dB, landing next to Audition's own render (0.7020 / −7.57 dB) against 0.6930 / −7.41 dB on the input. The level error had the same cause: −2.53 dB → −0.30 dB, against −0.50 dB for Audition, because two channels whose phases have drifted apart sum to less energy than two that have not.
 
-Both this crate (`VocoderState::feed`) and the Python reference (`VocoderState.feed` in `pyradius.vocoder_core`) now run one `Crossover` **per channel**, and each channel's granule is built from its own band ring, with the sync sensitivity set to 0.75. The two remain bit-exact with each other: on the corpus at +3 semitones, `max|d| = 5e-07` and `corr = 1.0000000000` on both channels.
+Both this crate (`VocoderState::feed`) and the Python reference (`VocoderState.feed` in `pyradius.vocoder_core`) run one `Crossover` **per channel**, and each channel's granule is built from its own band ring, with the sync sensitivity set to 0.75. Before the timing fix, the corpus at +3 semitones gave `max|d| = 5e-07` and `corr = 1.0000000000` on both channels.
 
-The consequence to know about is that **on stereo input the vocoder no longer matches the C engine**, which still has both defects. The C engine was not changed. On dual-mono input the three agree, which is the third assertion of `vocoder_preserves_stereo_separation`.
+The consequence to know about is that **on stereo input the vocoder no longer matches the C engine**, which still has both defects. The C engine was not changed. `vocoder_preserves_stereo_separation` also checks the dual-mono case for this crate.
 
 ## Reference renders from Adobe Audition (perceptual)
 
@@ -84,7 +88,7 @@ All of it runs with no external audio files and no extra cargo features. The cor
 
 * **engine unit tests** — bit-exact golden vectors minted from the Python reference for every operator: the FFT, `fill_granule` across 16 branch and parameter combinations, `cart_to_polar`, `unwrap_phase`, `ApplyPitchCoherence`, `ResetPhasesForTransients`, `adjust_multiphase_diff`, `SynchronizeStereoPhases`, `Randomize` and `SubstituteNoisyPhases`, `OverlapAddChannel`, `Crossover`, `FormantState`, the transients-info geometry, the sampler, and the constant tables.
 * **TD acceptance** — duration, amplitude and stereo-image preservation, both pitch directions, a *measured* semitone check on a synthetic tone, and the corpus granule and transient counts.
-* **vocoder acceptance** — geometry for both sample rates, the scheduler's structural invariants, a short synthetic render, stereo separation, and an `#[ignore]`d full-length parity run.
+* **vocoder acceptance** — geometry for both sample rates, the scheduler's structural invariants, a short synthetic render, stereo separation, and an `#[ignore]`d full-length reference comparison. `transient_sched.rs` checks that drift between early and late synthetic beats stays below 2 ms for pitch-only and combined pitch/tempo renders.
 * **CLI acceptance** — help, version and argument errors, a real render, the `--truth` correlation report, rejection of an unsupported vocoder rate, a write and read round trip for every container, the documented defaults including the identity-render note, the progress bar in all three modes, the clipping warning per format, and an exhaustive check of the quality knobs: wav `-b 16/24/32/32f` are confirmed by file size to be 2/3/4/4 bytes per sample and grow in that order, FLAC 16 and 24 are lossless to within their depth's quantisation step, MP3 320 kbps is larger than 128 kbps, Ogg 512 kbit/s is larger than 96 kbit/s and the default is the measured ceiling, `--ogg-bitrate` lands near its request, the removed `--ogg-quality` flag is rejected, `--format` overrides the extension, and an unknown extension is rejected.
 * **C ABI acceptance** — the exported symbols called through `extern "C"`, `rx_td_render` bit-identical to the Rust API, the null and bad-argument contract, and the vocoder render reachable from C.
 * **Audition reference** — the duration, level and energy-contour checks above.

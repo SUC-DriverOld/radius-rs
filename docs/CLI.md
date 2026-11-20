@@ -148,10 +148,12 @@ In the time-domain engine the slope drives the granule pump — the accumulator
 spawns *extra granules* that replay windows, so the ring holds a time-stretched
 copy of the input (measured: ring write = `slope × input` frames, exact, at 50 %,
 100 % and 200 %) — and the drain resamples it back by the pitch ratio. In the
-vocoder the slope is the out-step of the grain scheduler (`vc_calc_sched`).
-
-At `--tempo 100` the slope equals the drain rate and the whole path is
-bit-identical to the pitch-only render, so the parity corpus still holds.
+vocoder the slope sets the ideal output hop. The scheduler rounds the
+cumulative position rather than rounding each hop before accumulating it.
+This prevents a pitch-only render from gradually falling out of sync even
+when its total frame count matches the input. At `--tempo 100` the slope
+equals the drain rate; neither the requested pitch nor the length changes
+because of the scheduling correction.
 
 ### The output can exceed full scale, and Audition's does too
 

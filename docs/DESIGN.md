@@ -47,9 +47,10 @@ Keeping `a*b + c` a single correctly-rounded operation has a consequence that is
 
 ## Deliberate behaviour differences
 
-Two places where this crate knowingly does not reproduce the reference, both because the reference is wrong:
+The crate deliberately differs from its reference in these cases:
 
-* **Stereo in the vocoder.** The reference handles stereo incorrectly in two independent ways: the band split reads only channel 0, and `sync_sens_3496` sits at a `0.0` placeholder that reduces the stereo phase synchroniser's weight to exactly zero, so it never runs. Both are fixed here. See the stereo section of [VERIFICATION.md](VERIFICATION.md). The Python reference carries the same two fixes, so the two remain bit-exact with each other, and both now differ from the C engine on stereo material.
+* **Stereo in the vocoder.** The reference handles stereo incorrectly in two independent ways: the band split reads only channel 0, and `sync_sens_3496` sits at a `0.0` placeholder that reduces the stereo phase synchroniser's weight to exactly zero, so it never runs. Both are fixed here and in the Python reference. See the stereo section of [VERIFICATION.md](VERIFICATION.md).
+* **Vocoder timing.** A fractional synthesis hop used to be rounded once and applied to every group, causing the audio to drift even with a correct output frame count. The engine now rounds cumulative positions and uses their differences as hops. The public `vc_calc_sched` helper still exposes the legacy schedule for comparisons; full renders are not expected to match it sample for sample.
 
 `--fft rustfft` is another case, but it is opt-in rather than a change of default: see [FFT.md](FFT.md).
 
