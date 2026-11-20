@@ -173,3 +173,36 @@ fn vocoder_does_not_accumulate_beat_drift() {
         );
     }
 }
+
+#[test]
+fn vocoder_reuses_the_output_ring_without_impulses() {
+    for (rate, pitch) in [(44_100, 4.0), (48_000, 5.0)] {
+        let n = rate as usize;
+        let input: Vec<f32> = (0..6 * n)
+            .map(|i| {
+                let phase = std::f64::consts::TAU * 440.0 * i as f64 / rate as f64;
+                ((11_000.0 * phase.sin()).round() / 32_768.0) as f32
+            })
+            .collect();
+        let mut st = VocoderState::new(rate, 1);
+        st.set_ratio(pitch, 100.0);
+        let out = st.render(&input);
+        assert_eq!(out.len(), input.len());
+
+        // Skip startup and the tail, but include several ring passes. A
+        // stale sample creates a sharp jump even if none of the PCM clips.
+        let steady = &out[n..5 * n];
+        let peak = radius_rs::util::peak(steady);
+        assert!(peak > 0.002, "missing steady tone at {rate} Hz");
+        let (i, jump) = steady
+            .windows(3)
+            .enumerate()
+            .map(|(i, w)| (i + n + 1, (w[0] - 2.0 * w[1] + w[2]).abs()))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        assert!(
+            jump < peak * 0.1,
+            "{rate} Hz, {pitch:+} st: impulse {jump:.5} against peak {peak:.5} at frame {i}"
+        );
+    }
+}

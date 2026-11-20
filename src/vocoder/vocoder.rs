@@ -420,6 +420,7 @@ struct AssemblyJob {
     ts_out_step: i32,
     step_1412: i32,
     pos_1384: i64,
+    ola_written_end: i64,
     hop_1420: i32,
     ctx: std::sync::Arc<AssemblyCtx>,
 }
@@ -467,6 +468,7 @@ impl AssemblyWorker {
                         job.ts_out_step,
                         job.step_1412,
                         job.pos_1384,
+                        job.ola_written_end,
                         job.hop_1420,
                         &job.mag,
                         &job.phase,
@@ -512,6 +514,8 @@ pub struct VocoderState {
     cursor_1376: i64,
     acc_1440: f64,
     pos_1384: i64,
+    /// Exclusive end of the synthesized region, before reducing modulo the ring size.
+    ola_written_end: i64,
     writepos_1224: i64,
     hop_1420: i32,
     granule_1400: i32,
@@ -908,6 +912,7 @@ impl VocoderState {
             cursor_1376: 0,
             acc_1440: 0.0,
             pos_1384: 0,
+            ola_written_end: 0,
             writepos_1224: 0,
             hop_1420: cfg.hop,
             granule_1400: cfg.hop,
@@ -1846,6 +1851,7 @@ impl VocoderState {
         ts_out_step: i32,
         step_1412: i32,
         pos_1384: i64,
+        ola_written_end: i64,
         hop_1420: i32,
         precision: i32,
         n_fft: usize,
@@ -1868,7 +1874,6 @@ impl VocoderState {
         // are 3300 at 44.1 kHz and 3592 at 48 kHz).
         let a_const = (n_write as i64 + 1) / 2;
         let ring_len = ring_out_len as i64;
-        let f1224 = pos_1384 - a3 as i64 + hop_1420 as i64;
         overlap_add_channel_in_place(
             win1,
             win2,
@@ -1889,7 +1894,7 @@ impl VocoderState {
             pos_1384,
             hop_1420 as i64,
             ring_len,
-            f1224,
+            ola_written_end,
             n_write as i64,
         );
     }
@@ -2003,6 +2008,10 @@ impl VocoderState {
         let step_1412 = self.step_1412;
         let pos_1384 = self.pos_1384;
         let hop_1420 = self.hop_1420;
+        // Only add inside the previous write's coverage. Predicting its end
+        // from the next hop can add stale samples after the ring wraps.
+        let ola_written_end = self.ola_written_end;
+        let window_end = pos_1384 - i64::from(hop_1420) + self.cfg.n_write as i64;
         let ring_out_len = self.cfg.ring_out_len;
         let nch = self.cfg.nch;
 
@@ -2029,6 +2038,7 @@ impl VocoderState {
                     ts_out_step,
                     step_1412,
                     pos_1384,
+                    ola_written_end,
                     hop_1420,
                     ctx: ctx.clone(),
                 })
@@ -2042,6 +2052,7 @@ impl VocoderState {
                 ts_out_step,
                 step_1412,
                 pos_1384,
+                ola_written_end,
                 hop_1420,
                 &self.ch[0].mag,
                 &self.ch[0].phase,
@@ -2067,6 +2078,7 @@ impl VocoderState {
                     ts_out_step,
                     step_1412,
                     pos_1384,
+                    ola_written_end,
                     hop_1420,
                     &self.ch[r].mag,
                     &self.ch[r].phase,
@@ -2079,6 +2091,7 @@ impl VocoderState {
                 );
             }
         }
+        self.ola_written_end = ola_written_end.max(window_end);
         if let Some(t0) = t0 { profile_add(|p| &mut p.assembly, t0); }
     }
 
@@ -2093,6 +2106,7 @@ impl VocoderState {
         ts_out_step: i32,
         step_1412: i32,
         pos_1384: i64,
+        ola_written_end: i64,
         hop_1420: i32,
         mag: &[f32],
         phase: &[f32],
@@ -2139,6 +2153,7 @@ impl VocoderState {
             ts_out_step,
             step_1412,
             pos_1384,
+            ola_written_end,
             hop_1420,
             ctx.precision,
             ctx.n_fft,
